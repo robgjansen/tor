@@ -1910,25 +1910,53 @@ cell_ewma_set_scale_factor(or_options_t *options, networkstatus_t *consensus)
              "scale factor is %lf per %d seconds",
              source, ewma_scale_factor, EWMA_TICK_LEN);
   }
+
+  /* per-conn halflife may be set separately of circ priority algorithm */
+  pc_throttle_globals_t *pct = get_pc_throttle_globals();
+
+  if (options && options->PerConnHalflife >= EPSILON) {
+	pct->perconn_ewma_enabled = 1;
+    halflife = options->PerConnHalflife;
+  }
+  /* its also enabled automatically if using fingerprint thorttling */
+  else if(pct->fingerprint_throttling_enabled) {
+	pct->perconn_ewma_enabled = 1;
+	halflife = 30.0; /* todo: somewhat arbitrarily chosen default */
+	log_notice(LD_CONFIG,"PerConnBWThreshold requires a PerConnHalflife,"
+			"using default of %i", halflife);
+  } else {
+	pct->perconn_ewma_enabled = 0;
+  }
+
+  if(pct->perconn_ewma_enabled) {
+	/* convert halflife into halflife-per-tick. */
+    halflife /= EWMA_TICK_LEN;
+    /* compute per-tick scale factor. */
+    pct->perconn_ewma_scale_factor = exp( LOG_ONEHALF / halflife );
+    log_notice(LD_OR,
+             "Enabled connection ewma using PerConnHalflife; "
+             "scale factor is %lf per %d seconds",
+             pct->perconn_ewma_scale_factor, EWMA_TICK_LEN);
+  }
 }
 
 /** Return the multiplier necessary to convert the value of a cell sent in
  * 'from_tick' to one sent in 'to_tick'. */
 static INLINE double
-get_scale_factor(unsigned from_tick, unsigned to_tick)
+get_scale_factor(unsigned from_tick, unsigned to_tick, double scale_base)
 {
   /* This math can wrap around, but that's okay: unsigned overflow is
      well-defined */
   int diff = (int)(to_tick - from_tick);
-  return pow(ewma_scale_factor, diff);
+  return pow(scale_base, diff);
 }
 
 /** Adjust the cell count of <b>ewma</b> so that it is scaled with respect to
  * <b>cur_tick</b> */
-static void
-scale_single_cell_ewma(cell_ewma_t *ewma, unsigned cur_tick)
+void
+scale_single_cell_ewma(cell_ewma_t *ewma, unsigned cur_tick, double scale_base)
 {
-  double factor = get_scale_factor(ewma->last_adjusted_tick, cur_tick);
+  double factor = get_scale_factor(ewma->last_adjusted_tick, cur_tick, scale_base);
   ewma->cell_count *= factor;
   ewma->last_adjusted_tick = cur_tick;
 }
@@ -1941,7 +1969,7 @@ scale_active_circuits(or_connection_t *conn, unsigned cur_tick)
 
   double factor = get_scale_factor(
               conn->active_circuit_pqueue_last_recalibrated,
-              cur_tick);
+              cur_tick, ewma_scale_factor);
   /** Ordinarily it isn't okay to change the value of an element in a heap,
    * but it's okay here, since we are preserving the order. */
   SMARTLIST_FOREACH(conn->active_circuit_pqueue, cell_ewma_t *, e, {
@@ -1953,6 +1981,24 @@ scale_active_circuits(or_connection_t *conn, unsigned cur_tick)
   conn->active_circuit_pqueue_last_recalibrated = cur_tick;
 }
 
+static void
+scale_or_connections(smartlist_t *conns, unsigned cur_tick) {
+  pc_throttle_globals_t *pct = get_pc_throttle_globals();
+  double factor = get_scale_factor(pct->perconn_ewma_last_recalibrated, cur_tick,
+		  pct->perconn_ewma_scale_factor);
+  SMARTLIST_FOREACH(conns, connection_t *, conn,
+  {
+    if (connection_speaks_cells(conn)) {
+      or_connection_t *or_conn = TO_OR_CONN(conn);
+	  tor_assert(or_conn->throttle.ewma.last_adjusted_tick ==
+			  pct->perconn_ewma_last_recalibrated);
+	  or_conn->throttle.ewma.cell_count *= factor;
+	  or_conn->throttle.ewma.last_adjusted_tick = cur_tick;
+    }
+  });
+  pct->perconn_ewma_last_recalibrated = cur_tick;
+}
+
 /** Rescale <b>ewma</b> to the same scale as <b>conn</b>, and add it to
  * <b>conn</b>'s priority queue of active circuits */
 static void
@@ -1960,7 +2006,8 @@ add_cell_ewma_to_conn(or_connection_t *conn, cell_ewma_t *ewma)
 {
   tor_assert(ewma->heap_index == -1);
   scale_single_cell_ewma(ewma,
-                         conn->active_circuit_pqueue_last_recalibrated);
+                         conn->active_circuit_pqueue_last_recalibrated,
+                         ewma_scale_factor);
 
   smartlist_pqueue_add(conn->active_circuit_pqueue,
                        compare_cell_ewma_counts,
@@ -2148,26 +2195,36 @@ connection_or_flush_from_first_active_circuit(or_connection_t *conn, int max,
   /* The EWMA cell counter for the circuit we're flushing. */
   cell_ewma_t *cell_ewma = NULL;
   double ewma_increment = -1;
+  double pc_ewma_increment = -1;
 
   circ = conn->active_circuits;
   if (!circ) return 0;
   assert_active_circuits_ok_paranoid(conn);
 
+  pc_throttle_globals_t *pct = get_pc_throttle_globals();
+
   /* See if we're doing the ewma circuit selection algorithm. */
-  if (ewma_enabled) {
+  if (ewma_enabled || pct->perconn_ewma_enabled) {
     unsigned tick;
     double fractional_tick;
     tor_gettimeofday_cached(&now_hires);
     tick = cell_ewma_tick_from_timeval(&now_hires, &fractional_tick);
 
-    if (tick != conn->active_circuit_pqueue_last_recalibrated) {
-      scale_active_circuits(conn, tick);
+    if(ewma_enabled) {
+	  if (tick != conn->active_circuit_pqueue_last_recalibrated) {
+		scale_active_circuits(conn, tick);
+	  }
+	  ewma_increment = pow(ewma_scale_factor, -fractional_tick);
+	  cell_ewma = smartlist_get(conn->active_circuit_pqueue, 0);
+	  circ = cell_ewma_to_circuit(cell_ewma);
     }
 
-    ewma_increment = pow(ewma_scale_factor, -fractional_tick);
-
-    cell_ewma = smartlist_get(conn->active_circuit_pqueue, 0);
-    circ = cell_ewma_to_circuit(cell_ewma);
+    if(pct->perconn_ewma_enabled) {
+      if(tick != pct->perconn_ewma_last_recalibrated) {
+    	scale_or_connections(get_connection_array(), tick);
+      }
+      pc_ewma_increment = pow(pct->perconn_ewma_scale_factor, -fractional_tick);
+    }
   }
 
   if (circ->n_conn == conn) {
@@ -2234,6 +2291,11 @@ connection_or_flush_from_first_active_circuit(or_connection_t *conn, int max,
       tmp = pop_first_cell_ewma_from_conn(conn);
       tor_assert(tmp == cell_ewma);
       add_cell_ewma_to_conn(conn, cell_ewma);
+    }
+    if(pct->perconn_ewma_enabled) {
+    	conn->throttle.ewma.cell_count += pc_ewma_increment;
+    	scale_single_cell_ewma(&conn->throttle.ewma,
+    			pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
     }
     if (circ != conn->active_circuits) {
       /* If this happens, the current circuit just got made inactive by

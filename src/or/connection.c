@@ -208,6 +208,12 @@ or_connection_new(int socket_family)
   or_conn->active_circuit_pqueue = smartlist_create();
   or_conn->active_circuit_pqueue_last_recalibrated = cell_ewma_get_tick();
 
+  memset(&or_conn->throttle, 0, sizeof(or_conn->throttle));
+  or_conn->throttle.ewma.last_adjusted_tick = get_pc_throttle_globals()->perconn_ewma_last_recalibrated;
+  /* start unthrottled */
+  or_conn->throttle.bandwidthrate = -1;
+  or_conn->throttle.cell_count_penalty = -1.0;
+
   return or_conn;
 }
 
@@ -2253,6 +2259,18 @@ connection_bucket_refill(int seconds_elapsed, time_t now)
   connection_bucket_refill_helper(&global_relayed_write_bucket,
                                   relayrate, relayburst, seconds_elapsed,
                                   "global_relayed_write_bucket");
+
+  /* check if an adaptive throttling algorithm is enabled. if so, modify the
+   * PCBW values to throttle the refill rate of the PerConn token buckets. */
+  pc_throttle_globals_t *pct = get_pc_throttle_globals();
+  if(pct->fingerprint_throttling_enabled) {
+	connection_or_throttle_fingerprint(conns, options, now);
+  }
+
+  /* check if we want to track the per-conn cell counts */
+  if(options->PerConnHalflifeVerbose) {
+	  connection_or_log_cell_counts(conns);
+  }
 
   /* refill the per-connection buckets */
   SMARTLIST_FOREACH(conns, connection_t *, conn,

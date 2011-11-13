@@ -44,6 +44,12 @@ static int connection_or_check_valid_tls_handshake(or_connection_t *conn,
  * they form a linked list, with next_with_same_id as the next pointer. */
 static digestmap_t *orconn_identity_map = NULL;
 
+/* global state for adaptively throttling connections */
+pc_throttle_globals_t pcbw_globals = {0,0,0,0,0,};
+pc_throttle_globals_t* get_pc_throttle_globals() {
+	return &pcbw_globals;
+}
+
 /** If conn is listed in orconn_identity_map, remove it, and clear
  * conn->identity_digest.  Otherwise do nothing. */
 void
@@ -369,10 +375,30 @@ connection_or_update_token_buckets_helper(or_connection_t *conn, int reset,
   } else {
     /* Not a recognized relay. Squeeze it down based on the suggested
      * bandwidth parameters in the consensus, but allow local config
-     * options to override. */
-    rate = options->PerConnBWRate ? (int)options->PerConnBWRate :
-        (int)networkstatus_get_param(NULL, "bwconnrate",
-                                     (int)options->BandwidthRate);
+     * options to override. Adaptive throttling overrides everything. This way,
+     * connections that are not adaptively throttled can still be throttled 
+     * to some maximum rate using the PerConnBWRate. */
+	pc_throttle_globals_t *pct = get_pc_throttle_globals();
+	if(pct->fingerprint_throttling_enabled) {
+		if(conn->throttle.bandwidthrate < 0) {
+			/* no throttling, give it full bandwidth */
+			rate = (int)options->BandwidthRate;
+		} else {
+			/* use the rate adaptively chosen by the throttling algorithm */
+			rate = conn->throttle.bandwidthrate;
+			log_info(LD_OR,"adaptively adjusted bandwidth rate "
+					"from %d to %d on connection %lu to %s:%u",
+					conn->bandwidthrate, rate, conn->_base.global_identifier,
+					conn->_base.address, conn->_base.port);
+		}
+	} else {
+		/* rate defaults to config then consensus */
+		rate = options->PerConnBWRate ? (int)options->PerConnBWRate :
+			(int)networkstatus_get_param(NULL, "bwconnrate",
+										 (int)options->BandwidthRate);
+	}
+
+	/* burst defaults to config then consensus */
     burst = options->PerConnBWBurst ? (int)options->PerConnBWBurst :
         (int)networkstatus_get_param(NULL, "bwconnburst",
                                      (int)options->BandwidthBurst);
@@ -402,6 +428,95 @@ connection_or_update_token_buckets(smartlist_t *conns, or_options_t *options)
     if (connection_speaks_cells(conn))
       connection_or_update_token_buckets_helper(TO_OR_CONN(conn), 0, options);
   });
+}
+
+/**
+ * create and return new list of all open or connections to nonrelays.
+ * caller must free list.
+ */
+static smartlist_t *
+connection_or_get_active_nonrelay(smartlist_t *conns) {
+  smartlist_t* or_conns = smartlist_create();
+  SMARTLIST_FOREACH(conns, connection_t *, conn,
+  {
+	if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
+		or_connection_t* or_conn = TO_OR_CONN(conn);
+		if(!connection_or_digest_is_known_relay(or_conn->identity_digest)) {
+		  smartlist_add(or_conns, TO_OR_CONN(conn));
+		}
+	}
+  });
+  return or_conns;
+}
+
+void
+connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, time_t now){
+  pc_throttle_globals_t *pct = get_pc_throttle_globals();
+
+  /* keep track of the cell count that would be achieved by fair usage */
+  double conn_len = ((double)smartlist_len(conns));
+  if(conn_len <= 0)
+	  return;
+  double rate = (double)options->BandwidthRate;
+  double cell_share_increment = rate / conn_len / CELL_NETWORK_SIZE;
+
+  pct->fingerprint_ewma.cell_count += cell_share_increment;
+  scale_single_cell_ewma(&pct->fingerprint_ewma,
+    pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
+
+  log_info(LD_OR, "fingerprint ewma incremented by %f, scaled to %f",
+  		cell_share_increment, pct->fingerprint_ewma.cell_count);
+
+  /* any connection with cell count over fair fingerprint gets throttled */
+  smartlist_t* or_conns = connection_or_get_active_nonrelay(conns);
+  SMARTLIST_FOREACH(or_conns, or_connection_t *, or_conn,
+  {
+    int old_rate = or_conn->throttle.bandwidthrate;
+
+    /* if this connection is already being throttled, see if we've cooled
+     * down enough to stop throttling. */
+	int was_throttled = or_conn->throttle.cell_count_penalty >= 0;
+
+	if(was_throttled) {
+	  /* stop throttling when cell count falls below penalty */
+	  if(or_conn->throttle.ewma.cell_count <
+			  or_conn->throttle.cell_count_penalty) {
+		  or_conn->throttle.bandwidthrate = -1;
+		  or_conn->throttle.cell_count_penalty = -1.0;
+	 }
+	} else if(or_conn->throttle.ewma.cell_count >=
+			pct->fingerprint_ewma.cell_count) {
+	  /* sent over its fair share, penalize by throttling */
+	  or_conn->throttle.bandwidthrate = options->PerConnBWFingerprint;
+	  or_conn->throttle.cell_count_penalty = pct->fingerprint_ewma.cell_count *
+			  options->PerConnBWFingerprintPenalty;
+	} else {
+	  /* todo: i think this is redundant...? */
+	  or_conn->throttle.bandwidthrate = -1;
+	  or_conn->throttle.cell_count_penalty = -1.0;
+	}
+
+	if(or_conn->throttle.bandwidthrate != old_rate) {
+		connection_or_update_token_buckets_helper(or_conn, 0, options);
+	}
+  });
+  smartlist_free(or_conns);
+}
+
+void
+connection_or_log_cell_counts(smartlist_t *conns) {
+  /* get all active connections to non-relays */
+  smartlist_t* or_conns = connection_or_get_active_nonrelay(conns);
+
+  /* print out cell counts for each */
+  SMARTLIST_FOREACH(or_conns, or_connection_t *, or_conn,
+  {
+	  log_notice(LD_OR,"cell count %f for connection %u to %s:%u",
+			or_conn->throttle.ewma.cell_count, or_conn->_base.global_identifier,
+			or_conn->_base.address, or_conn->_base.port);
+  });
+
+  smartlist_free(or_conns);
 }
 
 /** If we don't necessarily know the router we're connecting to, but we

@@ -314,6 +314,10 @@ static config_var_t _option_vars[] = {
   OBSOLETE("PathlenCoinWeight"),
   V(PerConnBWBurst,              MEMUNIT,  "0"),
   V(PerConnBWRate,               MEMUNIT,  "0"),
+  V(PerConnHalflife,     		 DOUBLE,   "-1.0"),
+  V(PerConnHalflifeVerbose,      BOOL,     "0"),
+  V(PerConnBWFingerprint,        MEMUNIT,     "0"),
+  V(PerConnBWFingerprintPenalty, DOUBLE,   "0.0"),
   V(PidFile,                     STRING,   NULL),
   V(TestingTorNetwork,           BOOL,     "0"),
   V(PreferTunneledDirConns,      BOOL,     "1"),
@@ -1228,7 +1232,19 @@ options_act(or_options_t *old_options)
   if (accounting_is_enabled(options))
     configure_accounting(time(NULL));
 
-  /* Change the cell EWMA settings */
+  /* check for the adaptive throttling algorithm settings */
+  pc_throttle_globals_t* pct = get_pc_throttle_globals();
+  if(options->PerConnBWFingerprint > 0) {
+	  pct->fingerprint_throttling_enabled = 1;
+	  memset(&pct->fingerprint_ewma, 0, sizeof(cell_ewma_t));
+	  log_notice(LD_CONFIG,"enabled adaptive throttling using fingerprinting:"
+			  "flagged connections will be throttled at %u Bps",
+			  options->PerConnBWFingerprint);
+  } else {
+	  pct->fingerprint_throttling_enabled = 0;
+  }
+
+  /* Change the cell and per-conn EWMA settings */
   cell_ewma_set_scale_factor(options, networkstatus_get_latest_consensus());
 
   /* Check for transitions that need action. */

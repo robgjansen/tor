@@ -892,6 +892,57 @@ typedef struct socks_request_t socks_request_t;
 #define DIR_CONNECTION_MAGIC 0x9988ffeeu
 #define CONTROL_CONNECTION_MAGIC 0x8abc765du
 
+/**
+ * The cell_ewma_t structure keeps track of how many cells a circuit has
+ * transferred recently.  It keeps an EWMA (exponentially weighted moving
+ * average) of the number of cells flushed from the circuit queue onto a
+ * connection in connection_or_flush_from_first_active_circuit().
+ */
+typedef struct {
+  /** The last 'tick' at which we recalibrated cell_count.
+   *
+   * A cell sent at exactly the start of this tick has weight 1.0. Cells sent
+   * since the start of this tick have weight greater than 1.0; ones sent
+   * earlier have less weight. */
+  unsigned last_adjusted_tick;
+  /** The EWMA of the cell count. */
+  double cell_count;
+  /** True iff this is the cell count for a circuit's previous
+   * connection. */
+  unsigned int is_for_p_conn : 1;
+  /** The position of the circuit within the OR connection's priority
+   * queue. */
+  int heap_index;
+} cell_ewma_t;
+
+/**
+ * used for adaptive throttling. the throttle is enabled if options->PCBWThreshold
+ * is non-zero and active if this connection was one of the loudest
+ * options->PerConnBWThreshold fraction of all connections during the last interval.
+ * bandwidthrate is set to the minimum transfer rate among all
+ * connections with active throttles over the last interval. intervals are given
+ * by options->PerConnBWRefresh.
+ */
+typedef struct pc_throttle_t {
+  /** connection-level cell counts */
+  cell_ewma_t ewma;
+  /** our current adaptive bandwidthrate */
+  int bandwidthrate;
+  double cell_count_penalty;
+} pc_throttle_t;
+
+typedef struct pcbw_globals_t {
+  /* track ewma cell counts per connection */
+  unsigned int perconn_ewma_enabled;
+  double perconn_ewma_scale_factor;
+  unsigned int perconn_ewma_last_recalibrated;
+
+  /* do the fingerprinting algorithm where we try to throttle only bulk flows */
+  unsigned int fingerprint_throttling_enabled;
+  /* a "virtual" EWMA that tracks the "fair" connection EWMA over time */
+  cell_ewma_t fingerprint_ewma;
+} pc_throttle_globals_t;
+
 /** Description of a connection to another host or process, and associated
  * data.
  *
@@ -1086,6 +1137,7 @@ typedef struct or_connection_t {
   unsigned active_circuit_pqueue_last_recalibrated;
   struct or_connection_t *next_with_same_id; /**< Next connection with same
                                               * identity digest as this one. */
+  pc_throttle_t throttle; /* for adaptive throttling */
 } or_connection_t;
 
 /** Subtype of connection_t for an "edge connection" -- that is, a socks (ap)
@@ -2005,29 +2057,6 @@ typedef struct {
   time_t expiry_time;
 } cpath_build_state_t;
 
-/**
- * The cell_ewma_t structure keeps track of how many cells a circuit has
- * transferred recently.  It keeps an EWMA (exponentially weighted moving
- * average) of the number of cells flushed from the circuit queue onto a
- * connection in connection_or_flush_from_first_active_circuit().
- */
-typedef struct {
-  /** The last 'tick' at which we recalibrated cell_count.
-   *
-   * A cell sent at exactly the start of this tick has weight 1.0. Cells sent
-   * since the start of this tick have weight greater than 1.0; ones sent
-   * earlier have less weight. */
-  unsigned last_adjusted_tick;
-  /** The EWMA of the cell count. */
-  double cell_count;
-  /** True iff this is the cell count for a circuit's previous
-   * connection. */
-  unsigned int is_for_p_conn : 1;
-  /** The position of the circuit within the OR connection's priority
-   * queue. */
-  int heap_index;
-} cell_ewma_t;
-
 #define ORIGIN_CIRCUIT_MAGIC 0x35315243u
 #define OR_CIRCUIT_MAGIC 0x98ABC04Fu
 
@@ -2527,6 +2556,11 @@ typedef struct {
                                  * use in a second for all relayed conns? */
   uint64_t PerConnBWRate; /**< Long-term bw on a single TLS conn, if set. */
   uint64_t PerConnBWBurst; /**< Allowed burst on a single TLS conn, if set. */
+  double PerConnHalflife; /** keep per connection ewma using this halflife */
+  unsigned int PerConnHalflifeVerbose; /** log per-conn cell counts if non-zero */
+  uint64_t PerConnBWFingerprint; /** adaptively fingerprint and throttle bulk
+  	  connections to this rate if non-zero */
+  double PerConnBWFingerprintPenalty; /** un-flag at this fraction of the fair rate */
   int NumCpus; /**< How many CPUs should we try to use? */
   int RunTesting; /**< If true, create testing circuits to measure how well the
                    * other ORs are running. */

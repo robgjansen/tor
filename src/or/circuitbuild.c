@@ -479,6 +479,11 @@ circuit_build_times_get_xm(circuit_build_times_t *cbt)
              histogram[nth_max_bin[n]]);
   }
 
+  if(bin_counts == 0) {
+	  /* dont div by 0 */
+	  bin_counts = 1;
+  }
+
   ret /= bin_counts;
   tor_free(histogram);
   tor_free(nth_max_bin);
