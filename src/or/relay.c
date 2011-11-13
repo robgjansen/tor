@@ -1923,7 +1923,7 @@ cell_ewma_set_scale_factor(or_options_t *options, networkstatus_t *consensus)
 	pct->perconn_ewma_enabled = 1;
 	halflife = 30.0; /* todo: somewhat arbitrarily chosen default */
 	log_notice(LD_CONFIG,"PerConnBWThreshold requires a PerConnHalflife,"
-			"using default of %i", halflife);
+			"using default of %f", halflife);
   } else {
 	pct->perconn_ewma_enabled = 0;
   }

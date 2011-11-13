@@ -1238,7 +1238,7 @@ options_act(or_options_t *old_options)
 	  pct->fingerprint_throttling_enabled = 1;
 	  memset(&pct->fingerprint_ewma, 0, sizeof(cell_ewma_t));
 	  log_notice(LD_CONFIG,"enabled adaptive throttling using fingerprinting:"
-			  "flagged connections will be throttled at %u Bps",
+			  "flagged connections will be throttled at %lu Bps",
 			  options->PerConnBWFingerprint);
   } else {
 	  pct->fingerprint_throttling_enabled = 0;

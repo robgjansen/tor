@@ -511,7 +511,7 @@ connection_or_log_cell_counts(smartlist_t *conns) {
   /* print out cell counts for each */
   SMARTLIST_FOREACH(or_conns, or_connection_t *, or_conn,
   {
-	  log_notice(LD_OR,"cell count %f for connection %u to %s:%u",
+	  log_notice(LD_OR,"cell count %f for connection %lu to %s:%u",
 			or_conn->throttle.ewma.cell_count, or_conn->_base.global_identifier,
 			or_conn->_base.address, or_conn->_base.port);
   });
