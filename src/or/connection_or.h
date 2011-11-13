@@ -53,5 +53,9 @@ void var_cell_pack_header(const var_cell_t *cell, char *hdr_out);
 var_cell_t *var_cell_new(uint16_t payload_len);
 void var_cell_free(var_cell_t *cell);
 
+pc_throttle_globals_t* get_pc_throttle_globals();
+void connection_or_throttle_threshold(smartlist_t *conns, or_options_t *options, time_t now);
+void connection_or_log_cell_counts(smartlist_t *conns);
+
 #endif
 

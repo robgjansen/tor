@@ -314,6 +314,11 @@ static config_var_t _option_vars[] = {
   OBSOLETE("PathlenCoinWeight"),
   V(PerConnBWBurst,              MEMUNIT,  "0"),
   V(PerConnBWRate,               MEMUNIT,  "0"),
+  V(PerConnHalflife,             DOUBLE,   "-1.0"),
+  V(PerConnHalflifeVerbose,	  UINT,		"0"),
+  V(PerConnBWThreshold,          DOUBLE,   "0.0"),
+  V(PerConnBWRefresh,		      UINT,		"0"),
+  V(PerConnBWFloor,		      MEMUNIT,	"0"),
   V(PidFile,                     STRING,   NULL),
   V(TestingTorNetwork,           BOOL,     "0"),
   V(PreferTunneledDirConns,      BOOL,     "1"),
@@ -1228,7 +1233,19 @@ options_act(or_options_t *old_options)
   if (accounting_is_enabled(options))
     configure_accounting(time(NULL));
 
-  /* Change the cell EWMA settings */
+  /* check for the adaptive throttling algorithm settings */
+  pc_throttle_globals_t* pct = get_pc_throttle_globals();
+
+  if(options->PerConnBWThreshold > 0.0) {
+	  pct->threshold_throttling_enabled = 1;
+	  log_notice(LD_CONFIG,"enabled adaptive throttling using threshold %f "
+			  "and refresh every %i seconds",
+			  options->PerConnBWThreshold, options->PerConnBWRefresh);
+  } else {
+	  pct->threshold_throttling_enabled = 0;
+  }
+
+  /* Change the cell and per-conn EWMA settings */
   cell_ewma_set_scale_factor(options, networkstatus_get_latest_consensus());
 
   /* Check for transitions that need action. */
@@ -1302,7 +1319,8 @@ options_act(or_options_t *old_options)
       init_keys();
 
     if (options->PerConnBWRate != old_options->PerConnBWRate ||
-        options->PerConnBWBurst != old_options->PerConnBWBurst)
+        options->PerConnBWBurst != old_options->PerConnBWBurst ||
+        options->PerConnBWThreshold != old_options->PerConnBWThreshold)
       connection_or_update_token_buckets(get_connection_array(), options);
   }
 
@@ -3322,6 +3340,14 @@ options_validate(or_options_t *old_options, or_options_t *options,
   if (ensure_bandwidth_cap(&options->PerConnBWBurst,
                            "PerConnBWBurst", msg) < 0)
     return -1;
+  if (options->PerConnBWThreshold < 0.0 || options->PerConnBWThreshold > 1.0) {
+      tor_asprintf(msg,
+                       "PerConnBWThreshold is set to %f, but must range between"
+                       "%f and %f",
+                       options->PerConnBWThreshold,
+                       0.0, 1.0);
+      return -1;
+  }
 
   if (server_mode(options)) {
     if (options->BandwidthRate < ROUTER_REQUIRED_MIN_BANDWIDTH) {
