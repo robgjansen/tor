@@ -1231,6 +1231,11 @@ options_act(or_options_t *old_options)
   /* Change the cell EWMA settings */
   cell_ewma_set_scale_factor(options, networkstatus_get_latest_consensus());
 
+  /* check for the adaptive throttling algorithm settings */
+  if(options->PerConnSplitBits) {
+	  log_notice(LD_CONFIG,"enabled adaptive throttling using bit-splitting");
+  }
+
   /* Check for transitions that need action. */
   if (old_options) {
 
