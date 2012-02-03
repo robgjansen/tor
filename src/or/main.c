@@ -845,6 +845,10 @@ conn_close_if_marked(int i)
                            "Holding conn (fd %d) open for more flushing.",
                            (int)conn->s));
         conn->timestamp_lastwritten = now; /* reset so we can flush more */
+      } else if(sz == 0) { /* retval is 0 */
+        /* wants to flush, but is rate limited */
+        conn->write_blocked_on_bw = 1;
+        connection_stop_writing(conn);
       }
       return 0;
     }
