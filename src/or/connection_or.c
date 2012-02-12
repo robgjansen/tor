@@ -584,7 +584,7 @@ connection_or_update_token_buckets_helper(or_connection_t *conn, int reset,
 		/* rate defaults to config then consensus */
 		rate = options->PerConnBWRate ? (int)options->PerConnBWRate :
 			(int)networkstatus_get_param(NULL, "bwconnrate",
-										 (int)options->BandwidthRate);
+										 (int)options->BandwidthRate, 1, INT32_MAX);
 	}
 
 	/* burst defaults to config then consensus */
