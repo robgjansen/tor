@@ -122,6 +122,7 @@
 /* Define to 1 if you have the <sys/socket.h> header file. */
 #undef HAVE_SYS_SOCKET_H
 
+
 /* Define to 1 if you have the <sys/stat.h> header file. */
 #define HAVE_SYS_STAT_H
 
@@ -233,5 +234,13 @@
 #define USING_TWOS_COMPLEMENT
 
 /* Version number of package */
-#define VERSION "0.2.2.15-alpha"
+#define VERSION "0.2.3.8-alpha"
 
+
+
+#define HAVE_STRUCT_SOCKADDR_IN6
+#define HAVE_STRUCT_IN6_ADDR
+#define RSHIFT_DOES_SIGN_EXTEND
+#define FLEXIBLE_ARRAY_MEMBER 0
+#define HAVE_EVENT2_EVENT_H
+#define SHARE_DATADIR ""

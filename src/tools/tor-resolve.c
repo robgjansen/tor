@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson
- * Copyright (c) 2007-2010, The Tor Project, Inc.
+ * Copyright (c) 2007-2011, The Tor Project, Inc.
  */
 /* See LICENSE for licensing information */
 
@@ -319,7 +319,7 @@ main(int argc, char **argv)
 {
   uint32_t sockshost;
   uint16_t socksport = 0, port_option = 0;
-  int isSocks4 = 0, isVerbose = 0, isReverse = 0, force = 0;
+  int isSocks4 = 0, isVerbose = 0, isReverse = 0;
   char **arg;
   int n_args;
   struct in_addr a;
@@ -349,8 +349,6 @@ main(int argc, char **argv)
       isSocks4 = 0;
     else if (!strcmp("-x", arg[0]))
       isReverse = 1;
-    else if (!strcmp("-F", arg[0]))
-      force = 1;
     else if (!strcmp("-p", arg[0])) {
       int p;
       if (n_args < 2) {
@@ -395,7 +393,7 @@ main(int argc, char **argv)
       socksport = 9050; /* 9050 */
     }
   } else if (n_args == 2) {
-    if (parse_addr_port(LOG_WARN, arg[1], NULL, &sockshost, &socksport)<0) {
+    if (addr_port_lookup(LOG_WARN, arg[1], NULL, &sockshost, &socksport)<0) {
       fprintf(stderr, "Couldn't parse/resolve address %s", arg[1]);
       return 1;
     }

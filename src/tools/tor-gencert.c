@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2010 The Tor Project, Inc. */
+/* Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
@@ -169,7 +169,7 @@ parse_commandline(int argc, char **argv)
         fprintf(stderr, "No argument to -a\n");
         return 1;
       }
-      if (parse_addr_port(LOG_ERR, argv[++i], NULL, &addr, &port)<0)
+      if (addr_port_lookup(LOG_ERR, argv[++i], NULL, &addr, &port)<0)
         return 1;
       in.s_addr = htonl(addr);
       tor_inet_ntoa(&in, b, sizeof(b));
@@ -264,7 +264,7 @@ load_identity_key(void)
     }
 
     if (!(f = start_writing_to_stdio_file(identity_key_file,
-                                          OPEN_FLAGS_REPLACE, 0400,
+                                          OPEN_FLAGS_REPLACE | O_TEXT, 0400,
                                           &open_file)))
       return 1;
 
@@ -349,7 +349,7 @@ generate_signing_key(void)
   }
 
   if (!(f = start_writing_to_stdio_file(signing_key_file,
-                                        OPEN_FLAGS_REPLACE, 0600,
+                                        OPEN_FLAGS_REPLACE | O_TEXT, 0600,
                                         &open_file)))
     return 1;
 

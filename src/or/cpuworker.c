@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -62,7 +62,6 @@ connection_cpu_finished_flushing(connection_t *conn)
 {
   tor_assert(conn);
   tor_assert(conn->type == CONN_TYPE_CPUWORKER);
-  connection_stop_writing(conn);
   return 0;
 }
 
@@ -141,13 +140,13 @@ connection_cpu_process_inbuf(connection_t *conn)
   tor_assert(conn);
   tor_assert(conn->type == CONN_TYPE_CPUWORKER);
 
-  if (!buf_datalen(conn->inbuf))
+  if (!connection_get_inbuf_len(conn))
     return 0;
 
   if (conn->state == CPUWORKER_STATE_BUSY_ONION) {
-    if (buf_datalen(conn->inbuf) < LEN_ONION_RESPONSE) /* answer available? */
+    if (connection_get_inbuf_len(conn) < LEN_ONION_RESPONSE)
       return 0; /* not yet */
-    tor_assert(buf_datalen(conn->inbuf) == LEN_ONION_RESPONSE);
+    tor_assert(connection_get_inbuf_len(conn) == LEN_ONION_RESPONSE);
 
     connection_fetch_from_buf(&success,1,conn);
     connection_fetch_from_buf(buf,LEN_ONION_RESPONSE-1,conn);
@@ -226,8 +225,8 @@ cpuworker_main(void *data)
 {
   char question[ONIONSKIN_CHALLENGE_LEN];
   uint8_t question_type;
-  int *fdarray = data;
-  int fd;
+  tor_socket_t *fdarray = data;
+  tor_socket_t fd;
 
   /* variables for onion processing */
   char keys[CPATH_KEY_MATERIAL_LEN];
@@ -250,7 +249,7 @@ cpuworker_main(void *data)
   for (;;) {
     ssize_t r;
 
-    if ((r = recv(fd, &question_type, 1, 0)) != 1) {
+    if ((r = recv(fd, (void *)&question_type, 1, 0)) != 1) {
 //      log_fn(LOG_ERR,"read type failed. Exiting.");
       if (r == 0) {
         log_info(LD_OR,
@@ -317,12 +316,12 @@ cpuworker_main(void *data)
 static int
 spawn_cpuworker(void)
 {
-  int *fdarray;
-  int fd;
+  tor_socket_t *fdarray;
+  tor_socket_t fd;
   connection_t *conn;
   int err;
 
-  fdarray = tor_malloc(sizeof(int)*2);
+  fdarray = tor_malloc(sizeof(tor_socket_t)*2);
   if ((err = tor_socketpair(AF_UNIX, SOCK_STREAM, 0, fdarray)) < 0) {
     log_warn(LD_NET, "Couldn't construct socketpair for cpuworker: %s",
              tor_socket_strerror(-err));
@@ -367,7 +366,7 @@ spawn_cpuworker(void)
 static void
 spawn_enough_cpuworkers(void)
 {
-  int num_cpuworkers_needed = get_options()->NumCpus;
+  int num_cpuworkers_needed = get_num_cpus(get_options());
 
   if (num_cpuworkers_needed < MIN_CPUWORKERS)
     num_cpuworkers_needed = MIN_CPUWORKERS;
@@ -446,9 +445,19 @@ assign_onionskin_to_cpuworker(connection_t *cpuworker,
 {
   char qbuf[1];
   char tag[TAG_LEN];
+  time_t now = approx_time();
+  static time_t last_culled_cpuworkers = 0;
 
-  cull_wedged_cpuworkers();
-  spawn_enough_cpuworkers();
+  /* Checking for wedged cpuworkers requires a linear search over all
+   * connections, so let's do it only once a minute.
+   */
+#define CULL_CPUWORKERS_INTERVAL 60
+
+  if (last_culled_cpuworkers + CULL_CPUWORKERS_INTERVAL <= now) {
+    cull_wedged_cpuworkers();
+    spawn_enough_cpuworkers();
+    last_culled_cpuworkers = now;
+  }
 
   if (1) {
     if (num_cpuworkers_busy == num_cpuworkers) {

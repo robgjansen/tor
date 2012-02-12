@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #define DIRVOTE_PRIVATE
@@ -50,7 +50,7 @@ static int dirvote_publish_consensus(void);
 static char *make_consensus_method_list(int low, int high, const char *sep);
 
 /** The highest consensus method that we currently support. */
-#define MAX_SUPPORTED_CONSENSUS_METHOD 9
+#define MAX_SUPPORTED_CONSENSUS_METHOD 11
 
 /** Lowest consensus method that contains a 'directory-footer' marker */
 #define MIN_METHOD_FOR_FOOTER 9
@@ -83,9 +83,7 @@ format_networkstatus_vote(crypto_pk_env_t *private_signing_key,
   const char *client_versions = NULL, *server_versions = NULL;
   char *outp, *endp;
   char fingerprint[FINGERPRINT_LEN+1];
-  char ipaddr[INET_NTOA_BUF_LEN];
   char digest[DIGEST_LEN];
-  struct in_addr in;
   uint32_t addr;
   routerlist_t *rl = router_get_routerlist();
   char *version_lines = NULL;
@@ -98,8 +96,6 @@ format_networkstatus_vote(crypto_pk_env_t *private_signing_key,
   voter = smartlist_get(v3_ns->voters, 0);
 
   addr = voter->addr;
-  in.s_addr = htonl(addr);
-  tor_inet_ntoa(&in, ipaddr, sizeof(ipaddr));
 
   base16_encode(fingerprint, sizeof(fingerprint),
                 v3_ns->cert->cache_info.identity_digest, DIGEST_LEN);
@@ -186,7 +182,8 @@ format_networkstatus_vote(crypto_pk_env_t *private_signing_key,
                  flags,
                  params,
                  voter->nickname, fingerprint, voter->address,
-                 ipaddr, voter->dir_port, voter->or_port, voter->contact);
+                 fmt_addr32(addr), voter->dir_port, voter->or_port,
+                 voter->contact);
 
     if (r < 0) {
       log_err(LD_BUG, "Insufficient memory for network status line");
@@ -340,7 +337,7 @@ static int
 _compare_votes_by_authority_id(const void **_a, const void **_b)
 {
   const networkstatus_t *a = *_a, *b = *_b;
-  return memcmp(get_voter(a)->identity_digest,
+  return fast_memcmp(get_voter(a)->identity_digest,
                 get_voter(b)->identity_digest, DIGEST_LEN);
 }
 
@@ -357,7 +354,7 @@ _compare_dir_src_ents_by_authority_id(const void **_a, const void **_b)
   a_id = a->is_legacy ? a_v->legacy_id_digest : a_v->identity_digest;
   b_id = b->is_legacy ? b_v->legacy_id_digest : b_v->identity_digest;
 
-  return memcmp(a_id, b_id, DIGEST_LEN);
+  return fast_memcmp(a_id, b_id, DIGEST_LEN);
 }
 
 /** Given a sorted list of strings <b>in</b>, add every member to <b>out</b>
@@ -394,11 +391,12 @@ static int
 compare_vote_rs(const vote_routerstatus_t *a, const vote_routerstatus_t *b)
 {
   int r;
-  if ((r = memcmp(a->status.identity_digest, b->status.identity_digest,
+  if ((r = fast_memcmp(a->status.identity_digest, b->status.identity_digest,
                   DIGEST_LEN)))
     return r;
-  if ((r = memcmp(a->status.descriptor_digest, b->status.descriptor_digest,
-                  DIGEST_LEN)))
+  if ((r = fast_memcmp(a->status.descriptor_digest,
+                       b->status.descriptor_digest,
+                       DIGEST_LEN)))
     return r;
   if ((r = (int)(b->status.published_on - a->status.published_on)))
     return r;
@@ -444,9 +442,9 @@ compute_routerstatus_consensus(smartlist_t *votes, int consensus_method,
     if (cur && !compare_vote_rs(cur, rs)) {
       ++cur_n;
     } else {
-      if (cur_n > most_n ||
-          (cur && cur_n == most_n &&
-           cur->status.published_on > most_published)) {
+      if (cur && (cur_n > most_n ||
+                  (cur_n == most_n &&
+                   cur->status.published_on > most_published))) {
         most = cur;
         most_n = cur_n;
         most_published = cur->status.published_on;
@@ -766,15 +764,275 @@ networkstatus_check_weights(int64_t Wgg, int64_t Wgd, int64_t Wmg,
   if (berr) {
     log_info(LD_DIR,
              "Bw weight mismatch %d. G="I64_FORMAT" M="I64_FORMAT
-             " E="I64_FORMAT" D="I64_FORMAT" T="I64_FORMAT,
+             " E="I64_FORMAT" D="I64_FORMAT" T="I64_FORMAT
+             " Wmd=%d Wme=%d Wmg=%d Wed=%d Wee=%d"
+             " Wgd=%d Wgg=%d Wme=%d Wmg=%d",
              berr,
              I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
-             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T));
+             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T),
+             (int)Wmd, (int)Wme, (int)Wmg, (int)Wed, (int)Wee,
+             (int)Wgd, (int)Wgg, (int)Wme, (int)Wmg);
   }
 
   return berr;
 }
 
+/**
+ * This function computes the bandwidth weights for consensus method 10.
+ *
+ * It returns true if weights could be computed, false otherwise.
+ */
+static int
+networkstatus_compute_bw_weights_v10(smartlist_t *chunks, int64_t G,
+                                     int64_t M, int64_t E, int64_t D,
+                                     int64_t T, int64_t weight_scale)
+{
+  bw_weights_error_t berr = 0;
+  int64_t Wgg = -1, Wgd = -1;
+  int64_t Wmg = -1, Wme = -1, Wmd = -1;
+  int64_t Wed = -1, Wee = -1;
+  const char *casename;
+  char buf[512];
+  int r;
+
+  if (G <= 0 || M <= 0 || E <= 0 || D <= 0) {
+    log_warn(LD_DIR, "Consensus with empty bandwidth: "
+                     "G="I64_FORMAT" M="I64_FORMAT" E="I64_FORMAT
+                     " D="I64_FORMAT" T="I64_FORMAT,
+             I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
+             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T));
+    return 0;
+  }
+
+  /*
+   * Computed from cases in 3.4.3 of dir-spec.txt
+   *
+   * 1. Neither are scarce
+   * 2. Both Guard and Exit are scarce
+   *    a. R+D <= S
+   *    b. R+D > S
+   * 3. One of Guard or Exit is scarce
+   *    a. S+D < T/3
+   *    b. S+D >= T/3
+   */
+  if (3*E >= T && 3*G >= T) { // E >= T/3 && G >= T/3
+    /* Case 1: Neither are scarce.  */
+    casename = "Case 1 (Wgd=Wmd=Wed)";
+    Wgd = weight_scale/3;
+    Wed = weight_scale/3;
+    Wmd = weight_scale/3;
+    Wee = (weight_scale*(E+G+M))/(3*E);
+    Wme = weight_scale - Wee;
+    Wmg = (weight_scale*(2*G-E-M))/(3*G);
+    Wgg = weight_scale - Wmg;
+
+    berr = networkstatus_check_weights(Wgg, Wgd, Wmg, Wme, Wmd, Wee, Wed,
+                                       weight_scale, G, M, E, D, T, 10, 1);
+
+    if (berr) {
+      log_warn(LD_DIR,
+             "Bw Weights error %d for %s v10. G="I64_FORMAT" M="I64_FORMAT
+             " E="I64_FORMAT" D="I64_FORMAT" T="I64_FORMAT
+             " Wmd=%d Wme=%d Wmg=%d Wed=%d Wee=%d"
+             " Wgd=%d Wgg=%d Wme=%d Wmg=%d weight_scale=%d",
+             berr, casename,
+             I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
+             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T),
+             (int)Wmd, (int)Wme, (int)Wmg, (int)Wed, (int)Wee,
+             (int)Wgd, (int)Wgg, (int)Wme, (int)Wmg, (int)weight_scale);
+      return 0;
+    }
+  } else if (3*E < T && 3*G < T) { // E < T/3 && G < T/3
+    int64_t R = MIN(E, G);
+    int64_t S = MAX(E, G);
+    /*
+     * Case 2: Both Guards and Exits are scarce
+     * Balance D between E and G, depending upon
+     * D capacity and scarcity.
+     */
+    if (R+D < S) { // Subcase a
+      Wgg = weight_scale;
+      Wee = weight_scale;
+      Wmg = 0;
+      Wme = 0;
+      Wmd = 0;
+      if (E < G) {
+        casename = "Case 2a (E scarce)";
+        Wed = weight_scale;
+        Wgd = 0;
+      } else { /* E >= G */
+        casename = "Case 2a (G scarce)";
+        Wed = 0;
+        Wgd = weight_scale;
+      }
+    } else { // Subcase b: R+D >= S
+      casename = "Case 2b1 (Wgg=1, Wmd=Wgd)";
+      Wee = (weight_scale*(E - G + M))/E;
+      Wed = (weight_scale*(D - 2*E + 4*G - 2*M))/(3*D);
+      Wme = (weight_scale*(G-M))/E;
+      Wmg = 0;
+      Wgg = weight_scale;
+      Wmd = (weight_scale - Wed)/2;
+      Wgd = (weight_scale - Wed)/2;
+
+      berr = networkstatus_check_weights(Wgg, Wgd, Wmg, Wme, Wmd, Wee, Wed,
+                                       weight_scale, G, M, E, D, T, 10, 1);
+
+      if (berr) {
+        casename = "Case 2b2 (Wgg=1, Wee=1)";
+        Wgg = weight_scale;
+        Wee = weight_scale;
+        Wed = (weight_scale*(D - 2*E + G + M))/(3*D);
+        Wmd = (weight_scale*(D - 2*M + G + E))/(3*D);
+        Wme = 0;
+        Wmg = 0;
+
+        if (Wmd < 0) { // Can happen if M > T/3
+          casename = "Case 2b3 (Wmd=0)";
+          Wmd = 0;
+          log_warn(LD_DIR,
+                   "Too much Middle bandwidth on the network to calculate "
+                   "balanced bandwidth-weights. Consider increasing the "
+                   "number of Guard nodes by lowering the requirements.");
+        }
+        Wgd = weight_scale - Wed - Wmd;
+        berr = networkstatus_check_weights(Wgg, Wgd, Wmg, Wme, Wmd, Wee,
+                  Wed, weight_scale, G, M, E, D, T, 10, 1);
+      }
+      if (berr != BW_WEIGHTS_NO_ERROR &&
+              berr != BW_WEIGHTS_BALANCE_MID_ERROR) {
+        log_warn(LD_DIR,
+             "Bw Weights error %d for %s v10. G="I64_FORMAT" M="I64_FORMAT
+             " E="I64_FORMAT" D="I64_FORMAT" T="I64_FORMAT
+             " Wmd=%d Wme=%d Wmg=%d Wed=%d Wee=%d"
+             " Wgd=%d Wgg=%d Wme=%d Wmg=%d weight_scale=%d",
+             berr, casename,
+             I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
+             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T),
+             (int)Wmd, (int)Wme, (int)Wmg, (int)Wed, (int)Wee,
+             (int)Wgd, (int)Wgg, (int)Wme, (int)Wmg, (int)weight_scale);
+        return 0;
+      }
+    }
+  } else { // if (E < T/3 || G < T/3) {
+    int64_t S = MIN(E, G);
+    // Case 3: Exactly one of Guard or Exit is scarce
+    if (!(3*E < T || 3*G < T) || !(3*G >= T || 3*E >= T)) {
+      log_warn(LD_BUG,
+           "Bw-Weights Case 3 v10 but with G="I64_FORMAT" M="
+           I64_FORMAT" E="I64_FORMAT" D="I64_FORMAT" T="I64_FORMAT,
+               I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
+               I64_PRINTF_ARG(D), I64_PRINTF_ARG(T));
+    }
+
+    if (3*(S+D) < T) { // Subcase a: S+D < T/3
+      if (G < E) {
+        casename = "Case 3a (G scarce)";
+        Wgg = Wgd = weight_scale;
+        Wmd = Wed = Wmg = 0;
+        // Minor subcase, if E is more scarce than M,
+        // keep its bandwidth in place.
+        if (E < M) Wme = 0;
+        else Wme = (weight_scale*(E-M))/(2*E);
+        Wee = weight_scale-Wme;
+      } else { // G >= E
+        casename = "Case 3a (E scarce)";
+        Wee = Wed = weight_scale;
+        Wmd = Wgd = Wme = 0;
+        // Minor subcase, if G is more scarce than M,
+        // keep its bandwidth in place.
+        if (G < M) Wmg = 0;
+        else Wmg = (weight_scale*(G-M))/(2*G);
+        Wgg = weight_scale-Wmg;
+      }
+    } else { // Subcase b: S+D >= T/3
+      // D != 0 because S+D >= T/3
+      if (G < E) {
+        casename = "Case 3bg (G scarce, Wgg=1, Wmd == Wed)";
+        Wgg = weight_scale;
+        Wgd = (weight_scale*(D - 2*G + E + M))/(3*D);
+        Wmg = 0;
+        Wee = (weight_scale*(E+M))/(2*E);
+        Wme = weight_scale - Wee;
+        Wmd = (weight_scale - Wgd)/2;
+        Wed = (weight_scale - Wgd)/2;
+
+        berr = networkstatus_check_weights(Wgg, Wgd, Wmg, Wme, Wmd, Wee,
+                    Wed, weight_scale, G, M, E, D, T, 10, 1);
+      } else { // G >= E
+        casename = "Case 3be (E scarce, Wee=1, Wmd == Wgd)";
+        Wee = weight_scale;
+        Wed = (weight_scale*(D - 2*E + G + M))/(3*D);
+        Wme = 0;
+        Wgg = (weight_scale*(G+M))/(2*G);
+        Wmg = weight_scale - Wgg;
+        Wmd = (weight_scale - Wed)/2;
+        Wgd = (weight_scale - Wed)/2;
+
+        berr = networkstatus_check_weights(Wgg, Wgd, Wmg, Wme, Wmd, Wee,
+                      Wed, weight_scale, G, M, E, D, T, 10, 1);
+      }
+      if (berr) {
+        log_warn(LD_DIR,
+             "Bw Weights error %d for %s v10. G="I64_FORMAT" M="I64_FORMAT
+             " E="I64_FORMAT" D="I64_FORMAT" T="I64_FORMAT
+             " Wmd=%d Wme=%d Wmg=%d Wed=%d Wee=%d"
+             " Wgd=%d Wgg=%d Wme=%d Wmg=%d weight_scale=%d",
+             berr, casename,
+             I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
+             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T),
+             (int)Wmd, (int)Wme, (int)Wmg, (int)Wed, (int)Wee,
+             (int)Wgd, (int)Wgg, (int)Wme, (int)Wmg, (int)weight_scale);
+        return 0;
+      }
+    }
+  }
+
+  /* We cast down the weights to 32 bit ints on the assumption that
+   * weight_scale is ~= 10000. We need to ensure a rogue authority
+   * doesn't break this assumption to rig our weights */
+  tor_assert(0 < weight_scale && weight_scale < INT32_MAX);
+
+  /*
+   * Provide Wgm=Wgg, Wmm=1, Wem=Wee, Weg=Wed. May later determine
+   * that middle nodes need different bandwidth weights for dirport traffic,
+   * or that weird exit policies need special weight, or that bridges
+   * need special weight.
+   *
+   * NOTE: This list is sorted.
+   */
+  r = tor_snprintf(buf, sizeof(buf),
+     "bandwidth-weights Wbd=%d Wbe=%d Wbg=%d Wbm=%d "
+     "Wdb=%d "
+     "Web=%d Wed=%d Wee=%d Weg=%d Wem=%d "
+     "Wgb=%d Wgd=%d Wgg=%d Wgm=%d "
+     "Wmb=%d Wmd=%d Wme=%d Wmg=%d Wmm=%d\n",
+     (int)Wmd, (int)Wme, (int)Wmg, (int)weight_scale,
+     (int)weight_scale,
+     (int)weight_scale, (int)Wed, (int)Wee, (int)Wed, (int)Wee,
+     (int)weight_scale, (int)Wgd, (int)Wgg, (int)Wgg,
+     (int)weight_scale, (int)Wmd, (int)Wme, (int)Wmg, (int)weight_scale);
+  if (r<0) {
+    log_warn(LD_BUG,
+             "Not enough space in buffer for bandwidth-weights line.");
+    *buf = '\0';
+    return 0;
+  }
+  smartlist_add(chunks, tor_strdup(buf));
+
+  log_notice(LD_CIRC, "Computed bandwidth weights for %s with v10: "
+             "G="I64_FORMAT" M="I64_FORMAT" E="I64_FORMAT" D="I64_FORMAT
+             " T="I64_FORMAT,
+             casename,
+             I64_PRINTF_ARG(G), I64_PRINTF_ARG(M), I64_PRINTF_ARG(E),
+             I64_PRINTF_ARG(D), I64_PRINTF_ARG(T));
+  return 1;
+}
+/**
+ * This function computes the bandwidth weights for consensus method 9.
+ *
+ * It has been obsoleted in favor of consensus method 10.
+ */
 static void
 networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
                               int64_t E, int64_t D, int64_t T,
@@ -1064,7 +1322,7 @@ networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
     *buf = '\0';
   }
   smartlist_add(chunks, tor_strdup(buf));
-  log_notice(LD_CIRC, "Computed bandwidth weights for %s: "
+  log_notice(LD_CIRC, "Computed bandwidth weights for %s with v9: "
              "G="I64_FORMAT" M="I64_FORMAT" E="I64_FORMAT" D="I64_FORMAT
              " T="I64_FORMAT,
              casename,
@@ -1101,6 +1359,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
   const routerstatus_format_type_t rs_format =
     flavor == FLAV_NS ? NS_V3_CONSENSUS : NS_V3_CONSENSUS_MICRODESC;
   char *params = NULL;
+  int added_weights = 0;
   tor_assert(flavor == FLAV_NS || flavor == FLAV_MICRODESC);
   tor_assert(total_authorities >= smartlist_len(votes));
 
@@ -1268,8 +1527,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
     smartlist_sort(dir_sources, _compare_dir_src_ents_by_authority_id);
 
     SMARTLIST_FOREACH_BEGIN(dir_sources, const dir_src_ent_t *, e) {
-      struct in_addr in;
-      char ip[INET_NTOA_BUF_LEN];
       char fingerprint[HEX_DIGEST_LEN+1];
       char votedigest[HEX_DIGEST_LEN+1];
       networkstatus_t *v = e->v;
@@ -1279,8 +1536,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
       if (e->is_legacy)
         tor_assert(consensus_method >= 2);
 
-      in.s_addr = htonl(voter->addr);
-      tor_inet_ntoa(&in, ip, sizeof(ip));
       base16_encode(fingerprint, sizeof(fingerprint), e->digest, DIGEST_LEN);
       base16_encode(votedigest, sizeof(votedigest), voter->vote_digest,
                     DIGEST_LEN);
@@ -1288,7 +1543,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       tor_asprintf(&buf,
                    "dir-source %s%s %s %s %s %d %d\n",
                    voter->nickname, e->is_legacy ? "-legacy" : "",
-                   fingerprint, voter->address, ip,
+                   fingerprint, voter->address, fmt_addr32(voter->addr),
                    voter->dir_port,
                    voter->or_port);
       smartlist_add(chunks, buf);
@@ -1330,7 +1585,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
                      * is the same flag as votes[j]->known_flags[b]. */
     int *named_flag; /* Index of the flag "Named" for votes[j] */
     int *unnamed_flag; /* Index of the flag "Unnamed" for votes[j] */
-    int chosen_named_idx, chosen_unnamed_idx;
+    int chosen_named_idx;
 
     strmap_t *name_to_id_map = strmap_new();
     char conflict[DIGEST_LEN];
@@ -1348,7 +1603,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
     for (i = 0; i < smartlist_len(votes); ++i)
       unnamed_flag[i] = named_flag[i] = -1;
     chosen_named_idx = smartlist_string_pos(flags, "Named");
-    chosen_unnamed_idx = smartlist_string_pos(flags, "Unnamed");
 
     /* Build the flag index. */
     SMARTLIST_FOREACH(votes, networkstatus_t *, v,
@@ -1387,7 +1641,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
               strmap_set_lc(name_to_id_map, rs->status.nickname,
                             rs->status.identity_digest);
             } else if (d != conflict &&
-                memcmp(d, rs->status.identity_digest, DIGEST_LEN)) {
+                fast_memcmp(d, rs->status.identity_digest, DIGEST_LEN)) {
               /* Authorities disagree about this nickname. */
               strmap_set_lc(name_to_id_map, rs->status.nickname, conflict);
             } else {
@@ -1411,7 +1665,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
             } else if (!d) {
               /* We have no name officially mapped to this digest. */
               strmap_set_lc(name_to_id_map, rs->status.nickname, unknown);
-            } else if (!memcmp(d, rs->status.identity_digest, DIGEST_LEN)) {
+            } else if (fast_memeq(d, rs->status.identity_digest, DIGEST_LEN)) {
               /* Authorities disagree about this nickname. */
               strmap_set_lc(name_to_id_map, rs->status.nickname, conflict);
             } else {
@@ -1432,7 +1686,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       const char *chosen_name = NULL;
       int exitsummary_disagreement = 0;
       int is_named = 0, is_unnamed = 0, is_running = 0;
-      int is_guard = 0, is_exit = 0;
+      int is_guard = 0, is_exit = 0, is_bad_exit = 0;
       int naming_conflict = 0;
       int n_listing = 0;
       int i;
@@ -1444,7 +1698,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
         if (index[v_sl_idx] < size[v_sl_idx]) {
           rs = smartlist_get(v->routerstatus_list, index[v_sl_idx]);
           if (!lowest_id ||
-              memcmp(rs->status.identity_digest, lowest_id, DIGEST_LEN) < 0)
+              fast_memcmp(rs->status.identity_digest,
+                          lowest_id, DIGEST_LEN) < 0)
             lowest_id = rs->status.identity_digest;
         }
       });
@@ -1463,7 +1718,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
         if (index[v_sl_idx] >= size[v_sl_idx])
           continue; /* out of entries. */
         rs = smartlist_get(v->routerstatus_list, index[v_sl_idx]);
-        if (memcmp(rs->status.identity_digest, lowest_id, DIGEST_LEN))
+        if (fast_memcmp(rs->status.identity_digest, lowest_id, DIGEST_LEN))
           continue; /* doesn't include this router. */
         /* At this point, we know that we're looking at a routerstatus with
          * identity "lowest".
@@ -1508,7 +1763,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       rs = compute_routerstatus_consensus(matching_descs, consensus_method,
                                           microdesc_digest);
       /* Copy bits of that into rs_out. */
-      tor_assert(!memcmp(lowest_id, rs->status.identity_digest, DIGEST_LEN));
+      tor_assert(fast_memeq(lowest_id, rs->status.identity_digest,DIGEST_LEN));
       memcpy(rs_out.identity_digest, lowest_id, DIGEST_LEN);
       memcpy(rs_out.descriptor_digest, rs->status.descriptor_digest,
              DIGEST_LEN);
@@ -1532,7 +1787,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
         const char *d = strmap_get_lc(name_to_id_map, rs_out.nickname);
         if (!d) {
           is_named = is_unnamed = 0;
-        } else if (!memcmp(d, lowest_id, DIGEST_LEN)) {
+        } else if (fast_memeq(d, lowest_id, DIGEST_LEN)) {
           is_named = 1; is_unnamed = 0;
         } else {
           is_named = 0; is_unnamed = 1;
@@ -1558,6 +1813,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
               is_guard = 1;
             else if (!strcmp(fl, "Running"))
               is_running = 1;
+            else if (!strcmp(fl, "BadExit"))
+              is_bad_exit = 1;
           }
         }
       });
@@ -1582,6 +1839,11 @@ networkstatus_compute_consensus(smartlist_t *votes,
       } else if (consensus_method >= 5 && num_bandwidths > 0) {
         rs_out.has_bandwidth = 1;
         rs_out.bandwidth = median_uint32(bandwidths, num_bandwidths);
+      }
+
+      /* Fix bug 2203: Do not count BadExit nodes as Exits for bw weights */
+      if (consensus_method >= 11) {
+        is_exit = is_exit && !is_bad_exit;
       }
 
       if (consensus_method >= MIN_METHOD_FOR_BW_WEIGHTS) {
@@ -1623,11 +1885,11 @@ networkstatus_compute_consensus(smartlist_t *votes,
         SMARTLIST_FOREACH(matching_descs, vote_routerstatus_t *, vsr, {
           /* Check if the vote where this status comes from had the
            * proper descriptor */
-          tor_assert(!memcmp(rs_out.identity_digest,
+          tor_assert(fast_memeq(rs_out.identity_digest,
                              vsr->status.identity_digest,
                              DIGEST_LEN));
           if (vsr->status.has_exitsummary &&
-               !memcmp(rs_out.descriptor_digest,
+               fast_memeq(rs_out.descriptor_digest,
                        vsr->status.descriptor_digest,
                        DIGEST_LEN)) {
             tor_assert(vsr->status.exitsummary);
@@ -1783,7 +2045,13 @@ networkstatus_compute_consensus(smartlist_t *votes,
       }
     }
 
-    networkstatus_compute_bw_weights_v9(chunks, G, M, E, D, T, weight_scale);
+    if (consensus_method < 10) {
+      networkstatus_compute_bw_weights_v9(chunks, G, M, E, D, T, weight_scale);
+      added_weights = 1;
+    } else {
+      added_weights = networkstatus_compute_bw_weights_v10(chunks, G, M, E, D,
+                                                           T, weight_scale);
+    }
   }
 
   /* Add a signature. */
@@ -1873,7 +2141,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       return NULL;
     }
     // Verify balancing parameters
-    if (consensus_method >= MIN_METHOD_FOR_BW_WEIGHTS) {
+    if (consensus_method >= MIN_METHOD_FOR_BW_WEIGHTS && added_weights) {
       networkstatus_verify_bw_weights(c);
     }
     networkstatus_vote_free(c);
@@ -1937,7 +2205,8 @@ networkstatus_add_detached_signatures(networkstatus_t *target,
     }
     for (alg = DIGEST_SHA1; alg < N_DIGEST_ALGORITHMS; ++alg) {
       if (!tor_mem_is_zero(digests->d[alg], DIGEST256_LEN)) {
-        if (!memcmp(target->digests.d[alg], digests->d[alg], DIGEST256_LEN)) {
+        if (fast_memeq(target->digests.d[alg], digests->d[alg],
+                       DIGEST256_LEN)) {
           ++n_matches;
         } else {
           *msg_out = "Mismatched digest.";
@@ -2235,7 +2504,7 @@ authority_cert_dup(authority_cert_t *cert)
 void
 dirvote_get_preferred_voting_intervals(vote_timing_t *timing_out)
 {
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
 
   tor_assert(timing_out);
 
@@ -2309,7 +2578,7 @@ static struct {
 /** Set voting_schedule to hold the timing for the next vote we should be
  * doing. */
 void
-dirvote_recalculate_timing(or_options_t *options, time_t now)
+dirvote_recalculate_timing(const or_options_t *options, time_t now)
 {
   int interval, vote_delay, dist_delay;
   time_t start;
@@ -2360,7 +2629,7 @@ dirvote_recalculate_timing(or_options_t *options, time_t now)
 
 /** Entry point: Take whatever voting actions are pending as of <b>now</b>. */
 void
-dirvote_act(or_options_t *options, time_t now)
+dirvote_act(const or_options_t *options, time_t now)
 {
   if (!authdir_mode_v3(options))
     return;
@@ -2475,7 +2744,7 @@ dirvote_perform_vote(void)
 
   directory_post_to_dirservers(DIR_PURPOSE_UPLOAD_VOTE,
                                ROUTER_PURPOSE_GENERAL,
-                               V3_AUTHORITY,
+                               V3_DIRINFO,
                                pending_vote->vote_body->dir,
                                pending_vote->vote_body->dir_len, 0);
   log_notice(LD_DIR, "Vote posted.");
@@ -2494,7 +2763,7 @@ dirvote_fetch_missing_votes(void)
   SMARTLIST_FOREACH(router_get_trusted_dir_servers(),
                     trusted_dir_server_t *, ds,
     {
-      if (!(ds->type & V3_AUTHORITY))
+      if (!(ds->type & V3_DIRINFO))
         continue;
       if (!dirvote_get_vote(ds->v3_identity_digest,
                             DGV_BY_ID|DGV_INCLUDE_PENDING)) {
@@ -2607,7 +2876,7 @@ list_v3_auth_ids(void)
   char *keys;
   SMARTLIST_FOREACH(router_get_trusted_dir_servers(),
                     trusted_dir_server_t *, ds,
-    if ((ds->type & V3_AUTHORITY) &&
+    if ((ds->type & V3_DIRINFO) &&
         !tor_digest_is_zero(ds->v3_identity_digest))
       smartlist_add(known_v3_keys,
                     tor_strdup(hex_str(ds->v3_identity_digest, DIGEST_LEN))));
@@ -2701,11 +2970,11 @@ dirvote_add_vote(const char *vote_body, const char **msg_out, int *status_out)
 
   /* Now see whether we already have a vote from this authority. */
   SMARTLIST_FOREACH(pending_vote_list, pending_vote_t *, v, {
-      if (! memcmp(v->vote->cert->cache_info.identity_digest,
+      if (fast_memeq(v->vote->cert->cache_info.identity_digest,
                    vote->cert->cache_info.identity_digest,
                    DIGEST_LEN)) {
         networkstatus_voter_info_t *vi_old = get_voter(v->vote);
-        if (!memcmp(vi_old->vote_digest, vi->vote_digest, DIGEST_LEN)) {
+        if (fast_memeq(vi_old->vote_digest, vi->vote_digest, DIGEST_LEN)) {
           /* Ah, it's the same vote. Not a problem. */
           log_info(LD_DIR, "Discarding a vote we already have (from %s).",
                    vi->address);
@@ -2802,11 +3071,11 @@ dirvote_compute_consensuses(void)
   if (!pending_vote_list)
     pending_vote_list = smartlist_create();
 
-  n_voters = get_n_authorities(V3_AUTHORITY);
+  n_voters = get_n_authorities(V3_DIRINFO);
   n_votes = smartlist_len(pending_vote_list);
   if (n_votes <= n_voters/2) {
     log_warn(LD_DIR, "We don't have enough votes to generate a consensus: "
-             "%d of %d", n_votes, n_voters/2);
+             "%d of %d", n_votes, n_voters/2+1);
     goto err;
   }
   tor_assert(pending_vote_list);
@@ -2855,8 +3124,12 @@ dirvote_compute_consensuses(void)
       authority_cert_t *cert = get_my_v3_legacy_cert();
       legacy_sign = get_my_v3_legacy_signing_key();
       if (cert) {
-        crypto_pk_get_digest(cert->identity_key, legacy_dbuf);
-        legacy_id_digest = legacy_dbuf;
+        if (crypto_pk_get_digest(cert->identity_key, legacy_dbuf)) {
+          log_warn(LD_BUG,
+                   "Unable to compute digest of legacy v3 identity key");
+        } else {
+          legacy_id_digest = legacy_dbuf;
+        }
       }
     }
 
@@ -2937,7 +3210,7 @@ dirvote_compute_consensuses(void)
 
   directory_post_to_dirservers(DIR_PURPOSE_UPLOAD_SIGNATURES,
                                ROUTER_PURPOSE_GENERAL,
-                               V3_AUTHORITY,
+                               V3_DIRINFO,
                                pending_consensus_signatures,
                                strlen(pending_consensus_signatures), 0);
   log_notice(LD_DIR, "Signature(s) posted.");
@@ -3202,23 +3475,23 @@ dirvote_get_vote(const char *fp, int flags)
   if (by_id) {
     if (pending_vote_list && include_pending) {
       SMARTLIST_FOREACH(pending_vote_list, pending_vote_t *, pv,
-        if (!memcmp(get_voter(pv->vote)->identity_digest, fp, DIGEST_LEN))
+        if (fast_memeq(get_voter(pv->vote)->identity_digest, fp, DIGEST_LEN))
           return pv->vote_body);
     }
     if (previous_vote_list && include_previous) {
       SMARTLIST_FOREACH(previous_vote_list, pending_vote_t *, pv,
-        if (!memcmp(get_voter(pv->vote)->identity_digest, fp, DIGEST_LEN))
+        if (fast_memeq(get_voter(pv->vote)->identity_digest, fp, DIGEST_LEN))
           return pv->vote_body);
     }
   } else {
     if (pending_vote_list && include_pending) {
       SMARTLIST_FOREACH(pending_vote_list, pending_vote_t *, pv,
-        if (!memcmp(pv->vote->digests.d[DIGEST_SHA1], fp, DIGEST_LEN))
+        if (fast_memeq(pv->vote->digests.d[DIGEST_SHA1], fp, DIGEST_LEN))
           return pv->vote_body);
     }
     if (previous_vote_list && include_previous) {
       SMARTLIST_FOREACH(previous_vote_list, pending_vote_t *, pv,
-        if (!memcmp(pv->vote->digests.d[DIGEST_SHA1], fp, DIGEST_LEN))
+        if (fast_memeq(pv->vote->digests.d[DIGEST_SHA1], fp, DIGEST_LEN))
           return pv->vote_body);
     }
   }
@@ -3337,7 +3610,7 @@ vote_routerstatus_find_microdesc_hash(char *digest256_out,
      * the first part. */
     while (1) {
       num_len = strspn(cp, "1234567890");
-      if (num_len == mlen && !memcmp(mstr, cp, mlen)) {
+      if (num_len == mlen && fast_memeq(mstr, cp, mlen)) {
         /* This is the line. */
         char buf[BASE64_DIGEST256_LEN+1];
         /* XXXX ignores extraneous stuff if the digest is too long.  This

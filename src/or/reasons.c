@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -39,6 +39,8 @@ stream_end_reason_to_control_string(int reason)
     case END_STREAM_REASON_CANT_ATTACH: return "CANT_ATTACH";
     case END_STREAM_REASON_NET_UNREACHABLE: return "NET_UNREACHABLE";
     case END_STREAM_REASON_SOCKSPROTOCOL: return "SOCKS_PROTOCOL";
+
+    case END_STREAM_REASON_PRIVATE_ADDR: return "PRIVATE_ADDR";
 
     default: return NULL;
   }
@@ -125,6 +127,9 @@ stream_end_reason_to_socks5_response(int reason)
       return SOCKS5_NET_UNREACHABLE;
     case END_STREAM_REASON_SOCKSPROTOCOL:
       return SOCKS5_GENERAL_ERROR;
+    case END_STREAM_REASON_PRIVATE_ADDR:
+      return SOCKS5_GENERAL_ERROR;
+
     default:
       log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
              "Reason for ending (%d) not recognized; "
@@ -169,13 +174,7 @@ errno_to_stream_end_reason(int e)
     S_CASE(ENETUNREACH):
       return END_STREAM_REASON_INTERNAL;
     S_CASE(EHOSTUNREACH):
-      /* XXXX022
-       * The correct behavior is END_STREAM_REASON_NOROUTE, but older
-       * clients don't recognize it.  So we're going to continue sending
-       * "MISC" until 0.2.1.27 or later is "well established".
-       */
-      /* return END_STREAM_REASON_NOROUTE; */
-      return END_STREAM_REASON_MISC;
+      return END_STREAM_REASON_NOROUTE;
     S_CASE(ECONNREFUSED):
       return END_STREAM_REASON_CONNECTREFUSED;
     S_CASE(ECONNRESET):
@@ -334,6 +333,8 @@ circuit_end_reason_to_control_string(int reason)
       return "NOPATH";
     case END_CIRC_REASON_NOSUCHSERVICE:
       return "NOSUCHSERVICE";
+    case END_CIRC_REASON_MEASUREMENT_EXPIRED:
+      return "MEASUREMENT_EXPIRED";
     default:
       log_warn(LD_BUG, "Unrecognized reason code %d", (int)reason);
       return NULL;

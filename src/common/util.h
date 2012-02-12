@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -14,6 +14,7 @@
 #include "orconfig.h"
 #include "torint.h"
 #include "compat.h"
+#include "di_ops.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -159,6 +160,12 @@ uint64_t round_to_power_of_2(uint64_t u64);
 unsigned round_to_next_multiple_of(unsigned number, unsigned divisor);
 uint32_t round_uint32_to_next_multiple_of(uint32_t number, uint32_t divisor);
 uint64_t round_uint64_to_next_multiple_of(uint64_t number, uint64_t divisor);
+int n_bits_set_u8(uint8_t v);
+
+/* Compute the CEIL of <b>a</b> divided by <b>b</b>, for nonnegative <b>a</b>
+ * and positive <b>b</b>.  Works on integer types only. Not defined if a+b can
+ * overflow. */
+#define CEIL_DIV(a,b) (((a)+(b)-1)/(b))
 
 /* String manipulation */
 
@@ -168,6 +175,7 @@ void tor_strlower(char *s) ATTR_NONNULL((1));
 void tor_strupper(char *s) ATTR_NONNULL((1));
 int tor_strisprint(const char *s) ATTR_PURE ATTR_NONNULL((1));
 int tor_strisnonupper(const char *s) ATTR_PURE ATTR_NONNULL((1));
+int strcmp_opt(const char *s1, const char *s2) ATTR_PURE;
 int strcmpstart(const char *s1, const char *s2) ATTR_PURE ATTR_NONNULL((1,2));
 int strcmp_len(const char *s1, const char *s2, size_t len)
   ATTR_PURE ATTR_NONNULL((1,2));
@@ -176,8 +184,8 @@ int strcasecmpstart(const char *s1, const char *s2)
 int strcmpend(const char *s1, const char *s2) ATTR_PURE ATTR_NONNULL((1,2));
 int strcasecmpend(const char *s1, const char *s2)
   ATTR_PURE ATTR_NONNULL((1,2));
-int memcmpstart(const void *mem, size_t memlen,
-                const char *prefix) ATTR_PURE;
+int fast_memcmpstart(const void *mem, size_t memlen,
+                     const char *prefix) ATTR_PURE;
 
 void tor_strstrip(char *s, const char *strip) ATTR_NONNULL((1,2));
 long tor_parse_long(const char *s, int base, long min,
@@ -197,6 +205,8 @@ const char *find_whitespace(const char *s) ATTR_PURE;
 const char *find_whitespace_eos(const char *s, const char *eos) ATTR_PURE;
 const char *find_str_at_start_of_line(const char *haystack, const char *needle)
   ATTR_PURE;
+int string_is_C_identifier(const char *string);
+
 int tor_mem_is_zero(const char *mem, size_t len) ATTR_PURE;
 int tor_digest_is_zero(const char *digest) ATTR_PURE;
 int tor_digest256_is_zero(const char *digest) ATTR_PURE;
@@ -211,6 +221,11 @@ int tor_sscanf(const char *buf, const char *pattern, ...)
   __attribute__((format(scanf, 2, 3)))
 #endif
   ;
+
+void smartlist_asprintf_add(struct smartlist_t *sl, const char *pattern, ...)
+  CHECK_PRINTF(2, 3);
+void smartlist_vasprintf_add(struct smartlist_t *sl, const char *pattern,
+                             va_list args);
 
 int hex_decode_digit(char c);
 void base16_encode(char *dest, size_t destlen, const char *src, size_t srclen);
@@ -242,19 +257,46 @@ time_t approx_time(void);
 void update_approx_time(time_t now);
 #endif
 
-/* Fuzzy time. */
-void ftime_set_maximum_sloppiness(int seconds);
-void ftime_set_estimated_skew(int seconds);
-/* typedef struct ftime_t { time_t earliest; time_t latest; } ftime_t; */
-/* void ftime_get_window(time_t now, ftime_t *ft_out); */
-int ftime_maybe_after(time_t now, time_t when);
-int ftime_maybe_before(time_t now, time_t when);
-int ftime_definitely_after(time_t now, time_t when);
-int ftime_definitely_before(time_t now, time_t when);
+/* Rate-limiter */
+
+/** A ratelim_t remembers how often an event is occurring, and how often
+ * it's allowed to occur.  Typical usage is something like:
+ *
+   <pre>
+    if (possibly_very_frequent_event()) {
+      const int INTERVAL = 300;
+      static ratelim_t warning_limit = RATELIM_INIT(INTERVAL);
+      char *m;
+      if ((m = rate_limit_log(&warning_limit, approx_time()))) {
+        log_warn(LD_GENERAL, "The event occurred!%s", m);
+        tor_free(m);
+      }
+    }
+   </pre>
+ */
+typedef struct ratelim_t {
+  int rate;
+  time_t last_allowed;
+  int n_calls_since_last_time;
+} ratelim_t;
+
+#define RATELIM_INIT(r) { (r), 0, 0 }
+
+char *rate_limit_log(ratelim_t *lim, time_t now);
 
 /* File helpers */
-ssize_t write_all(int fd, const char *buf, size_t count, int isSocket);
-ssize_t read_all(int fd, char *buf, size_t count, int isSocket);
+ssize_t write_all(tor_socket_t fd, const char *buf, size_t count,int isSocket);
+ssize_t read_all(tor_socket_t fd, char *buf, size_t count, int isSocket);
+
+/** Status of an I/O stream. */
+enum stream_status {
+  IO_STREAM_OKAY,
+  IO_STREAM_EAGAIN,
+  IO_STREAM_TERM,
+  IO_STREAM_CLOSED
+};
+
+enum stream_status get_string_from_pipe(FILE *stream, char *buf, size_t count);
 
 /** Return values from file_status(); see that function's documentation
  * for details. */
@@ -263,8 +305,14 @@ file_status_t file_status(const char *filename);
 
 /** Possible behaviors for check_private_dir() on encountering a nonexistent
  * directory; see that function's documentation for details. */
-typedef enum { CPD_NONE, CPD_CREATE, CPD_CHECK } cpd_check_t;
-int check_private_dir(const char *dirname, cpd_check_t check);
+typedef unsigned int cpd_check_t;
+#define CPD_NONE 0
+#define CPD_CREATE 1
+#define CPD_CHECK 2
+#define CPD_GROUP_OK 4
+#define CPD_CHECK_MODE_ONLY 8
+int check_private_dir(const char *dirname, cpd_check_t check,
+                      const char *effective_user);
 #define OPEN_FLAGS_REPLACE (O_WRONLY|O_CREAT|O_TRUNC)
 #define OPEN_FLAGS_APPEND (O_WRONLY|O_CREAT|O_APPEND)
 typedef struct open_file_t open_file_t;
@@ -307,6 +355,75 @@ int path_is_relative(const char *filename) ATTR_PURE;
 void start_daemon(void);
 void finish_daemon(const char *desired_cwd);
 void write_pidfile(char *filename);
+
+/* Port forwarding */
+void tor_check_port_forwarding(const char *filename,
+                               int dir_port, int or_port, time_t now);
+
+int tor_terminate_process(pid_t pid);
+typedef struct process_handle_s process_handle_t;
+int tor_spawn_background(const char *const filename, const char **argv,
+                         const char **envp, process_handle_t *process_handle);
+
+#define SPAWN_ERROR_MESSAGE "ERR: Failed to spawn background process - code "
+
+#ifdef MS_WINDOWS
+HANDLE load_windows_system_library(const TCHAR *library_name);
+#endif
+
+#ifdef UTIL_PRIVATE
+/* Prototypes for private functions only used by util.c (and unit tests) */
+
+/* Values of process_handle_t.status. PROCESS_STATUS_NOTRUNNING must be
+ * 0 because tor_check_port_forwarding depends on this being the initial
+ * statue of the static instance of process_handle_t */
+#define PROCESS_STATUS_NOTRUNNING 0
+#define PROCESS_STATUS_RUNNING 1
+#define PROCESS_STATUS_ERROR -1
+struct process_handle_s {
+  int status;
+#ifdef MS_WINDOWS
+  HANDLE stdout_pipe;
+  HANDLE stderr_pipe;
+  PROCESS_INFORMATION pid;
+#else
+  int stdout_pipe;
+  int stderr_pipe;
+  FILE *stdout_handle;
+  FILE *stderr_handle;
+  pid_t pid;
+#endif // MS_WINDOWS
+};
+
+/* Return values of tor_get_exit_code() */
+#define PROCESS_EXIT_RUNNING 1
+#define PROCESS_EXIT_EXITED 0
+#define PROCESS_EXIT_ERROR -1
+int tor_get_exit_code(const process_handle_t process_handle,
+                      int block, int *exit_code);
+int tor_split_lines(struct smartlist_t *sl, char *buf, int len);
+#ifdef MS_WINDOWS
+ssize_t tor_read_all_handle(HANDLE h, char *buf, size_t count,
+                            const process_handle_t *process);
+#else
+ssize_t tor_read_all_handle(FILE *h, char *buf, size_t count,
+                            const process_handle_t *process,
+                            int *eof);
+#endif
+ssize_t tor_read_all_from_process_stdout(
+    const process_handle_t *process_handle, char *buf, size_t count);
+ssize_t tor_read_all_from_process_stderr(
+    const process_handle_t *process_handle, char *buf, size_t count);
+char *tor_join_win_cmdline(const char *argv[]);
+
+void format_helper_exit_status(unsigned char child_state,
+                               int saved_errno, char *hex_errno);
+
+/* Space for hex values of child state, a slash, saved_errno (with
+   leading minus) and newline (no null) */
+#define HEX_ERRNO_SIZE (sizeof(char) * 2 + 1 + \
+                        1 + sizeof(int) * 2 + 1)
+#endif
 
 const char *libor_get_digests(void);
 

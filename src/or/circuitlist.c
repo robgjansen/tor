@@ -1,7 +1,7 @@
 /* Copyright 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -19,6 +19,7 @@
 #include "connection_or.h"
 #include "control.h"
 #include "networkstatus.h"
+#include "nodelist.h"
 #include "onion.h"
 #include "relay.h"
 #include "rendclient.h"
@@ -86,10 +87,7 @@ orconn_circid_circuit_map_t *_last_circid_orconn_ent = NULL;
 /** Implementation helper for circuit_set_{p,n}_circid_orconn: A circuit ID
  * and/or or_connection for circ has just changed from <b>old_conn, old_id</b>
  * to <b>conn, id</b>.  Adjust the conn,circid map as appropriate, removing
- * the old entry (if any) and adding a new one.  If <b>active</b> is true,
- * remove the circuit from the list of active circuits on old_conn and add it
- * to the list of active circuits on conn.
- * XXX "active" isn't an arg anymore */
+ * the old entry (if any) and adding a new one. */
 static void
 circuit_set_circid_orconn_helper(circuit_t *circ, int direction,
                                  circid_t id,
@@ -256,7 +254,7 @@ circuit_get_all_pending_on_or_conn(smartlist_t *out, or_connection_t *or_conn)
         continue;
     } else {
       /* We expected a key. See if it's the right one. */
-      if (memcmp(or_conn->identity_digest,
+      if (tor_memneq(or_conn->identity_digest,
                  circ->n_hop->identity_digest, DIGEST_LEN))
         continue;
     }
@@ -274,8 +272,10 @@ circuit_count_pending_on_or_conn(or_connection_t *or_conn)
   circuit_get_all_pending_on_or_conn(sl, or_conn);
   cnt = smartlist_len(sl);
   smartlist_free(sl);
-  log_debug(LD_CIRC,"or_conn to %s, %d pending circs",
-            or_conn->nickname ? or_conn->nickname : "NULL", cnt);
+  log_debug(LD_CIRC,"or_conn to %s at %s, %d pending circs",
+            or_conn->nickname ? or_conn->nickname : "NULL",
+            or_conn->_base.address,
+            cnt);
   return cnt;
 }
 
@@ -368,9 +368,65 @@ circuit_purpose_to_controller_string(uint8_t purpose)
     case CIRCUIT_PURPOSE_TESTING:
       return "TESTING";
     case CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT:
-      return "EXPIRED";
+      return "MEASURE_TIMEOUT";
     case CIRCUIT_PURPOSE_CONTROLLER:
       return "CONTROLLER";
+
+    default:
+      tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
+      return buf;
+  }
+}
+
+/** Return a human-readable string for the circuit purpose <b>purpose</b>. */
+const char *
+circuit_purpose_to_string(uint8_t purpose)
+{
+  static char buf[32];
+
+  switch (purpose)
+    {
+    case CIRCUIT_PURPOSE_OR:
+      return "Circuit at relay";
+    case CIRCUIT_PURPOSE_INTRO_POINT:
+      return "Acting as intro point";
+    case CIRCUIT_PURPOSE_REND_POINT_WAITING:
+      return "Acting as rendevous (pending)";
+    case CIRCUIT_PURPOSE_REND_ESTABLISHED:
+      return "Acting as rendevous (established)";
+    case CIRCUIT_PURPOSE_C_GENERAL:
+      return "General-purpose client";
+    case CIRCUIT_PURPOSE_C_INTRODUCING:
+      return "Hidden service client: Connecting to intro point";
+    case CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT:
+      return "Hidden service client: Waiting for ack from intro point";
+    case CIRCUIT_PURPOSE_C_INTRODUCE_ACKED:
+      return "Hidden service client: Received ack from intro point";
+    case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
+      return "Hidden service client: Establishing rendezvous point";
+    case CIRCUIT_PURPOSE_C_REND_READY:
+      return "Hidden service client: Pending rendezvous point";
+    case CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED:
+      return "Hidden service client: Pending rendezvous point (ack received)";
+    case CIRCUIT_PURPOSE_C_REND_JOINED:
+      return "Hidden service client: Active rendezvous point";
+    case CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT:
+      return "Measuring circuit timeout";
+
+    case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
+      return "Hidden service: Establishing introduction point";
+    case CIRCUIT_PURPOSE_S_INTRO:
+      return "Hidden service: Introduction point";
+    case CIRCUIT_PURPOSE_S_CONNECT_REND:
+      return "Hidden service: Connecting to rendezvous point";
+    case CIRCUIT_PURPOSE_S_REND_JOINED:
+      return "Hidden service: Active rendezvous point";
+
+    case CIRCUIT_PURPOSE_TESTING:
+      return "Testing circuit";
+
+    case CIRCUIT_PURPOSE_CONTROLLER:
+      return "Circuit made by controller";
 
     default:
       tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
@@ -384,7 +440,9 @@ circuit_purpose_to_controller_string(uint8_t purpose)
 int32_t
 circuit_initial_package_window(void)
 {
-  int32_t num = networkstatus_get_param(NULL, "circwindow", CIRCWINDOW_START);
+  int32_t num = networkstatus_get_param(NULL, "circwindow", CIRCWINDOW_START,
+                                        CIRCWINDOW_START_MIN,
+                                        CIRCWINDOW_START_MAX);
   /* If the consensus tells us a negative number, we'd assert. */
   if (num < 0)
     num = CIRCWINDOW_START;
@@ -396,8 +454,7 @@ circuit_initial_package_window(void)
 static void
 init_circuit_base(circuit_t *circ)
 {
-  circ->timestamp_created = time(NULL);
-  tor_gettimeofday(&circ->highres_created);
+  tor_gettimeofday(&circ->timestamp_created);
 
   circ->package_window = circuit_initial_package_window();
   circ->deliver_window = CIRCWINDOW_START;
@@ -493,6 +550,16 @@ circuit_free(circuit_t *circ)
 
     crypto_free_pk_env(ocirc->intro_key);
     rend_data_free(ocirc->rend_data);
+
+    tor_free(ocirc->dest_address);
+    if (ocirc->socks_username) {
+      memset(ocirc->socks_username, 0x12, ocirc->socks_username_len);
+      tor_free(ocirc->socks_username);
+    }
+    if (ocirc->socks_password) {
+      memset(ocirc->socks_password, 0x06, ocirc->socks_password_len);
+      tor_free(ocirc->socks_password);
+    }
   } else {
     or_circuit_t *ocirc = TO_OR_CIRCUIT(circ);
     /* Remember cell statistics for this circuit before deallocating. */
@@ -607,9 +674,10 @@ circuit_dump_details(int severity, circuit_t *circ, int conn_array_index,
                      const char *type, int this_circid, int other_circid)
 {
   log(severity, LD_CIRC, "Conn %d has %s circuit: circID %d (other side %d), "
-      "state %d (%s), born %d:",
+      "state %d (%s), born %ld:",
       conn_array_index, type, this_circid, other_circid, circ->state,
-      circuit_state_to_string(circ->state), (int)circ->timestamp_created);
+      circuit_state_to_string(circ->state),
+      (long)circ->timestamp_created.tv_sec);
   if (CIRCUIT_IS_ORIGIN(circ)) { /* circ starts at this node */
     circuit_log_path(severity, LD_CIRC, TO_ORIGIN_CIRCUIT(circ));
   }
@@ -661,7 +729,7 @@ circuit_dump_by_conn(connection_t *conn, int severity)
         tor_addr_eq(&circ->n_hop->addr, &conn->addr) &&
         circ->n_hop->port == conn->port &&
         conn->type == CONN_TYPE_OR &&
-        !memcmp(TO_OR_CONN(conn)->identity_digest,
+        tor_memeq(TO_OR_CONN(conn)->identity_digest,
                 circ->n_hop->identity_digest, DIGEST_LEN)) {
       circuit_dump_details(severity, circ, conn->conn_array_index,
                            (circ->state == CIRCUIT_STATE_OPEN &&
@@ -715,8 +783,8 @@ circuit_get_by_circid_orconn_impl(circid_t circ_id, or_connection_t *conn)
     return found->circuit;
 
   return NULL;
-
   /* The rest of this checks for bugs. Disabled by default. */
+  /* We comment it out because coverity complains otherwise.
   {
     circuit_t *circ;
     for (circ=global_circuitlist;circ;circ = circ->next) {
@@ -735,7 +803,7 @@ circuit_get_by_circid_orconn_impl(circid_t circ_id, or_connection_t *conn)
       }
     }
     return NULL;
-  }
+  } */
 }
 
 /** Return a circ such that:
@@ -806,7 +874,7 @@ circuit_unlink_all_from_or_conn(or_connection_t *conn, int reason)
 }
 
 /** Return a circ such that:
- *  - circ-\>rend_data-\>query is equal to <b>rend_query</b>, and
+ *  - circ-\>rend_data-\>onion_address is equal to <b>rend_query</b>, and
  *  - circ-\>purpose is equal to <b>purpose</b>.
  *
  * Return NULL if no such circuit exists.
@@ -855,7 +923,7 @@ circuit_get_next_by_pk_and_purpose(origin_circuit_t *start,
     if (!digest)
       return TO_ORIGIN_CIRCUIT(circ);
     else if (TO_ORIGIN_CIRCUIT(circ)->rend_data &&
-             !memcmp(TO_ORIGIN_CIRCUIT(circ)->rend_data->rend_pk_digest,
+             tor_memeq(TO_ORIGIN_CIRCUIT(circ)->rend_data->rend_pk_digest,
                      digest, DIGEST_LEN))
       return TO_ORIGIN_CIRCUIT(circ);
   }
@@ -873,7 +941,7 @@ circuit_get_by_rend_token_and_purpose(uint8_t purpose, const char *token,
   for (circ = global_circuitlist; circ; circ = circ->next) {
     if (! circ->marked_for_close &&
         circ->purpose == purpose &&
-        ! memcmp(TO_OR_CIRCUIT(circ)->rend_token, token, len))
+        tor_memeq(TO_OR_CIRCUIT(circ)->rend_token, token, len))
       return TO_OR_CIRCUIT(circ);
   }
   return NULL;
@@ -921,6 +989,7 @@ circuit_find_to_cannibalize(uint8_t purpose, extend_info_t *info,
   int need_uptime = (flags & CIRCLAUNCH_NEED_UPTIME) != 0;
   int need_capacity = (flags & CIRCLAUNCH_NEED_CAPACITY) != 0;
   int internal = (flags & CIRCLAUNCH_IS_INTERNAL) != 0;
+  const or_options_t *options = get_options();
 
   /* Make sure we're not trying to create a onehop circ by
    * cannibalization. */
@@ -942,22 +1011,36 @@ circuit_find_to_cannibalize(uint8_t purpose, extend_info_t *info,
           (!need_capacity || circ->build_state->need_capacity) &&
           (internal == circ->build_state->is_internal) &&
           circ->remaining_relay_early_cells &&
-          !circ->build_state->onehop_tunnel) {
+          !circ->build_state->onehop_tunnel &&
+          !circ->isolation_values_set) {
         if (info) {
           /* need to make sure we don't duplicate hops */
           crypt_path_t *hop = circ->cpath;
-          routerinfo_t *ri1 = router_get_by_digest(info->identity_digest);
+          const node_t *ri1 = node_get_by_id(info->identity_digest);
           do {
-            routerinfo_t *ri2;
-            if (!memcmp(hop->extend_info->identity_digest,
+            const node_t *ri2;
+            if (tor_memeq(hop->extend_info->identity_digest,
                         info->identity_digest, DIGEST_LEN))
               goto next;
             if (ri1 &&
-                (ri2 = router_get_by_digest(hop->extend_info->identity_digest))
-                && routers_in_same_family(ri1, ri2))
+                (ri2 = node_get_by_id(hop->extend_info->identity_digest))
+                && nodes_in_same_family(ri1, ri2))
               goto next;
             hop=hop->next;
           } while (hop!=circ->cpath);
+        }
+        if (options->ExcludeNodes) {
+          /* Make sure no existing nodes in the circuit are excluded for
+           * general use.  (This may be possible if StrictNodes is 0, and we
+           * thought we needed to use an otherwise excluded node for, say, a
+           * directory operation.) */
+          crypt_path_t *hop = circ->cpath;
+          do {
+            if (routerset_contains_extendinfo(options->ExcludeNodes,
+                                              hop->extend_info))
+              goto next;
+            hop = hop->next;
+          } while (hop != circ->cpath);
         }
         if (!best || (best->build_state->need_uptime && !need_uptime))
           best = circ;
@@ -1021,16 +1104,19 @@ circuit_mark_all_unused_circs(void)
  * This is useful for letting the user change pseudonyms, so new
  * streams will not be linkable to old streams.
  */
+/* XXX023 this is a bad name for what this function does */
 void
 circuit_expire_all_dirty_circs(void)
 {
   circuit_t *circ;
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
 
   for (circ=global_circuitlist; circ; circ = circ->next) {
     if (CIRCUIT_IS_ORIGIN(circ) &&
         !circ->marked_for_close &&
         circ->timestamp_dirty)
+      /* XXXX023 This is a screwed-up way to say "This is too dirty
+       * for new circuits. */
       circ->timestamp_dirty -= options->MaxCircuitDirtiness;
   }
 }
@@ -1042,9 +1128,11 @@ circuit_expire_all_dirty_circs(void)
  *   - If circ isn't open yet: call circuit_build_failed() if we're
  *     the origin, and in either case call circuit_rep_hist_note_result()
  *     to note stats.
- *   - If purpose is C_INTRODUCE_ACK_WAIT, remove the intro point we
- *     just tried from our list of intro points for that service
- *     descriptor.
+ *   - If purpose is C_INTRODUCE_ACK_WAIT, report the intro point
+ *     failure we just had to the hidden service client module.
+ *   - If purpose is C_INTRODUCING and <b>reason</b> isn't TIMEOUT,
+ *     report to the hidden service client module that the intro point
+ *     we just tried may be unreachable.
  *   - Send appropriate destroys and edge_destroys for conns and
  *     streams attached to circ.
  *   - If circ->rend_splice is set (we are the midpoint of a joined
@@ -1113,19 +1201,38 @@ _circuit_mark_for_close(circuit_t *circ, int reason, int line,
   }
   if (circ->purpose == CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT) {
     origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
+    int timed_out = (reason == END_CIRC_REASON_TIMEOUT);
     tor_assert(circ->state == CIRCUIT_STATE_OPEN);
     tor_assert(ocirc->build_state->chosen_exit);
     tor_assert(ocirc->rend_data);
     /* treat this like getting a nack from it */
-    log_info(LD_REND, "Failed intro circ %s to %s (awaiting ack). "
-           "Removing from descriptor.",
+    log_info(LD_REND, "Failed intro circ %s to %s (awaiting ack). %s",
            safe_str_client(ocirc->rend_data->onion_address),
+           safe_str_client(build_state_get_exit_nickname(ocirc->build_state)),
+           timed_out ? "Recording timeout." : "Removing from descriptor.");
+    rend_client_report_intro_point_failure(ocirc->build_state->chosen_exit,
+                                           ocirc->rend_data,
+                                           timed_out ?
+                                           INTRO_POINT_FAILURE_TIMEOUT :
+                                           INTRO_POINT_FAILURE_GENERIC);
+  } else if (circ->purpose == CIRCUIT_PURPOSE_C_INTRODUCING &&
+             reason != END_CIRC_REASON_TIMEOUT) {
+    origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
+    tor_assert(ocirc->build_state->chosen_exit);
+    tor_assert(ocirc->rend_data);
+    log_info(LD_REND, "Failed intro circ %s to %s "
+             "(building circuit to intro point). "
+             "Marking intro point as possibly unreachable.",
+             safe_str_client(ocirc->rend_data->onion_address),
            safe_str_client(build_state_get_exit_nickname(ocirc->build_state)));
-    rend_client_remove_intro_point(ocirc->build_state->chosen_exit,
-                                   ocirc->rend_data);
+    rend_client_report_intro_point_failure(ocirc->build_state->chosen_exit,
+                                           ocirc->rend_data,
+                                           INTRO_POINT_FAILURE_UNREACHABLE);
   }
-  if (circ->n_conn)
+  if (circ->n_conn) {
+    circuit_clear_cell_queue(circ, circ->n_conn);
     connection_or_send_destroy(circ->n_circ_id, circ->n_conn, reason);
+  }
 
   if (! CIRCUIT_IS_ORIGIN(circ)) {
     or_circuit_t *or_circ = TO_OR_CIRCUIT(circ);
@@ -1149,8 +1256,10 @@ _circuit_mark_for_close(circuit_t *circ, int reason, int line,
       conn->on_circuit = NULL;
     }
 
-    if (or_circ->p_conn)
+    if (or_circ->p_conn) {
+      circuit_clear_cell_queue(circ, or_circ->p_conn);
       connection_or_send_destroy(or_circ->p_circ_id, or_circ->p_conn, reason);
+    }
   } else {
     origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
     edge_connection_t *conn;

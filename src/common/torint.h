@@ -1,6 +1,6 @@
 /* Copyright (c) 2003, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -111,11 +111,20 @@ typedef signed int int32_t;
 typedef unsigned int uint32_t;
 #define HAVE_UINT32_T
 #endif
+#ifndef UINT16_MAX
+#define UINT16_MAX 0xffffu
+#endif
+#ifndef INT16_MAX
+#define INT16_MAX 0x7fff
+#endif
+#ifndef INT16_MIN
+#define INT16_MIN (-INT16_MAX-1)
+#endif
 #ifndef UINT32_MAX
 #define UINT32_MAX 0xffffffffu
 #endif
 #ifndef INT32_MAX
-#define INT32_MAX 0x7fffffffu
+#define INT32_MAX 0x7fffffff
 #endif
 #ifndef INT32_MIN
 #define INT32_MIN (-2147483647-1)
@@ -329,8 +338,10 @@ typedef uint32_t uintptr_t;
 #endif
 #endif
 
-/* Any size_t larger than this amount is likely to be an underflow. */
-#define SIZE_T_CEILING (sizeof(char)<<(sizeof(size_t)*8 - 1))
+/** Any ssize_t larger than this amount is likely to be an underflow. */
+#define SSIZE_T_CEILING ((ssize_t)(SSIZE_T_MAX-16))
+/** Any size_t larger than this amount is likely to be an underflow. */
+#define SIZE_T_CEILING  ((size_t)(SSIZE_T_MAX-16))
 
 #endif /* __TORINT_H */
 

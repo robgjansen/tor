@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -21,6 +21,7 @@ hibernating, phase 2:
   - close all OR/AP/exit conns)
 */
 
+#define HIBERNATE_PRIVATE
 #include "or.h"
 #include "config.h"
 #include "connection.h"
@@ -29,26 +30,11 @@ hibernating, phase 2:
 #include "main.h"
 #include "router.h"
 
-/** Possible values of hibernate_state */
-typedef enum {
-  /** We are running normally. */
-  HIBERNATE_STATE_LIVE=1,
-  /** We're trying to shut down cleanly, and we'll kill all active connections
-   * at shutdown_time. */
-  HIBERNATE_STATE_EXITING=2,
-  /** We're running low on allocated bandwidth for this period, so we won't
-   * accept any new connections. */
-  HIBERNATE_STATE_LOWBANDWIDTH=3,
-  /** We are hibernating, and we won't wake up till there's more bandwidth to
-   * use. */
-  HIBERNATE_STATE_DORMANT=4
-} hibernate_state_t;
-
 extern long stats_n_seconds_working; /* published uptime */
 
 /** Are we currently awake, asleep, running out of bandwidth, or shutting
  * down? */
-static hibernate_state_t hibernate_state = HIBERNATE_STATE_LIVE;
+static hibernate_state_t hibernate_state = HIBERNATE_STATE_INITIAL;
 /** If are hibernating, when do we plan to wake up? Set to 0 if we
  * aren't hibernating. */
 static time_t hibernate_end_time = 0;
@@ -95,6 +81,13 @@ static uint64_t n_bytes_read_in_interval = 0;
 static uint64_t n_bytes_written_in_interval = 0;
 /** How many seconds have we been running this interval? */
 static uint32_t n_seconds_active_in_interval = 0;
+/** How many seconds were we active in this interval before we hit our soft
+ * limit? */
+static int n_seconds_to_hit_soft_limit = 0;
+/** When in this interval was the soft limit hit. */
+static time_t soft_limit_hit_at = 0;
+/** How many bytes had we read/written when we hit the soft limit? */
+static uint64_t n_bytes_at_soft_limit = 0;
 /** When did this accounting interval start? */
 static time_t interval_start_time = 0;
 /** When will this accounting interval end? */
@@ -127,7 +120,7 @@ static void accounting_set_wakeup_time(void);
  * options->AccountingStart.  Return 0 on success, -1 on failure. If
  * <b>validate_only</b> is true, do not change the current settings. */
 int
-accounting_parse_options(or_options_t *options, int validate_only)
+accounting_parse_options(const or_options_t *options, int validate_only)
 {
   time_unit_t unit;
   int ok, idx;
@@ -242,7 +235,7 @@ accounting_parse_options(or_options_t *options, int validate_only)
  * hibernate, return 1, else return 0.
  */
 int
-accounting_is_enabled(or_options_t *options)
+accounting_is_enabled(const or_options_t *options)
 {
   if (options->AccountingMax)
     return 1;
@@ -341,29 +334,58 @@ start_of_accounting_period_after(time_t now)
   return edge_of_accounting_period_containing(now, 1);
 }
 
+/** Return the length of the accounting period containing the time
+ * <b>now</b>. */
+static long
+length_of_accounting_period_containing(time_t now)
+{
+  return edge_of_accounting_period_containing(now, 1) -
+    edge_of_accounting_period_containing(now, 0);
+}
+
 /** Initialize the accounting subsystem. */
 void
 configure_accounting(time_t now)
 {
+  time_t s_now;
   /* Try to remember our recorded usage. */
   if (!interval_start_time)
     read_bandwidth_usage(); /* If we fail, we'll leave values at zero, and
                              * reset below.*/
-  if (!interval_start_time ||
-      start_of_accounting_period_after(interval_start_time) <= now) {
-    /* We didn't have recorded usage, or we don't have recorded usage
-     * for this interval. Start a new interval. */
+
+  s_now = start_of_accounting_period_containing(now);
+
+  if (!interval_start_time) {
+    /* We didn't have recorded usage; Start a new interval. */
     log_info(LD_ACCT, "Starting new accounting interval.");
     reset_accounting(now);
-  } else if (interval_start_time ==
-        start_of_accounting_period_containing(interval_start_time)) {
+  } else if (s_now == interval_start_time) {
     log_info(LD_ACCT, "Continuing accounting interval.");
     /* We are in the interval we thought we were in. Do nothing.*/
     interval_end_time = start_of_accounting_period_after(interval_start_time);
   } else {
-    log_warn(LD_ACCT,
-             "Mismatched accounting interval; starting a fresh one.");
-    reset_accounting(now);
+    long duration =
+      length_of_accounting_period_containing(interval_start_time);
+    double delta = ((double)(s_now - interval_start_time)) / duration;
+    if (-0.50 <= delta && delta <= 0.50) {
+      /* The start of the period is now a little later or earlier than we
+       * remembered.  That's fine; we might lose some bytes we could otherwise
+       * have written, but better to err on the side of obeying people's
+       * accounting settings. */
+      log_info(LD_ACCT, "Accounting interval moved by %.02f%%; "
+               "that's fine.", delta*100);
+      interval_end_time = start_of_accounting_period_after(now);
+    } else if (delta >= 0.99) {
+      /* This is the regular time-moved-forward case; don't be too noisy
+       * about it or people will complain */
+      log_info(LD_ACCT, "Accounting interval elapsed; starting a new one");
+      reset_accounting(now);
+    } else {
+      log_warn(LD_ACCT,
+               "Mismatched accounting interval: moved by %.02f%%. "
+               "Starting a fresh one.", delta*100);
+      reset_accounting(now);
+    }
   }
   accounting_set_wakeup_time();
 }
@@ -374,23 +396,42 @@ configure_accounting(time_t now)
 static void
 update_expected_bandwidth(void)
 {
-  uint64_t used, expected;
-  uint64_t max_configured = (get_options()->BandwidthRate * 60);
+  uint64_t expected;
+  const or_options_t *options= get_options();
+  uint64_t max_configured = (options->RelayBandwidthRate > 0 ?
+                             options->RelayBandwidthRate :
+                             options->BandwidthRate) * 60;
 
-  if (n_seconds_active_in_interval < 1800) {
+#define MIN_TIME_FOR_MEASUREMENT (1800)
+
+  if (soft_limit_hit_at > interval_start_time && n_bytes_at_soft_limit &&
+      (soft_limit_hit_at - interval_start_time) > MIN_TIME_FOR_MEASUREMENT) {
+    /* If we hit our soft limit last time, only count the bytes up to that
+     * time. This is a better predictor of our actual bandwidth than
+     * considering the entirety of the last interval, since we likely started
+     * using bytes very slowly once we hit our soft limit. */
+    expected = n_bytes_at_soft_limit /
+      (soft_limit_hit_at - interval_start_time);
+    expected /= 60;
+  } else if (n_seconds_active_in_interval >= MIN_TIME_FOR_MEASUREMENT) {
+    /* Otherwise, we either measured enough time in the last interval but
+     * never hit our soft limit, or we're using a state file from a Tor that
+     * doesn't know to store soft-limit info.  Just take rate at which
+     * we were reading/writing in the last interval as our expected rate.
+     */
+    uint64_t used = MAX(n_bytes_written_in_interval,
+                        n_bytes_read_in_interval);
+    expected = used / (n_seconds_active_in_interval / 60);
+  } else {
     /* If we haven't gotten enough data last interval, set 'expected'
      * to 0.  This will set our wakeup to the start of the interval.
      * Next interval, we'll choose our starting time based on how much
      * we sent this interval.
      */
     expected = 0;
-  } else {
-    used = n_bytes_written_in_interval < n_bytes_read_in_interval ?
-      n_bytes_read_in_interval : n_bytes_written_in_interval;
-    expected = used / (n_seconds_active_in_interval / 60);
-    if (expected > max_configured)
-      expected = max_configured;
   }
+  if (expected > max_configured)
+    expected = max_configured;
   expected_bandwidth_usage = expected;
 }
 
@@ -408,6 +449,9 @@ reset_accounting(time_t now)
   n_bytes_read_in_interval = 0;
   n_bytes_written_in_interval = 0;
   n_seconds_active_in_interval = 0;
+  n_bytes_at_soft_limit = 0;
+  soft_limit_hit_at = 0;
+  n_seconds_to_hit_soft_limit = 0;
 }
 
 /** Return true iff we should save our bandwidth usage to disk. */
@@ -458,35 +502,39 @@ accounting_run_housekeeping(time_t now)
 static void
 accounting_set_wakeup_time(void)
 {
-  char buf[ISO_TIME_LEN+1];
   char digest[DIGEST_LEN];
   crypto_digest_env_t *d_env;
   int time_in_interval;
   uint64_t time_to_exhaust_bw;
   int time_to_consider;
 
-  if (! identity_key_is_set()) {
+  if (! server_identity_key_is_set()) {
     if (init_keys() < 0) {
       log_err(LD_BUG, "Error initializing keys");
       tor_assert(0);
     }
   }
 
-  format_iso_time(buf, interval_start_time);
-  crypto_pk_get_digest(get_identity_key(), digest);
+  if (server_identity_key_is_set()) {
+    char buf[ISO_TIME_LEN+1];
+    format_iso_time(buf, interval_start_time);
 
-  d_env = crypto_new_digest_env();
-  crypto_digest_add_bytes(d_env, buf, ISO_TIME_LEN);
-  crypto_digest_add_bytes(d_env, digest, DIGEST_LEN);
-  crypto_digest_get_digest(d_env, digest, DIGEST_LEN);
-  crypto_free_digest_env(d_env);
+    crypto_pk_get_digest(get_server_identity_key(), digest);
+
+    d_env = crypto_new_digest_env();
+    crypto_digest_add_bytes(d_env, buf, ISO_TIME_LEN);
+    crypto_digest_add_bytes(d_env, digest, DIGEST_LEN);
+    crypto_digest_get_digest(d_env, digest, DIGEST_LEN);
+    crypto_free_digest_env(d_env);
+  } else {
+    crypto_rand(digest, DIGEST_LEN);
+  }
 
   if (!expected_bandwidth_usage) {
     char buf1[ISO_TIME_LEN+1];
     char buf2[ISO_TIME_LEN+1];
     format_local_iso_time(buf1, interval_start_time);
     format_local_iso_time(buf2, interval_end_time);
-    time_to_exhaust_bw = GUESS_TIME_TO_USE_BANDWIDTH;
     interval_wakeup_time = interval_start_time;
 
     log_notice(LD_ACCT,
@@ -501,8 +549,8 @@ accounting_set_wakeup_time(void)
 
   time_to_exhaust_bw =
     (get_options()->AccountingMax/expected_bandwidth_usage)*60;
-  if (time_to_exhaust_bw > TIME_MAX) {
-    time_to_exhaust_bw = TIME_MAX;
+  if (time_to_exhaust_bw > INT_MAX) {
+    time_to_exhaust_bw = INT_MAX;
     time_to_consider = 0;
   } else {
     time_to_consider = time_in_interval - (int)time_to_exhaust_bw;
@@ -520,8 +568,6 @@ accounting_set_wakeup_time(void)
      * to be chosen than the last half. */
     interval_wakeup_time = interval_start_time +
       (get_uint32(digest) % time_to_consider);
-
-    format_iso_time(buf, interval_wakeup_time);
   }
 
   {
@@ -568,6 +614,10 @@ accounting_record_bandwidth_usage(time_t now, or_state_t *state)
   state->AccountingSecondsActive = n_seconds_active_in_interval;
   state->AccountingExpectedUsage = expected_bandwidth_usage;
 
+  state->AccountingSecondsToReachSoftLimit = n_seconds_to_hit_soft_limit;
+  state->AccountingSoftLimitHitAt = soft_limit_hit_at;
+  state->AccountingBytesAtSoftLimit = n_bytes_at_soft_limit;
+
   or_state_mark_dirty(state,
                       now+(get_options()->AvoidDiskWrites ? 7200 : 60));
 
@@ -591,16 +641,27 @@ read_bandwidth_usage(void)
   if (!state)
     return -1;
 
-  /* Okay; it looks like the state file is more up-to-date than the
-   * bw_accounting file, or the bw_accounting file is nonexistent,
-   * or the bw_accounting file is corrupt.
-   */
   log_info(LD_ACCT, "Reading bandwidth accounting data from state file");
   n_bytes_read_in_interval = state->AccountingBytesReadInInterval;
   n_bytes_written_in_interval = state->AccountingBytesWrittenInInterval;
   n_seconds_active_in_interval = state->AccountingSecondsActive;
   interval_start_time = state->AccountingIntervalStart;
   expected_bandwidth_usage = state->AccountingExpectedUsage;
+
+  /* Older versions of Tor (before 0.2.2.17-alpha or so) didn't generate these
+   * fields. If you switch back and forth, you might get an
+   * AccountingSoftLimitHitAt value from long before the most recent
+   * interval_start_time.  If that's so, then ignore the softlimit-related
+   * values. */
+  if (state->AccountingSoftLimitHitAt > interval_start_time) {
+    soft_limit_hit_at =  state->AccountingSoftLimitHitAt;
+    n_bytes_at_soft_limit = state->AccountingBytesAtSoftLimit;
+    n_seconds_to_hit_soft_limit = state->AccountingSecondsToReachSoftLimit;
+  } else {
+    soft_limit_hit_at = 0;
+    n_bytes_at_soft_limit = 0;
+    n_seconds_to_hit_soft_limit = 0;
+  }
 
   {
     char tbuf1[ISO_TIME_LEN+1];
@@ -641,8 +702,27 @@ hibernate_hard_limit_reached(void)
 static int
 hibernate_soft_limit_reached(void)
 {
-  uint64_t soft_limit = DBL_TO_U64(U64_TO_DBL(get_options()->AccountingMax)
-                                   * .95);
+  const uint64_t acct_max = get_options()->AccountingMax;
+#define SOFT_LIM_PCT (.95)
+#define SOFT_LIM_BYTES (500*1024*1024)
+#define SOFT_LIM_MINUTES (3*60)
+  /* The 'soft limit' is a fair bit more complicated now than once it was.
+   * We want to stop accepting connections when ALL of the following are true:
+   *   - We expect to use up the remaining bytes in under 3 hours
+   *   - We have used up 95% of our bytes.
+   *   - We have less than 500MB of bytes left.
+   */
+  uint64_t soft_limit = DBL_TO_U64(U64_TO_DBL(acct_max) * SOFT_LIM_PCT);
+  if (acct_max > SOFT_LIM_BYTES && acct_max - SOFT_LIM_BYTES > soft_limit) {
+    soft_limit = acct_max - SOFT_LIM_BYTES;
+  }
+  if (expected_bandwidth_usage) {
+    const uint64_t expected_usage =
+      expected_bandwidth_usage * SOFT_LIM_MINUTES;
+    if (acct_max > expected_usage && acct_max - expected_usage > soft_limit)
+      soft_limit = acct_max - expected_usage;
+  }
+
   if (!soft_limit)
     return 0;
   return n_bytes_read_in_interval >= soft_limit
@@ -656,7 +736,7 @@ static void
 hibernate_begin(hibernate_state_t new_state, time_t now)
 {
   connection_t *conn;
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
 
   if (new_state == HIBERNATE_STATE_EXITING &&
       hibernate_state != HIBERNATE_STATE_LIVE) {
@@ -665,6 +745,14 @@ hibernate_begin(hibernate_state_t new_state, time_t now)
                "a second time" : "while hibernating");
     tor_cleanup();
     exit(0);
+  }
+
+  if (new_state == HIBERNATE_STATE_LOWBANDWIDTH &&
+      hibernate_state == HIBERNATE_STATE_LIVE) {
+    soft_limit_hit_at = now;
+    n_seconds_to_hit_soft_limit = n_seconds_active_in_interval;
+    n_bytes_at_soft_limit = MAX(n_bytes_read_in_interval,
+                                n_bytes_written_in_interval);
   }
 
   /* close listeners. leave control listener(s). */
@@ -682,7 +770,8 @@ hibernate_begin(hibernate_state_t new_state, time_t now)
   /* XXX upload rendezvous service descriptors with no intro points */
 
   if (new_state == HIBERNATE_STATE_EXITING) {
-    log_notice(LD_GENERAL,"Interrupt: will shut down in %d seconds. Interrupt "
+    log_notice(LD_GENERAL,"Interrupt: we have stopped accepting new "
+               "connections, and will shut down in %d seconds. Interrupt "
                "again to exit now.", options->ShutdownWaitLength);
     shutdown_time = time(NULL) + options->ShutdownWaitLength;
   } else { /* soft limit reached */
@@ -701,10 +790,12 @@ static void
 hibernate_end(hibernate_state_t new_state)
 {
   tor_assert(hibernate_state == HIBERNATE_STATE_LOWBANDWIDTH ||
-             hibernate_state == HIBERNATE_STATE_DORMANT);
+             hibernate_state == HIBERNATE_STATE_DORMANT ||
+             hibernate_state == HIBERNATE_STATE_INITIAL);
 
   /* listeners will be relaunched in run_scheduled_events() in main.c */
-  log_notice(LD_ACCT,"Hibernation period ended. Resuming normal activity.");
+  if (hibernate_state != HIBERNATE_STATE_INITIAL)
+    log_notice(LD_ACCT,"Hibernation period ended. Resuming normal activity.");
 
   hibernate_state = new_state;
   hibernate_end_time = 0; /* no longer hibernating */
@@ -753,7 +844,7 @@ hibernate_go_dormant(time_t now)
       connection_edge_end(TO_EDGE_CONN(conn), END_STREAM_REASON_HIBERNATING);
     log_info(LD_NET,"Closing conn type %d", conn->type);
     if (conn->type == CONN_TYPE_AP) /* send socks failure if needed */
-      connection_mark_unattached_ap(TO_EDGE_CONN(conn),
+      connection_mark_unattached_ap(TO_ENTRY_CONN(conn),
                                     END_STREAM_REASON_HIBERNATING);
     else
       connection_mark_for_close(conn);
@@ -836,10 +927,12 @@ consider_hibernation(time_t now)
 
   /* Else, we aren't hibernating. See if it's time to start hibernating, or to
    * go dormant. */
-  if (hibernate_state == HIBERNATE_STATE_LIVE) {
+  if (hibernate_state == HIBERNATE_STATE_LIVE ||
+      hibernate_state == HIBERNATE_STATE_INITIAL) {
     if (hibernate_soft_limit_reached()) {
       log_notice(LD_ACCT,
-                 "Bandwidth soft limit reached; commencing hibernation.");
+                 "Bandwidth soft limit reached; commencing hibernation. "
+                 "No new connections will be accepted");
       hibernate_begin(HIBERNATE_STATE_LOWBANDWIDTH, now);
     } else if (accounting_enabled && now < interval_wakeup_time) {
       format_local_iso_time(buf,interval_wakeup_time);
@@ -847,6 +940,8 @@ consider_hibernation(time_t now)
                  "Commencing hibernation. We will wake up at %s local time.",
                  buf);
       hibernate_go_dormant(now);
+    } else if (hibernate_state == HIBERNATE_STATE_INITIAL) {
+      hibernate_end(HIBERNATE_STATE_LIVE);
     }
   }
 
@@ -911,5 +1006,15 @@ getinfo_helper_accounting(control_connection_t *conn,
     *answer = NULL;
   }
   return 0;
+}
+
+/**
+ * Manually change the hibernation state.  Private; used only by the unit
+ * tests.
+ */
+void
+hibernate_set_state_for_testing_(hibernate_state_t newstate)
+{
+  hibernate_state = newstate;
 }
 

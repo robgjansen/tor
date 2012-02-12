@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -43,18 +43,30 @@
 #ifdef HAVE_SYS_PARAM_H
 #include <sys/param.h> /* FreeBSD needs this to know what version it is */
 #endif
+#ifdef HAVE_SYS_UN_H
+#include <sys/un.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 
+/* tor_addr_is_null() and maybe other functions rely on AF_UNSPEC being 0 to
+ * work correctly. Bail out here if we've found a platform where AF_UNSPEC
+ * isn't 0. */
+#if AF_UNSPEC != 0
+#error We rely on AF_UNSPEC being 0. Let us know about your platform, please!
+#endif
+
 /** Convert the tor_addr_t in <b>a</b>, with port in <b>port</b>, into a
- * socklen object in *<b>sa_out</b> of object size <b>len</b>.  If not enough
- * room is free, or on error, return -1.  Else return the length of the
- * sockaddr. */
-/* XXXX021 This returns socklen_t.  socklen_t is sometimes unsigned.  This
- *   function claims to return -1 sometimes.  Problematic! */
+ * sockaddr object in *<b>sa_out</b> of object size <b>len</b>.  If not enough
+ * room is available in sa_out, or on error, return 0.  On success, return
+ * the length of the sockaddr.
+ *
+ * Interface note: ordinarily, we return -1 for error.  We can't do that here,
+ * since socklen_t is unsigned on some platforms.
+ **/
 socklen_t
 tor_addr_to_sockaddr(const tor_addr_t *a,
                      uint16_t port,
@@ -65,7 +77,7 @@ tor_addr_to_sockaddr(const tor_addr_t *a,
   if (family == AF_INET) {
     struct sockaddr_in *sin;
     if (len < (int)sizeof(struct sockaddr_in))
-      return -1;
+      return 0;
     sin = (struct sockaddr_in *)sa_out;
     memset(sin, 0, sizeof(struct sockaddr_in));
 #ifdef HAVE_STRUCT_SOCKADDR_IN_SIN_LEN
@@ -78,7 +90,7 @@ tor_addr_to_sockaddr(const tor_addr_t *a,
   } else if (family == AF_INET6) {
     struct sockaddr_in6 *sin6;
     if (len < (int)sizeof(struct sockaddr_in6))
-      return -1;
+      return 0;
     sin6 = (struct sockaddr_in6 *)sa_out;
     memset(sin6, 0, sizeof(struct sockaddr_in6));
 #ifdef HAVE_STRUCT_SOCKADDR_IN6_SIN6_LEN
@@ -89,7 +101,7 @@ tor_addr_to_sockaddr(const tor_addr_t *a,
     memcpy(&sin6->sin6_addr, tor_addr_to_in6(a), sizeof(struct in6_addr));
     return sizeof(struct sockaddr_in6);
   } else {
-    return -1;
+    return 0;
   }
 }
 
@@ -116,6 +128,33 @@ tor_addr_from_sockaddr(tor_addr_t *a, const struct sockaddr *sa,
     return -1;
   }
   return 0;
+}
+
+/** Return a newly allocated string holding the address described in
+ * <b>sa</b>.  AF_UNIX, AF_UNSPEC, AF_INET, and AF_INET6 are supported. */
+char *
+tor_sockaddr_to_str(const struct sockaddr *sa)
+{
+  char address[TOR_ADDR_BUF_LEN];
+  char *result;
+  tor_addr_t addr;
+  uint16_t port;
+#ifdef HAVE_SYS_UN_H
+  if (sa->sa_family == AF_UNIX) {
+    struct sockaddr_un *s_un = (struct sockaddr_un *)sa;
+    tor_asprintf(&result, "unix:%s", s_un->sun_path);
+    return result;
+  }
+#endif
+  if (sa->sa_family == AF_UNSPEC)
+    return tor_strdup("unspec");
+
+  if (tor_addr_from_sockaddr(&addr, sa, &port) < 0)
+    return NULL;
+  if (! tor_addr_to_str(address, &addr, sizeof(address), 1))
+    return NULL;
+  tor_asprintf(&result, "%s:%d", address, (int)port);
+  return result;
 }
 
 /** Set address <b>a</b> to the unspecified address.  This address belongs to
@@ -311,22 +350,28 @@ tor_addr_is_internal(const tor_addr_t *addr, int for_listening)
  *  brackets.
  */
 const char *
-tor_addr_to_str(char *dest, const tor_addr_t *addr, int len, int decorate)
+tor_addr_to_str(char *dest, const tor_addr_t *addr, size_t len, int decorate)
 {
   const char *ptr;
   tor_assert(addr && dest);
 
   switch (tor_addr_family(addr)) {
     case AF_INET:
-      if (len<3)
+      /* Shortest addr x.x.x.x + \0 */
+      if (len < 8)
         return NULL;
-        ptr = tor_inet_ntop(AF_INET, &addr->addr.in_addr, dest, len);
+      ptr = tor_inet_ntop(AF_INET, &addr->addr.in_addr, dest, len);
       break;
     case AF_INET6:
+      /* Shortest addr [ :: ] + \0 */
+      if (len < (3 + (decorate ? 2 : 0)))
+        return NULL;
+
       if (decorate)
         ptr = tor_inet_ntop(AF_INET6, &addr->addr.in6_addr, dest+1, len-2);
       else
         ptr = tor_inet_ntop(AF_INET6, &addr->addr.in6_addr, dest, len);
+
       if (ptr && decorate) {
         *dest = '[';
         memcpy(dest+strlen(dest), "]", 2);
@@ -352,7 +397,7 @@ tor_addr_to_str(char *dest, const tor_addr_t *addr, int len, int decorate)
  * IPv4 or IPv6 address too.
  */
 int
-tor_addr_parse_reverse_lookup_name(tor_addr_t *result, const char *address,
+tor_addr_parse_PTR_name(tor_addr_t *result, const char *address,
                                    int family, int accept_regular)
 {
   if (!strcasecmpend(address, ".in-addr.arpa")) {
@@ -423,7 +468,7 @@ tor_addr_parse_reverse_lookup_name(tor_addr_t *result, const char *address,
 
   if (accept_regular) {
     tor_addr_t tmp;
-    int r = tor_addr_from_str(&tmp, address);
+    int r = tor_addr_parse(&tmp, address);
     if (r < 0)
       return 0;
     if (r != family && family != AF_UNSPEC)
@@ -438,13 +483,17 @@ tor_addr_parse_reverse_lookup_name(tor_addr_t *result, const char *address,
   return 0;
 }
 
-/** Convert <b>addr</b> to an in-addr.arpa name or a .ip6.arpa name, and store
- * the result in the <b>outlen</b>-byte buffer at <b>out</b>.  Return 0 on
- * success, -1 on failure. */
+/** Convert <b>addr</b> to an in-addr.arpa name or a .ip6.arpa name,
+ * and store the result in the <b>outlen</b>-byte buffer at
+ * <b>out</b>.  Return the number of chars written to <b>out</b>, not
+ * including the trailing \0, on success. Returns -1 on failure. */
 int
-tor_addr_to_reverse_lookup_name(char *out, size_t outlen,
-                                const tor_addr_t *addr)
+tor_addr_to_PTR_name(char *out, size_t outlen,
+                     const tor_addr_t *addr)
 {
+  tor_assert(out);
+  tor_assert(addr);
+
   if (addr->family == AF_INET) {
     uint32_t a = tor_addr_to_ipv4h(addr);
 
@@ -467,7 +516,7 @@ tor_addr_to_reverse_lookup_name(char *out, size_t outlen,
       *cp++ = '.';
     }
     memcpy(cp, "ip6.arpa", 9); /* 8 characters plus NUL */
-    return 0;
+    return 32 * 2 + 8;
   }
   return -1;
 }
@@ -508,7 +557,8 @@ tor_addr_parse_mask_ports(const char *s, tor_addr_t *addr_out,
   tor_assert(s);
   tor_assert(addr_out);
 
-  /* IP, [], /mask, ports */
+  /** Longest possible length for an address, mask, and port-range combination.
+   * Includes IP, [], /mask, :, ports */
 #define MAX_ADDRESS_LENGTH (TOR_ADDR_BUF_LEN+2+(1+INET_NTOA_BUF_LEN)+12+1)
 
   if (strlen(s) > MAX_ADDRESS_LENGTH) {
@@ -601,7 +651,7 @@ tor_addr_parse_mask_ports(const char *s, tor_addr_t *addr_out,
       if (family == AF_INET6 && v4map) {
         if (bits > 32 && bits < 96) { /* Crazy */
           log_warn(LD_GENERAL,
-                   "Bad mask bits %i for V4-mapped V6 address; rejecting.",
+                   "Bad mask bits %d for V4-mapped V6 address; rejecting.",
                    bits);
           goto err;
         }
@@ -788,7 +838,7 @@ tor_addr_compare(const tor_addr_t *addr1, const tor_addr_t *addr2,
  * Reduce over-specific masks (>128 for ipv6, >32 for ipv4) to 128 or 32.
  *
  * The mask is interpreted relative to <b>addr1</b>, so that if a is
- * ::ffff:1.2.3.4, and b is 3.4.5.6,
+ * \::ffff:1.2.3.4, and b is 3.4.5.6,
  * tor_addr_compare_masked(a,b,100,CMP_SEMANTIC) is the same as
  * -tor_addr_compare_masked(b,a,4,CMP_SEMANTIC).
  *
@@ -800,6 +850,8 @@ int
 tor_addr_compare_masked(const tor_addr_t *addr1, const tor_addr_t *addr2,
                         maskbits_t mbits, tor_addr_comparison_t how)
 {
+  /** Helper: Evaluates to -1 if a is less than b, 0 if a equals b, or 1 if a
+   * is greater than b.  May evaluate a and b more than once.  */
 #define TRISTATE(a,b) (((a)<(b))?-1: (((a)==(b))?0:1))
   sa_family_t family1, family2, v_family1, v_family2;
 
@@ -832,7 +884,7 @@ tor_addr_compare_masked(const tor_addr_t *addr1, const tor_addr_t *addr2,
         const uint8_t *a2 = tor_addr_to_in6_addr8(addr2);
         const int bytes = mbits >> 3;
         const int leftover_bits = mbits & 7;
-        if (bytes && (r = memcmp(a1, a2, bytes))) {
+        if (bytes && (r = tor_memcmp(a1, a2, bytes))) {
           return r;
         } else if (leftover_bits) {
           uint8_t b1 = a1[bytes] >> (8-leftover_bits);
@@ -923,7 +975,22 @@ fmt_addr(const tor_addr_t *addr)
 {
   static char buf[TOR_ADDR_BUF_LEN];
   if (!addr) return "<null>";
-  tor_addr_to_str(buf, addr, sizeof(buf), 0);
+  if (tor_addr_to_str(buf, addr, sizeof(buf), 0))
+    return buf;
+  else
+    return "???";
+}
+
+/** Like fmt_addr(), but takes <b>addr</b> as a host-order IPv4
+ * addresses. Also not thread-safe, also clobbers its return buffer on
+ * repeated calls. */
+const char *
+fmt_addr32(uint32_t addr)
+{
+  static char buf[INET_NTOA_BUF_LEN];
+  struct in_addr in;
+  in.s_addr = htonl(addr);
+  tor_inet_ntoa(&in, buf, sizeof(buf));
   return buf;
 }
 
@@ -934,7 +1001,7 @@ fmt_addr(const tor_addr_t *addr)
  *  Return an address family on success, or -1 if an invalid address string is
  *  provided. */
 int
-tor_addr_from_str(tor_addr_t *addr, const char *src)
+tor_addr_parse(tor_addr_t *addr, const char *src)
 {
   char *tmp = NULL; /* Holds substring if we got a dotted quad. */
   int result;
@@ -962,7 +1029,7 @@ tor_addr_from_str(tor_addr_t *addr, const char *src)
  * address as needed, and put the result in <b>addr_out</b> and (optionally)
  * <b>port_out</b>.  Return 0 on success, negative on failure. */
 int
-tor_addr_port_parse(const char *s, tor_addr_t *addr_out, uint16_t *port_out)
+tor_addr_port_lookup(const char *s, tor_addr_t *addr_out, uint16_t *port_out)
 {
   const char *port;
   tor_addr_t addr;
@@ -1025,27 +1092,28 @@ get_interface_address6(int severity, sa_family_t family, tor_addr_t *addr)
 {
   int sock=-1, r=-1;
   struct sockaddr_storage my_addr, target_addr;
-  socklen_t my_addr_len;
+  socklen_t addr_len;
 
   tor_assert(addr);
 
   memset(addr, 0, sizeof(tor_addr_t));
   memset(&target_addr, 0, sizeof(target_addr));
-  my_addr_len = (socklen_t)sizeof(my_addr);
-  /* Use the "discard" service port */
-  ((struct sockaddr_in*)&target_addr)->sin_port = 9;
   /* Don't worry: no packets are sent. We just need to use a real address
    * on the actual Internet. */
   if (family == AF_INET6) {
     struct sockaddr_in6 *sin6 = (struct sockaddr_in6*)&target_addr;
+    /* Use the "discard" service port */
+    sin6->sin6_port = htons(9);
     sock = tor_open_socket(PF_INET6,SOCK_DGRAM,IPPROTO_UDP);
-    my_addr_len = (socklen_t)sizeof(struct sockaddr_in6);
+    addr_len = (socklen_t)sizeof(struct sockaddr_in6);
     sin6->sin6_family = AF_INET6;
     S6_ADDR16(sin6->sin6_addr)[0] = htons(0x2002); /* 2002:: */
   } else if (family == AF_INET) {
     struct sockaddr_in *sin = (struct sockaddr_in*)&target_addr;
+    /* Use the "discard" service port */
+    sin->sin_port = htons(9);
     sock = tor_open_socket(PF_INET,SOCK_DGRAM,IPPROTO_UDP);
-    my_addr_len = (socklen_t)sizeof(struct sockaddr_in);
+    addr_len = (socklen_t)sizeof(struct sockaddr_in);
     sin->sin_family = AF_INET;
     sin->sin_addr.s_addr = htonl(0x12000001); /* 18.0.0.1 */
   } else {
@@ -1058,14 +1126,13 @@ get_interface_address6(int severity, sa_family_t family, tor_addr_t *addr)
     goto err;
   }
 
-  if (connect(sock,(struct sockaddr *)&target_addr,
-              (socklen_t)sizeof(target_addr))<0) {
+  if (connect(sock,(struct sockaddr *)&target_addr, addr_len) < 0) {
     int e = tor_socket_errno(sock);
     log_fn(severity, LD_NET, "connect() failed: %s", tor_socket_strerror(e));
     goto err;
   }
 
-  if (getsockname(sock,(struct sockaddr*)&my_addr, &my_addr_len)) {
+  if (getsockname(sock,(struct sockaddr*)&my_addr, &addr_len)) {
     int e = tor_socket_errno(sock);
     log_fn(severity, LD_NET, "getsockname() to determine interface failed: %s",
            tor_socket_strerror(e));
@@ -1082,7 +1149,7 @@ get_interface_address6(int severity, sa_family_t family, tor_addr_t *addr)
 
 /* ======
  * IPv4 helpers
- * XXXX022 IPv6 deprecate some of these.
+ * XXXX023 IPv6 deprecate some of these.
  */
 
 /** Return true iff <b>ip</b> (in host order) is an IP reserved to localhost,
@@ -1098,6 +1165,20 @@ is_internal_IP(uint32_t ip, int for_listening)
   return tor_addr_is_internal(&myaddr, for_listening);
 }
 
+/** Given an address of the form "host:port", try to divide it into its host
+ * ane port portions, setting *<b>address_out</b> to a newly allocated string
+ * holding the address portion and *<b>port_out</b> to the port (or 0 if no
+ * port is given).  Return 0 on success, -1 on failure. */
+int
+tor_addr_port_split(int severity, const char *addrport,
+                    char **address_out, uint16_t *port_out)
+{
+  tor_assert(addrport);
+  tor_assert(address_out);
+  tor_assert(port_out);
+  return addr_port_lookup(severity, addrport, address_out, NULL, port_out);
+}
+
 /** Parse a string of the form "host[:port]" from <b>addrport</b>.  If
  * <b>address</b> is provided, set *<b>address</b> to a copy of the
  * host portion of the string.  If <b>addr</b> is provided, try to
@@ -1109,7 +1190,7 @@ is_internal_IP(uint32_t ip, int for_listening)
  * Return 0 on success, -1 on failure.
  */
 int
-parse_addr_port(int severity, const char *addrport, char **address,
+addr_port_lookup(int severity, const char *addrport, char **address,
                 uint32_t *addr, uint16_t *port_out)
 {
   const char *colon;
@@ -1119,7 +1200,7 @@ parse_addr_port(int severity, const char *addrport, char **address,
 
   tor_assert(addrport);
 
-  colon = strchr(addrport, ':');
+  colon = strrchr(addrport, ':');
   if (colon) {
     _address = tor_strndup(addrport, colon-addrport);
     _port = (int) tor_parse_long(colon+1,10,1,65535,NULL,NULL);

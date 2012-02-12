@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2010, The Tor Project, Inc. */
+/* Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 #if 1
 /* Tor dependencies */
@@ -62,7 +62,6 @@
 
 #if 1
 /* Tor dependencies */
-#include "orconfig.h"
 #include "util.h"
 #include "compat.h"
 #include "torlog.h"
@@ -137,7 +136,7 @@ struct mp_chunk_t {
   int capacity; /**< Number of items that can be fit into this chunk. */
   size_t mem_size; /**< Number of usable bytes in mem. */
   char *next_mem; /**< Pointer into part of <b>mem</b> not yet carved up. */
-  char mem[1]; /**< Storage for this chunk. (Not actual size.) */
+  char mem[FLEXIBLE_ARRAY_MEMBER]; /**< Storage for this chunk. */
 };
 
 /** Number of extra bytes needed beyond mem_size to allocate a chunk. */
@@ -356,6 +355,10 @@ mp_pool_new(size_t item_size, size_t chunk_capacity)
 {
   mp_pool_t *pool;
   size_t alloc_size, new_chunk_cap;
+
+  tor_assert(item_size < SIZE_T_CEILING);
+  tor_assert(chunk_capacity < SIZE_T_CEILING);
+  tor_assert(SIZE_T_CEILING / item_size > chunk_capacity);
 
   pool = ALLOC(sizeof(mp_pool_t));
   CHECK_ALLOC(pool);
