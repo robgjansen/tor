@@ -8,10 +8,16 @@
 
 struct event;
 struct event_base;
+#ifdef USE_BUFFEREVENTS
+struct bufferevent;
+struct ev_token_bucket_cfg;
+struct bufferevent_rate_limit_group;
+#endif
 
 #ifdef HAVE_EVENT2_EVENT_H
 #include <event2/util.h>
-#else
+#elif !defined(EVUTIL_SOCKET_DEFINED)
+#define EVUTIL_SOCKET_DEFINED
 #define evutil_socket_t int
 #endif
 
@@ -53,13 +59,28 @@ struct timeval;
 int tor_event_base_loopexit(struct event_base *base, struct timeval *tv);
 #endif
 
-void tor_libevent_initialize(void);
+typedef struct tor_libevent_cfg {
+  int disable_iocp;
+  int num_cpus;
+  int msec_per_tick;
+} tor_libevent_cfg;
+
+void tor_libevent_initialize(tor_libevent_cfg *cfg);
 struct event_base *tor_libevent_get_base(void);
 const char *tor_libevent_get_method(void);
 void tor_check_libevent_version(const char *m, int server,
                                 const char **badness_out);
 void tor_check_libevent_header_compatibility(void);
 const char *tor_libevent_get_version_str(void);
+
+#ifdef USE_BUFFEREVENTS
+const struct timeval *tor_libevent_get_one_tick_timeout(void);
+int tor_libevent_using_iocp_bufferevents(void);
+int tor_set_bufferevent_rate_limit(struct bufferevent *bev,
+                                   struct ev_token_bucket_cfg *cfg);
+int tor_add_bufferevent_to_rate_limit_group(struct bufferevent *bev,
+                                   struct bufferevent_rate_limit_group *g);
+#endif
 
 #endif
 

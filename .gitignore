@@ -29,6 +29,7 @@
 /aclocal.m4
 /autom4te.cache
 /build-stamp
+/compile
 /configure
 /Doxyfile
 /orconfig.h
@@ -63,16 +64,6 @@
 /contrib/tor.logrotate
 /contrib/tor.wxs
 
-# /contrib/osx/
-/contrib/osx/Makefile
-/contrib/osx/Makefile.in
-/contrib/osx/TorBundleDesc.plist
-/contrib/osx/TorBundleInfo.plist
-/contrib/osx/TorDesc.plist
-/contrib/osx/TorInfo.plist
-/contrib/osx/TorStartupDesc.plist
-/contrib/osx/net.freehaven.tor.plist
-
 # /contrib/suse/
 /contrib/suse/tor.sh
 /contrib/suse/Makefile.in
@@ -97,6 +88,11 @@
 /doc/tor.html
 /doc/tor.html.in
 /doc/tor.1.xml
+/doc/tor-fw-helper.1
+/doc/tor-fw-helper.1.in
+/doc/tor-fw-helper.html
+/doc/tor-fw-helper.html.in
+/doc/tor-fw-helper.1.xml
 /doc/tor-gencert.1
 /doc/tor-gencert.1.in
 /doc/tor-gencert.html
@@ -148,7 +144,12 @@
 # /src/test
 /src/test/Makefile
 /src/test/Makefile.in
+/src/test/bench
+/src/test/bench.exe
 /src/test/test
+/src/test/test-child
+/src/test/test.exe
+/src/test/test-child.exe
 
 
 # /src/tools/
@@ -160,6 +161,12 @@
 /src/tools/tor-gencert.exe
 /src/tools/Makefile
 /src/tools/Makefile.in
+
+# /src/tools/tor-fw-helper/
+/src/tools/tor-fw-helper/tor-fw-helper
+/src/tools/tor-fw-helper/tor-fw-helper.exe
+/src/tools/tor-fw-helper/Makefile
+/src/tools/tor-fw-helper/Makefile.in
 
 # /src/win32/
 /src/win32/Makefile

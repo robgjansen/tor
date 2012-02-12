@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2010, The Tor Project, Inc. */
+/* Copyright (c) 2008-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /** \file memarea.c
@@ -30,12 +30,18 @@
 #endif
 
 #ifdef USE_SENTINELS
+/** Magic value that we stick at the end of a memarea so we can make sure
+ * there are no run-off-the-end bugs. */
 #define SENTINEL_VAL 0x90806622u
+/** How many bytes per area do we devote to the sentinel? */
 #define SENTINEL_LEN sizeof(uint32_t)
+/** Given a mem_area_chunk_t with SENTINEL_LEN extra bytes allocated at the
+ * end, set those bytes. */
 #define SET_SENTINEL(chunk)                                     \
   STMT_BEGIN                                                    \
   set_uint32( &(chunk)->u.mem[chunk->mem_size], SENTINEL_VAL ); \
   STMT_END
+/** Assert that the sentinel on a memarea is set correctly. */
 #define CHECK_SENTINEL(chunk)                                           \
   STMT_BEGIN                                                            \
   uint32_t sent_val = get_uint32(&(chunk)->u.mem[chunk->mem_size]);     \
@@ -53,7 +59,9 @@ realign_pointer(void *ptr)
 {
   uintptr_t x = (uintptr_t)ptr;
   x = (x+MEMAREA_ALIGN_MASK) & ~MEMAREA_ALIGN_MASK;
-  tor_assert(((void*)x) >= ptr); // XXXX021 remove this once bug 930 is solved
+  /* Reinstate this if bug 930 ever reappears
+  tor_assert(((void*)x) >= ptr);
+  */
   return (void*)x;
 }
 
@@ -73,8 +81,11 @@ typedef struct memarea_chunk_t {
   } u;
 } memarea_chunk_t;
 
+/** How many bytes are needed for overhead before we get to the memory part
+ * of a chunk? */
 #define CHUNK_HEADER_SIZE STRUCT_OFFSET(memarea_chunk_t, u)
 
+/** What's the smallest that we'll allocate a chunk? */
 #define CHUNK_SIZE 4096
 
 /** A memarea_t is an allocation region for a set of small memory requests
@@ -95,6 +106,7 @@ static memarea_chunk_t *freelist = NULL;
 static memarea_chunk_t *
 alloc_chunk(size_t sz, int freelist_ok)
 {
+  tor_assert(sz < SIZE_T_CEILING);
   if (freelist && freelist_ok) {
     memarea_chunk_t *res = freelist;
     freelist = res->next_chunk;
@@ -211,6 +223,7 @@ memarea_alloc(memarea_t *area, size_t sz)
   char *result;
   tor_assert(chunk);
   CHECK_SENTINEL(chunk);
+  tor_assert(sz < SIZE_T_CEILING);
   if (sz == 0)
     sz = 1;
   if (chunk->next_mem+sz > chunk->u.mem+chunk->mem_size) {
@@ -230,9 +243,10 @@ memarea_alloc(memarea_t *area, size_t sz)
   }
   result = chunk->next_mem;
   chunk->next_mem = chunk->next_mem + sz;
-  // XXXX021 remove these once bug 930 is solved.
+  /* Reinstate these if bug 930 ever comes back
   tor_assert(chunk->next_mem >= chunk->u.mem);
   tor_assert(chunk->next_mem <= chunk->u.mem+chunk->mem_size);
+  */
   chunk->next_mem = realign_pointer(chunk->next_mem);
   return result;
 }
@@ -269,6 +283,7 @@ memarea_strndup(memarea_t *area, const char *s, size_t n)
   size_t ln;
   char *result;
   const char *cp, *end = s+n;
+  tor_assert(n < SIZE_T_CEILING);
   for (cp = s; cp < end && *cp; ++cp)
     ;
   /* cp now points to s+n, or to the 0 in the string. */

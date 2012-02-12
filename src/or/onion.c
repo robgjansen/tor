@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -63,15 +63,16 @@ onion_pending_add(or_circuit_t *circ, char *onionskin)
 
   if (ol_length >= get_options()->MaxOnionsPending) {
 #define WARN_TOO_MANY_CIRC_CREATIONS_INTERVAL (60)
-    static time_t last_warned = 0;
-    time_t now = time(NULL);
-    if (last_warned + WARN_TOO_MANY_CIRC_CREATIONS_INTERVAL < now) {
+    static ratelim_t last_warned =
+      RATELIM_INIT(WARN_TOO_MANY_CIRC_CREATIONS_INTERVAL);
+    char *m;
+    if ((m = rate_limit_log(&last_warned, approx_time()))) {
       log_warn(LD_GENERAL,
                "Your computer is too slow to handle this many circuit "
                "creation requests! Please consider using the "
                "MaxAdvertisedBandwidth config option or choosing a more "
-               "restricted exit policy.");
-      last_warned = now;
+               "restricted exit policy.%s",m);
+      tor_free(m);
     }
     tor_free(tmp);
     return -1;
@@ -183,7 +184,7 @@ onion_skin_create(crypto_pk_env_t *dest_router_key,
   *handshake_state_out = NULL;
   memset(onion_skin_out, 0, ONIONSKIN_CHALLENGE_LEN);
 
-  if (!(dh = crypto_dh_new()))
+  if (!(dh = crypto_dh_new(DH_TYPE_CIRCUIT)))
     goto err;
 
   dhbytes = crypto_dh_get_bytes(dh);
@@ -198,6 +199,7 @@ onion_skin_create(crypto_pk_env_t *dest_router_key,
 
   /* set meeting point, meeting cookie, etc here. Leave zero for now. */
   if (crypto_pk_public_hybrid_encrypt(dest_router_key, onion_skin_out,
+                                      ONIONSKIN_CHALLENGE_LEN,
                                       challenge, DH_KEY_LEN,
                                       PK_PKCS1_OAEP_PADDING, 1)<0)
     goto err;
@@ -240,6 +242,7 @@ onion_skin_server_handshake(const char *onion_skin, /*ONIONSKIN_CHALLENGE_LEN*/
       break;
     note_crypto_pk_op(DEC_ONIONSKIN);
     len = crypto_pk_private_hybrid_decrypt(k, challenge,
+                                           ONIONSKIN_CHALLENGE_LEN,
                                            onion_skin, ONIONSKIN_CHALLENGE_LEN,
                                            PK_PKCS1_OAEP_PADDING,0);
     if (len>0)
@@ -255,7 +258,11 @@ onion_skin_server_handshake(const char *onion_skin, /*ONIONSKIN_CHALLENGE_LEN*/
     goto err;
   }
 
-  dh = crypto_dh_new();
+  dh = crypto_dh_new(DH_TYPE_CIRCUIT);
+  if (!dh) {
+    log_warn(LD_BUG, "Couldn't allocate DH key");
+    goto err;
+  }
   if (crypto_dh_get_public(dh, handshake_reply_out, DH_KEY_LEN)) {
     log_info(LD_GENERAL, "crypto_dh_get_public failed.");
     goto err;
@@ -321,7 +328,7 @@ onion_skin_client_handshake(crypto_dh_env_t *handshake_state,
   if (len < 0)
     goto err;
 
-  if (memcmp(key_material, handshake_reply+DH_KEY_LEN, DIGEST_LEN)) {
+  if (tor_memneq(key_material, handshake_reply+DH_KEY_LEN, DIGEST_LEN)) {
     /* H(K) does *not* match. Something fishy. */
     log_warn(LD_PROTOCOL,"Digest DOES NOT MATCH on onion handshake. "
              "Bug or attack.");
@@ -348,9 +355,9 @@ onion_skin_client_handshake(crypto_dh_env_t *handshake_state,
  * Return 0 on success, &lt;0 on failure.
  **/
 int
-fast_server_handshake(const char *key_in, /* DIGEST_LEN bytes */
-                      char *handshake_reply_out, /* DIGEST_LEN*2 bytes */
-                      char *key_out,
+fast_server_handshake(const uint8_t *key_in, /* DIGEST_LEN bytes */
+                      uint8_t *handshake_reply_out, /* DIGEST_LEN*2 bytes */
+                      uint8_t *key_out,
                       size_t key_out_len)
 {
   char tmp[DIGEST_LEN+DIGEST_LEN];
@@ -358,7 +365,7 @@ fast_server_handshake(const char *key_in, /* DIGEST_LEN bytes */
   size_t out_len;
   int r = -1;
 
-  if (crypto_rand(handshake_reply_out, DIGEST_LEN)<0)
+  if (crypto_rand((char*)handshake_reply_out, DIGEST_LEN)<0)
     return -1;
 
   memcpy(tmp, key_in, DIGEST_LEN);
@@ -391,9 +398,9 @@ fast_server_handshake(const char *key_in, /* DIGEST_LEN bytes */
  * and protected by TLS).
  */
 int
-fast_client_handshake(const char *handshake_state, /* DIGEST_LEN bytes */
-                      const char *handshake_reply_out, /* DIGEST_LEN*2 bytes */
-                      char *key_out,
+fast_client_handshake(const uint8_t *handshake_state,/*DIGEST_LEN bytes*/
+                      const uint8_t *handshake_reply_out,/*DIGEST_LEN*2 bytes*/
+                      uint8_t *key_out,
                       size_t key_out_len)
 {
   char tmp[DIGEST_LEN+DIGEST_LEN];
@@ -408,7 +415,7 @@ fast_client_handshake(const char *handshake_state, /* DIGEST_LEN bytes */
   if (crypto_expand_key_material(tmp, sizeof(tmp), out, out_len)) {
     goto done;
   }
-  if (memcmp(out, handshake_reply_out+DIGEST_LEN, DIGEST_LEN)) {
+  if (tor_memneq(out, handshake_reply_out+DIGEST_LEN, DIGEST_LEN)) {
     /* H(K) does *not* match. Something fishy. */
     log_warn(LD_PROTOCOL,"Digest DOES NOT MATCH on fast handshake. "
              "Bug or attack.");

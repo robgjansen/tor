@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -11,6 +11,21 @@
 
 #ifndef _TOR_CIRCUITBUILD_H
 #define _TOR_CIRCUITBUILD_H
+
+/** Represents a pluggable transport proxy used by a bridge. */
+typedef struct {
+  /** SOCKS version: One of PROXY_SOCKS4, PROXY_SOCKS5. */
+  int socks_version;
+  /** Name of pluggable transport protocol */
+  char *name;
+  /** Address of proxy */
+  tor_addr_t addr;
+  /** Port of proxy */
+  uint16_t port;
+  /** Boolean: We are re-parsing our transport list, and we are going to remove
+   * this one if we don't find it in the list of configured transports. */
+  unsigned marked_for_removal : 1;
+} transport_t;
 
 char *circuit_list_path(origin_circuit_t *circ, int verbose);
 char *circuit_list_path_for_controller(origin_circuit_t *circ);
@@ -24,13 +39,14 @@ origin_circuit_t *circuit_establish_circuit(uint8_t purpose,
 int circuit_handle_first_hop(origin_circuit_t *circ);
 void circuit_n_conn_done(or_connection_t *or_conn, int status);
 int inform_testing_reachability(void);
+int circuit_timeout_want_to_count_circ(origin_circuit_t *circ);
 int circuit_send_next_onion_skin(origin_circuit_t *circ);
 void circuit_note_clock_jumped(int seconds_elapsed);
 int circuit_extend(cell_t *cell, circuit_t *circ);
 int circuit_init_cpath_crypto(crypt_path_t *cpath, const char *key_data,
                               int reverse);
 int circuit_finish_handshake(origin_circuit_t *circ, uint8_t cell_type,
-                             const char *reply);
+                             const uint8_t *reply);
 int circuit_truncated(origin_circuit_t *circ, crypt_path_t *layer);
 int onionskin_answer(or_circuit_t *circ, uint8_t cell_type,
                      const char *payload, const char *keys);
@@ -43,41 +59,49 @@ void onion_append_to_cpath(crypt_path_t **head_ptr, crypt_path_t *new_hop);
 extend_info_t *extend_info_alloc(const char *nickname, const char *digest,
                                  crypto_pk_env_t *onion_key,
                                  const tor_addr_t *addr, uint16_t port);
-extend_info_t *extend_info_from_router(routerinfo_t *r);
+extend_info_t *extend_info_from_router(const routerinfo_t *r);
+extend_info_t *extend_info_from_node(const node_t *node);
 extend_info_t *extend_info_dup(extend_info_t *info);
 void extend_info_free(extend_info_t *info);
-routerinfo_t *build_state_get_exit_router(cpath_build_state_t *state);
+const node_t *build_state_get_exit_node(cpath_build_state_t *state);
 const char *build_state_get_exit_nickname(cpath_build_state_t *state);
 
-void entry_guards_compute_status(void);
+void entry_guards_compute_status(const or_options_t *options, time_t now);
 int entry_guard_register_connect_status(const char *digest, int succeeded,
                                         int mark_relay_status, time_t now);
 void entry_nodes_should_be_added(void);
-int entry_list_is_constrained(or_options_t *options);
-routerinfo_t *choose_random_entry(cpath_build_state_t *state);
+int entry_list_is_constrained(const or_options_t *options);
+const node_t *choose_random_entry(cpath_build_state_t *state);
 int entry_guards_parse_state(or_state_t *state, int set, char **msg);
 void entry_guards_update_state(or_state_t *state);
 int getinfo_helper_entry_guards(control_connection_t *conn,
                                 const char *question, char **answer,
                                 const char **errmsg);
 
-void clear_bridge_list(void);
-int routerinfo_is_a_configured_bridge(routerinfo_t *ri);
-void
-learned_router_identity(tor_addr_t *addr, uint16_t port, const char *digest);
+void mark_bridge_list(void);
+void sweep_bridge_list(void);
+void mark_transport_list(void);
+void sweep_transport_list(void);
+
+int routerinfo_is_a_configured_bridge(const routerinfo_t *ri);
+int node_is_a_configured_bridge(const node_t *node);
+void learned_router_identity(const tor_addr_t *addr, uint16_t port,
+                             const char *digest);
 void bridge_add_from_config(const tor_addr_t *addr, uint16_t port,
-                            char *digest);
+                            const char *digest,
+                            const char *transport_name);
 void retry_bridge_descriptor_fetch_directly(const char *digest);
-void fetch_bridge_descriptors(time_t now);
+void fetch_bridge_descriptors(const or_options_t *options, time_t now);
 void learned_bridge_descriptor(routerinfo_t *ri, int from_cache);
 int any_bridge_descriptors_known(void);
 int any_pending_bridge_descriptor_fetches(void);
-int bridges_known_but_down(void);
-void bridges_retry_all(void);
+int entries_known_but_down(const or_options_t *options);
+void entries_retry_all(const or_options_t *options);
 
 void entry_guards_free_all(void);
 
 extern circuit_build_times_t circ_times;
+int circuit_build_times_enough_to_compute(circuit_build_times_t *cbt);
 void circuit_build_times_update_state(circuit_build_times_t *cbt,
                                       or_state_t *state);
 int circuit_build_times_parse_state(circuit_build_times_t *cbt,
@@ -118,6 +142,22 @@ int circuit_build_times_network_check_changed(circuit_build_times_t *cbt);
 void circuit_build_times_network_is_live(circuit_build_times_t *cbt);
 int circuit_build_times_network_check_live(circuit_build_times_t *cbt);
 void circuit_build_times_network_circ_success(circuit_build_times_t *cbt);
+
+int circuit_build_times_get_bw_scale(networkstatus_t *ns);
+
+void clear_transport_list(void);
+int transport_add_from_config(const tor_addr_t *addr, uint16_t port,
+                               const char *name, int socks_ver);
+int transport_add(transport_t *t);
+void transport_free(transport_t *transport);
+transport_t *transport_create(const tor_addr_t *addr, uint16_t port,
+                                      const char *name, int socks_ver);
+
+int find_transport_by_bridge_addrport(const tor_addr_t *addr, uint16_t port,
+                                      const transport_t **transport);
+transport_t *transport_get_by_name(const char *name);
+
+int validate_pluggable_transports_config(void);
 
 #endif
 

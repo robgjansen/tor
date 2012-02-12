@@ -1,11 +1,11 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
- * \file routerpase.h
+ * \file routerparse.h
  * \brief Header file for routerparse.c.
  **/
 
@@ -20,6 +20,7 @@ int router_get_networkstatus_v3_hash(const char *s, char *digest,
                                      digest_algorithm_t algorithm);
 int router_get_networkstatus_v3_hashes(const char *s, digests_t *digests);
 int router_get_extrainfo_hash(const char *s, char *digest);
+#define DIROBJ_MAX_SIG_LEN 256
 int router_append_dirobj_signature(char *buf, size_t buf_len,
                                    const char *digest,
                                    size_t digest_len,
@@ -46,6 +47,7 @@ version_status_t tor_version_is_obsolete(const char *myversion,
 int tor_version_parse(const char *s, tor_version_t *out);
 int tor_version_as_new_as(const char *platform, const char *cutoff);
 int tor_version_compare(tor_version_t *a, tor_version_t *b);
+int tor_version_same_series(tor_version_t *a, tor_version_t *b);
 void sort_version_list(smartlist_t *lst, int remove_duplicates);
 void assert_addr_policy_ok(smartlist_t *t);
 void dump_distinct_digest_count(int severity);
@@ -80,8 +82,6 @@ int rend_parse_introduction_points(rend_service_descriptor_t *parsed,
                                    const char *intro_points_encoded,
                                    size_t intro_points_encoded_size);
 int rend_parse_client_keys(strmap_t *parsed_clients, const char *str);
-
-void tor_gettimeofday_cache_clear(void);
 
 #endif
 

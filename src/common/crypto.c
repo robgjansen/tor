@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -13,8 +13,12 @@
 #include "orconfig.h"
 
 #ifdef MS_WINDOWS
+#ifndef WIN32_WINNT
 #define WIN32_WINNT 0x400
+#endif
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x400
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <wincrypt.h>
@@ -60,21 +64,21 @@
 #error "We require OpenSSL >= 0.9.7"
 #endif
 
-#include <openssl/engine.h>
-
 #ifdef ANDROID
 /* Android's OpenSSL seems to have removed all of its Engine support. */
 #define DISABLE_ENGINES
 #endif
 
 #if OPENSSL_VERSION_NUMBER < 0x00908000l
-/* On OpenSSL versions before 0.9.8, there is no working SHA256
+/** @{ */
+/** On OpenSSL versions before 0.9.8, there is no working SHA256
  * implementation, so we use Tom St Denis's nice speedy one, slightly adapted
- * to our needs */
+ * to our needs.  These macros make it usable by us. */
 #define SHA256_CTX sha256_state
 #define SHA256_Init sha256_init
 #define SHA256_Update sha256_process
 #define LTC_ARGCHK(x) tor_assert(x)
+/** @} */
 #include "sha256.c"
 #define SHA256_Final(a,b) sha256_done(b,a)
 
@@ -104,21 +108,22 @@ static int _n_openssl_mutexes = 0;
 /** A public key, or a public/private key-pair. */
 struct crypto_pk_env_t
 {
-  int refs; /* reference counting so we don't have to copy keys */
-  RSA *key;
+  int refs; /**< reference count, so we don't have to copy keys */
+  RSA *key; /**< The key itself */
 };
 
 /** Key and stream information for a stream cipher. */
 struct crypto_cipher_env_t
 {
-  char key[CIPHER_KEY_LEN];
-  aes_cnt_cipher_t *cipher;
+  char key[CIPHER_KEY_LEN]; /**< The raw key. */
+  aes_cnt_cipher_t *cipher; /**< The key in format usable for counter-mode AES
+                             * encryption */
 };
 
 /** A structure to hold the first half (x, g^x) of a Diffie-Hellman handshake
  * while we're waiting for the second.*/
 struct crypto_dh_env_t {
-  DH *dh;
+  DH *dh; /**< The openssl DH object */
 };
 
 static int setup_openssl_threading(void);
@@ -326,17 +331,6 @@ _crypto_new_pk_env_rsa(RSA *rsa)
   return env;
 }
 
-/** used by tortls.c: wrap the RSA from an evp_pkey in a crypto_pk_env_t.
- * returns NULL if this isn't an RSA key. */
-crypto_pk_env_t *
-_crypto_new_pk_env_evp_pkey(EVP_PKEY *pkey)
-{
-  RSA *rsa;
-  if (!(rsa = EVP_PKEY_get1_RSA(pkey)))
-    return NULL;
-  return _crypto_new_pk_env_rsa(rsa);
-}
-
 /** Helper, used by tor-checkkey.c and tor-gencert.c.  Return the RSA from a
  * crypto_pk_env_t. */
 RSA *
@@ -390,7 +384,7 @@ crypto_new_pk_env(void)
   RSA *rsa;
 
   rsa = RSA_new();
-  if (!rsa) return NULL;
+  tor_assert(rsa);
   return _crypto_new_pk_env_rsa(rsa);
 }
 
@@ -405,6 +399,7 @@ crypto_free_pk_env(crypto_pk_env_t *env)
 
   if (--env->refs > 0)
     return;
+  tor_assert(env->refs == 0);
 
   if (env->key)
     RSA_free(env->key);
@@ -517,21 +512,25 @@ crypto_pk_generate_key_with_bits(crypto_pk_env_t *env, int bits)
   return 0;
 }
 
-/** Read a PEM-encoded private key from the string <b>s</b> into <b>env</b>.
- * Return 0 on success, -1 on failure.
+/** Read a PEM-encoded private key from the <b>len</b>-byte string <b>s</b>
+ * into <b>env</b>.  Return 0 on success, -1 on failure.  If len is -1,
+ * the string is nul-terminated.
  */
 /* Used here, and used for testing. */
 int
 crypto_pk_read_private_key_from_string(crypto_pk_env_t *env,
-                                       const char *s)
+                                       const char *s, ssize_t len)
 {
   BIO *b;
 
   tor_assert(env);
   tor_assert(s);
+  tor_assert(len < INT_MAX && len < SSIZE_T_CEILING);
 
-  /* Create a read-only memory BIO, backed by the NUL-terminated string 's' */
-  b = BIO_new_mem_buf((char*)s, -1);
+  /* Create a read-only memory BIO, backed by the string 's' */
+  b = BIO_new_mem_buf((char*)s, (int)len);
+  if (!b)
+    return -1;
 
   if (env->key)
     RSA_free(env->key);
@@ -565,7 +564,8 @@ crypto_pk_read_private_key_from_filename(crypto_pk_env_t *env,
   }
 
   /* Try to parse it. */
-  r = crypto_pk_read_private_key_from_string(env, contents);
+  r = crypto_pk_read_private_key_from_string(env, contents, -1);
+  memset(contents, 0, strlen(contents));
   tor_free(contents);
   if (r)
     return -1; /* read_private_key_from_string already warned, so we don't.*/
@@ -591,6 +591,8 @@ crypto_pk_write_key_to_string_impl(crypto_pk_env_t *env, char **dest,
   tor_assert(dest);
 
   b = BIO_new(BIO_s_mem()); /* Create a memory BIO */
+  if (!b)
+    return -1;
 
   /* Now you can treat b as if it were a file.  Just use the
    * PEM_*_bio_* functions instead of the non-bio variants.
@@ -658,6 +660,8 @@ crypto_pk_read_public_key_from_string(crypto_pk_env_t *env, const char *src,
   tor_assert(len<INT_MAX);
 
   b = BIO_new(BIO_s_mem()); /* Create a memory BIO */
+  if (!b)
+    return -1;
 
   BIO_write(b, src, (int)len);
 
@@ -703,6 +707,7 @@ crypto_pk_write_private_key_to_filename(crypto_pk_env_t *env,
   s[len]='\0';
   r = write_str_to_file(fname, s, 0);
   BIO_free(bio);
+  memset(s, 0, strlen(s));
   tor_free(s);
   return r;
 }
@@ -728,6 +733,18 @@ crypto_pk_key_is_private(const crypto_pk_env_t *key)
 {
   tor_assert(key);
   return PRIVATE_KEY_OK(key);
+}
+
+/** Return true iff <b>env</b> contains a public key whose public exponent
+ * equals 65537.
+ */
+int
+crypto_pk_public_exponent_ok(crypto_pk_env_t *env)
+{
+  tor_assert(env);
+  tor_assert(env->key);
+
+  return BN_is_word(env->key->e, 65537);
 }
 
 /** Compare the public-key components of a and b.  Return -1 if a\<b, 0
@@ -760,6 +777,17 @@ crypto_pk_keysize(crypto_pk_env_t *env)
   tor_assert(env->key);
 
   return (size_t) RSA_size(env->key);
+}
+
+/** Return the size of the public key modulus of <b>env</b>, in bits. */
+int
+crypto_pk_num_bits(crypto_pk_env_t *env)
+{
+  tor_assert(env);
+  tor_assert(env->key);
+  tor_assert(env->key->n);
+
+  return BN_num_bits(env->key->n);
 }
 
 /** Increase the reference count of <b>env</b>, and return it.
@@ -806,9 +834,12 @@ crypto_pk_copy_full(crypto_pk_env_t *env)
  * in <b>env</b>, using the padding method <b>padding</b>.  On success,
  * write the result to <b>to</b>, and return the number of bytes
  * written.  On failure, return -1.
+ *
+ * <b>tolen</b> is the number of writable bytes in <b>to</b>, and must be
+ * at least the length of the modulus of <b>env</b>.
  */
 int
-crypto_pk_public_encrypt(crypto_pk_env_t *env, char *to,
+crypto_pk_public_encrypt(crypto_pk_env_t *env, char *to, size_t tolen,
                          const char *from, size_t fromlen, int padding)
 {
   int r;
@@ -816,6 +847,7 @@ crypto_pk_public_encrypt(crypto_pk_env_t *env, char *to,
   tor_assert(from);
   tor_assert(to);
   tor_assert(fromlen<INT_MAX);
+  tor_assert(tolen >= crypto_pk_keysize(env));
 
   r = RSA_public_encrypt((int)fromlen,
                          (unsigned char*)from, (unsigned char*)to,
@@ -831,9 +863,13 @@ crypto_pk_public_encrypt(crypto_pk_env_t *env, char *to,
  * in <b>env</b>, using the padding method <b>padding</b>.  On success,
  * write the result to <b>to</b>, and return the number of bytes
  * written.  On failure, return -1.
+ *
+ * <b>tolen</b> is the number of writable bytes in <b>to</b>, and must be
+ * at least the length of the modulus of <b>env</b>.
  */
 int
 crypto_pk_private_decrypt(crypto_pk_env_t *env, char *to,
+                          size_t tolen,
                           const char *from, size_t fromlen,
                           int padding, int warnOnFailure)
 {
@@ -843,6 +879,7 @@ crypto_pk_private_decrypt(crypto_pk_env_t *env, char *to,
   tor_assert(to);
   tor_assert(env->key);
   tor_assert(fromlen<INT_MAX);
+  tor_assert(tolen >= crypto_pk_keysize(env));
   if (!env->key->p)
     /* Not a private key */
     return -1;
@@ -863,9 +900,13 @@ crypto_pk_private_decrypt(crypto_pk_env_t *env, char *to,
  * public key in <b>env</b>, using PKCS1 padding.  On success, write the
  * signed data to <b>to</b>, and return the number of bytes written.
  * On failure, return -1.
+ *
+ * <b>tolen</b> is the number of writable bytes in <b>to</b>, and must be
+ * at least the length of the modulus of <b>env</b>.
  */
 int
 crypto_pk_public_checksig(crypto_pk_env_t *env, char *to,
+                          size_t tolen,
                           const char *from, size_t fromlen)
 {
   int r;
@@ -873,6 +914,7 @@ crypto_pk_public_checksig(crypto_pk_env_t *env, char *to,
   tor_assert(from);
   tor_assert(to);
   tor_assert(fromlen < INT_MAX);
+  tor_assert(tolen >= crypto_pk_keysize(env));
   r = RSA_public_decrypt((int)fromlen,
                          (unsigned char*)from, (unsigned char*)to,
                          env->key, RSA_PKCS1_PADDING);
@@ -895,24 +937,28 @@ crypto_pk_public_checksig_digest(crypto_pk_env_t *env, const char *data,
 {
   char digest[DIGEST_LEN];
   char *buf;
+  size_t buflen;
   int r;
 
   tor_assert(env);
   tor_assert(data);
   tor_assert(sig);
+  tor_assert(datalen < SIZE_T_CEILING);
+  tor_assert(siglen < SIZE_T_CEILING);
 
   if (crypto_digest(digest,data,datalen)<0) {
     log_warn(LD_BUG, "couldn't compute digest");
     return -1;
   }
-  buf = tor_malloc(crypto_pk_keysize(env)+1);
-  r = crypto_pk_public_checksig(env,buf,sig,siglen);
+  buflen = crypto_pk_keysize(env);
+  buf = tor_malloc(buflen);
+  r = crypto_pk_public_checksig(env,buf,buflen,sig,siglen);
   if (r != DIGEST_LEN) {
     log_warn(LD_CRYPTO, "Invalid signature");
     tor_free(buf);
     return -1;
   }
-  if (memcmp(buf, digest, DIGEST_LEN)) {
+  if (tor_memneq(buf, digest, DIGEST_LEN)) {
     log_warn(LD_CRYPTO, "Signature mismatched with digest.");
     tor_free(buf);
     return -1;
@@ -926,9 +972,12 @@ crypto_pk_public_checksig_digest(crypto_pk_env_t *env, const char *data,
  * <b>env</b>, using PKCS1 padding.  On success, write the signature to
  * <b>to</b>, and return the number of bytes written.  On failure, return
  * -1.
+ *
+ * <b>tolen</b> is the number of writable bytes in <b>to</b>, and must be
+ * at least the length of the modulus of <b>env</b>.
  */
 int
-crypto_pk_private_sign(crypto_pk_env_t *env, char *to,
+crypto_pk_private_sign(crypto_pk_env_t *env, char *to, size_t tolen,
                        const char *from, size_t fromlen)
 {
   int r;
@@ -936,6 +985,7 @@ crypto_pk_private_sign(crypto_pk_env_t *env, char *to,
   tor_assert(from);
   tor_assert(to);
   tor_assert(fromlen < INT_MAX);
+  tor_assert(tolen >= crypto_pk_keysize(env));
   if (!env->key->p)
     /* Not a private key */
     return -1;
@@ -954,16 +1004,19 @@ crypto_pk_private_sign(crypto_pk_env_t *env, char *to,
  * <b>from</b>; sign the data with the private key in <b>env</b>, and
  * store it in <b>to</b>.  Return the number of bytes written on
  * success, and -1 on failure.
+ *
+ * <b>tolen</b> is the number of writable bytes in <b>to</b>, and must be
+ * at least the length of the modulus of <b>env</b>.
  */
 int
-crypto_pk_private_sign_digest(crypto_pk_env_t *env, char *to,
+crypto_pk_private_sign_digest(crypto_pk_env_t *env, char *to, size_t tolen,
                               const char *from, size_t fromlen)
 {
   int r;
   char digest[DIGEST_LEN];
   if (crypto_digest(digest,from,fromlen)<0)
     return -1;
-  r = crypto_pk_private_sign(env,to,digest,DIGEST_LEN);
+  r = crypto_pk_private_sign(env,to,tolen,digest,DIGEST_LEN);
   memset(digest, 0, sizeof(digest));
   return r;
 }
@@ -987,7 +1040,7 @@ crypto_pk_private_sign_digest(crypto_pk_env_t *env, char *to,
  */
 int
 crypto_pk_public_hybrid_encrypt(crypto_pk_env_t *env,
-                                char *to,
+                                char *to, size_t tolen,
                                 const char *from,
                                 size_t fromlen,
                                 int padding, int force)
@@ -1000,6 +1053,7 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_env_t *env,
   tor_assert(env);
   tor_assert(from);
   tor_assert(to);
+  tor_assert(fromlen < SIZE_T_CEILING);
 
   overhead = crypto_get_rsa_padding_overhead(crypto_get_rsa_padding(padding));
   pkeylen = crypto_pk_keysize(env);
@@ -1009,8 +1063,13 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_env_t *env,
 
   if (!force && fromlen+overhead <= pkeylen) {
     /* It all fits in a single encrypt. */
-    return crypto_pk_public_encrypt(env,to,from,fromlen,padding);
+    return crypto_pk_public_encrypt(env,to,
+                                    tolen,
+                                    from,fromlen,padding);
   }
+  tor_assert(tolen >= fromlen + overhead + CIPHER_KEY_LEN);
+  tor_assert(tolen >= pkeylen);
+
   cipher = crypto_new_cipher_env();
   if (!cipher) return -1;
   if (crypto_cipher_generate_key(cipher)<0)
@@ -1032,7 +1091,7 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_env_t *env,
   /* Length of symmetrically encrypted data. */
   symlen = fromlen-(pkeylen-overhead-CIPHER_KEY_LEN);
 
-  outlen = crypto_pk_public_encrypt(env,to,buf,pkeylen-overhead,padding);
+  outlen = crypto_pk_public_encrypt(env,to,tolen,buf,pkeylen-overhead,padding);
   if (outlen!=(int)pkeylen) {
     goto err;
   }
@@ -1058,6 +1117,7 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_env_t *env,
 int
 crypto_pk_private_hybrid_decrypt(crypto_pk_env_t *env,
                                  char *to,
+                                 size_t tolen,
                                  const char *from,
                                  size_t fromlen,
                                  int padding, int warnOnFailure)
@@ -1067,14 +1127,16 @@ crypto_pk_private_hybrid_decrypt(crypto_pk_env_t *env,
   crypto_cipher_env_t *cipher = NULL;
   char *buf = NULL;
 
+  tor_assert(fromlen < SIZE_T_CEILING);
   pkeylen = crypto_pk_keysize(env);
 
   if (fromlen <= pkeylen) {
-    return crypto_pk_private_decrypt(env,to,from,fromlen,padding,
+    return crypto_pk_private_decrypt(env,to,tolen,from,fromlen,padding,
                                      warnOnFailure);
   }
-  buf = tor_malloc(pkeylen+1);
-  outlen = crypto_pk_private_decrypt(env,buf,from,pkeylen,padding,
+
+  buf = tor_malloc(pkeylen);
+  outlen = crypto_pk_private_decrypt(env,buf,pkeylen,from,pkeylen,padding,
                                      warnOnFailure);
   if (outlen<0) {
     log_fn(warnOnFailure?LOG_WARN:LOG_DEBUG, LD_CRYPTO,
@@ -1092,6 +1154,7 @@ crypto_pk_private_hybrid_decrypt(crypto_pk_env_t *env,
   }
   memcpy(to,buf+CIPHER_KEY_LEN,outlen-CIPHER_KEY_LEN);
   outlen -= CIPHER_KEY_LEN;
+  tor_assert(tolen - outlen >= fromlen - pkeylen);
   r = crypto_cipher_decrypt(cipher, to+outlen, from+pkeylen, fromlen-pkeylen);
   if (r<0)
     goto err;
@@ -1116,7 +1179,7 @@ crypto_pk_asn1_encode(crypto_pk_env_t *pk, char *dest, size_t dest_len)
   int len;
   unsigned char *buf, *cp;
   len = i2d_RSAPublicKey(pk->key, NULL);
-  if (len < 0 || (size_t)len > dest_len)
+  if (len < 0 || (size_t)len > dest_len || dest_len > SIZE_T_CEILING)
     return -1;
   cp = buf = tor_malloc(len+1);
   len = i2d_RSAPublicKey(pk->key, &cp);
@@ -1141,9 +1204,6 @@ crypto_pk_asn1_decode(const char *str, size_t len)
 {
   RSA *rsa;
   unsigned char *buf;
-  /* This ifdef suppresses a type warning.  Take out the first case once
-   * everybody is using OpenSSL 0.9.7 or later.
-   */
   const unsigned char *cp;
   cp = buf = tor_malloc(len);
   memcpy(buf,str,len);
@@ -1184,6 +1244,32 @@ crypto_pk_get_digest(crypto_pk_env_t *pk, char *digest_out)
   return 0;
 }
 
+/** Compute all digests of the DER encoding of <b>pk</b>, and store them
+ * in <b>digests_out</b>.  Return 0 on success, -1 on failure. */
+int
+crypto_pk_get_all_digests(crypto_pk_env_t *pk, digests_t *digests_out)
+{
+  unsigned char *buf, *bufp;
+  int len;
+
+  len = i2d_RSAPublicKey(pk->key, NULL);
+  if (len < 0)
+    return -1;
+  buf = bufp = tor_malloc(len+1);
+  len = i2d_RSAPublicKey(pk->key, &bufp);
+  if (len < 0) {
+    crypto_log_errors(LOG_WARN,"encoding public key");
+    tor_free(buf);
+    return -1;
+  }
+  if (crypto_digest_all(digests_out, (char*)buf, len) < 0) {
+    tor_free(buf);
+    return -1;
+  }
+  tor_free(buf);
+  return 0;
+}
+
 /** Copy <b>in</b> to the <b>outlen</b>-byte buffer <b>out</b>, adding spaces
  * every four spaces. */
 /* static */ void
@@ -1191,6 +1277,8 @@ add_spaces_to_fp(char *out, size_t outlen, const char *in)
 {
   int n = 0;
   char *end = out+outlen;
+  tor_assert(outlen < SIZE_T_CEILING);
+
   while (*in && out<end) {
     *out++ = *in++;
     if (++n == 4 && *in && out<end) {
@@ -1336,6 +1424,7 @@ crypto_cipher_encrypt(crypto_cipher_env_t *env, char *to,
   tor_assert(from);
   tor_assert(fromlen);
   tor_assert(to);
+  tor_assert(fromlen < SIZE_T_CEILING);
 
   aes_crypt(env->cipher, from, fromlen, to);
   return 0;
@@ -1352,6 +1441,7 @@ crypto_cipher_decrypt(crypto_cipher_env_t *env, char *to,
   tor_assert(env);
   tor_assert(from);
   tor_assert(to);
+  tor_assert(fromlen < SIZE_T_CEILING);
 
   aes_crypt(env->cipher, from, fromlen, to);
   return 0;
@@ -1363,6 +1453,7 @@ crypto_cipher_decrypt(crypto_cipher_env_t *env, char *to,
 int
 crypto_cipher_crypt_inplace(crypto_cipher_env_t *env, char *buf, size_t len)
 {
+  tor_assert(len < SIZE_T_CEILING);
   aes_crypt_inplace(env->cipher, buf, len);
   return 0;
 }
@@ -1430,7 +1521,7 @@ crypto_cipher_decrypt_with_iv(crypto_cipher_env_t *cipher,
 
 /* SHA-1 */
 
-/** Compute the SHA1 digest of <b>len</b> bytes in data stored in
+/** Compute the SHA1 digest of the <b>len</b> bytes on data stored in
  * <b>m</b>.  Write the DIGEST_LEN byte result into <b>digest</b>.
  * Return 0 on success, -1 on failure.
  */
@@ -1442,6 +1533,9 @@ crypto_digest(char *digest, const char *m, size_t len)
   return (SHA1((const unsigned char*)m,len,(unsigned char*)digest) == NULL);
 }
 
+/** Compute a 256-bit digest of <b>len</b> bytes in data stored in <b>m</b>,
+ * using the algorithm <b>algorithm</b>.  Write the DIGEST_LEN256-byte result
+ * into <b>digest</b>.  Return 0 on success, -1 on failure. */
 int
 crypto_digest256(char *digest, const char *m, size_t len,
                  digest_algorithm_t algorithm)
@@ -1501,13 +1595,14 @@ crypto_digest_algorithm_parse_name(const char *name)
 /** Intermediate information about the digest of a stream of data. */
 struct crypto_digest_env_t {
   union {
-    SHA_CTX sha1;
-    SHA256_CTX sha2;
-  } d;
-  digest_algorithm_t algorithm : 8;
+    SHA_CTX sha1; /**< state for SHA1 */
+    SHA256_CTX sha2; /**< state for SHA256 */
+  } d; /**< State for the digest we're using.  Only one member of the
+        * union is usable, depending on the value of <b>algorithm</b>. */
+  digest_algorithm_t algorithm : 8; /**< Which algorithm is in use? */
 };
 
-/** Allocate and return a new digest object.
+/** Allocate and return a new digest object to compute SHA1 digests.
  */
 crypto_digest_env_t *
 crypto_new_digest_env(void)
@@ -1519,6 +1614,8 @@ crypto_new_digest_env(void)
   return r;
 }
 
+/** Allocate and return a new digest object to compute 256-bit digests
+ * using <b>algorithm</b>. */
 crypto_digest_env_t *
 crypto_new_digest256_env(digest_algorithm_t algorithm)
 {
@@ -1591,6 +1688,10 @@ crypto_digest_get_digest(crypto_digest_env_t *digest,
       SHA256_Final(r, &tmpenv.d.sha2);
       break;
     default:
+      log_warn(LD_BUG, "Called with unknown algorithm %d", digest->algorithm);
+      /* If fragile_assert is not enabled, then we should at least not
+       * leak anything. */
+      memset(r, 0xff, sizeof(r));
       tor_fragile_assert();
       break;
   }
@@ -1638,10 +1739,80 @@ crypto_hmac_sha1(char *hmac_out,
        (unsigned char*)hmac_out, NULL);
 }
 
+/** Compute the HMAC-SHA-256 of the <b>msg_len</b> bytes in <b>msg</b>, using
+ * the <b>key</b> of length <b>key_len</b>.  Store the DIGEST_LEN-byte result
+ * in <b>hmac_out</b>.
+ */
+void
+crypto_hmac_sha256(char *hmac_out,
+                   const char *key, size_t key_len,
+                   const char *msg, size_t msg_len)
+{
+#if (OPENSSL_VERSION_NUMBER >= 0x00908000l)
+  /* If we've got OpenSSL >=0.9.8 we can use its hmac implementation. */
+  tor_assert(key_len < INT_MAX);
+  tor_assert(msg_len < INT_MAX);
+  HMAC(EVP_sha256(), key, (int)key_len, (unsigned char*)msg, (int)msg_len,
+       (unsigned char*)hmac_out, NULL);
+#else
+  /* OpenSSL doesn't have an EVP implementation for SHA256. We'll need
+     to do HMAC on our own.
+
+     HMAC isn't so hard: To compute HMAC(key, msg):
+      1. If len(key) > blocksize, key = H(key).
+      2. If len(key) < blocksize, right-pad key up to blocksize with 0 bytes.
+      3. let ipad = key xor 0x363636363636....36
+         let opad = key xor 0x5c5c5c5c5c5c....5c
+         The result is H(opad | H( ipad | msg ) )
+  */
+#define BLOCKSIZE 64
+#define DIGESTSIZE 32
+  uint8_t k[BLOCKSIZE];
+  uint8_t pad[BLOCKSIZE];
+  uint8_t d[DIGESTSIZE];
+  int i;
+  SHA256_CTX st;
+
+  tor_assert(key_len < INT_MAX);
+  tor_assert(msg_len < INT_MAX);
+
+  if (key_len <= BLOCKSIZE) {
+    memset(k, 0, sizeof(k));
+    memcpy(k, key, key_len); /* not time invariant in key_len */
+  } else {
+    SHA256((const uint8_t *)key, key_len, k);
+    memset(k+DIGESTSIZE, 0, sizeof(k)-DIGESTSIZE);
+  }
+  for (i = 0; i < BLOCKSIZE; ++i)
+    pad[i] = k[i] ^ 0x36;
+  SHA256_Init(&st);
+  SHA256_Update(&st, pad, BLOCKSIZE);
+  SHA256_Update(&st, (uint8_t*)msg, msg_len);
+  SHA256_Final(d, &st);
+
+  for (i = 0; i < BLOCKSIZE; ++i)
+    pad[i] = k[i] ^ 0x5c;
+  SHA256_Init(&st);
+  SHA256_Update(&st, pad, BLOCKSIZE);
+  SHA256_Update(&st, d, DIGESTSIZE);
+  SHA256_Final((uint8_t*)hmac_out, &st);
+
+  /* Now clear everything. */
+  memset(k, 0, sizeof(k));
+  memset(pad, 0, sizeof(pad));
+  memset(d, 0, sizeof(d));
+  memset(&st, 0, sizeof(st));
+#undef BLOCKSIZE
+#undef DIGESTSIZE
+#endif
+}
+
 /* DH */
 
-/** Shared P parameter for our DH key exchanged. */
+/** Shared P parameter for our circuit-crypto DH key exchanges. */
 static BIGNUM *dh_param_p = NULL;
+/** Shared P parameter for our TLS DH key exchanges. */
+static BIGNUM *dh_param_p_tls = NULL;
 /** Shared G parameter for our DH key exchanges. */
 static BIGNUM *dh_param_g = NULL;
 
@@ -1650,14 +1821,16 @@ static BIGNUM *dh_param_g = NULL;
 static void
 init_dh_param(void)
 {
-  BIGNUM *p, *g;
+  BIGNUM *p, *p2, *g;
   int r;
-  if (dh_param_p && dh_param_g)
+  if (dh_param_p && dh_param_g && dh_param_p_tls)
     return;
 
   p = BN_new();
+  p2 = BN_new();
   g = BN_new();
   tor_assert(p);
+  tor_assert(p2);
   tor_assert(g);
 
   /* This is from rfc2409, section 6.2.  It's a safe prime, and
@@ -1671,21 +1844,38 @@ init_dh_param(void)
                 "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6"
                 "49286651ECE65381FFFFFFFFFFFFFFFF");
   tor_assert(r);
+  /* This is the 1024-bit safe prime that Apache uses for its DH stuff; see
+   * modules/ssl/ssl_engine_dh.c */
+  r = BN_hex2bn(&p2,
+                  "D67DE440CBBBDC1936D693D34AFD0AD50C84D239A45F520BB88174CB98"
+                "BCE951849F912E639C72FB13B4B4D7177E16D55AC179BA420B2A29FE324A"
+                "467A635E81FF5901377BEDDCFD33168A461AAD3B72DAE8860078045B07A7"
+                "DBCA7874087D1510EA9FCC9DDD330507DD62DB88AEAA747DE0F4D6E2BD68"
+                "B0E7393E0F24218EB3");
+  tor_assert(r);
 
   r = BN_set_word(g, 2);
   tor_assert(r);
   dh_param_p = p;
+  dh_param_p_tls = p2;
   dh_param_g = g;
 }
 
+/** Number of bits to use when choosing the x or y value in a Diffie-Hellman
+ * handshake.  Since we exponentiate by this value, choosing a smaller one
+ * lets our handhake go faster.
+ */
 #define DH_PRIVATE_KEY_BITS 320
 
 /** Allocate and return a new DH object for a key exchange.
  */
 crypto_dh_env_t *
-crypto_dh_new(void)
+crypto_dh_new(int dh_type)
 {
   crypto_dh_env_t *res = tor_malloc_zero(sizeof(crypto_dh_env_t));
+
+  tor_assert(dh_type == DH_TYPE_CIRCUIT || dh_type == DH_TYPE_TLS ||
+             dh_type == DH_TYPE_REND);
 
   if (!dh_param_p)
     init_dh_param();
@@ -1693,8 +1883,13 @@ crypto_dh_new(void)
   if (!(res->dh = DH_new()))
     goto err;
 
-  if (!(res->dh->p = BN_dup(dh_param_p)))
-    goto err;
+  if (dh_type == DH_TYPE_TLS) {
+    if (!(res->dh->p = BN_dup(dh_param_p_tls)))
+      goto err;
+  } else {
+    if (!(res->dh->p = BN_dup(dh_param_p)))
+      goto err;
+  }
 
   if (!(res->dh->g = BN_dup(dh_param_g)))
     goto err;
@@ -1825,7 +2020,7 @@ crypto_dh_compute_secret(int severity, crypto_dh_env_t *dh,
 {
   char *secret_tmp = NULL;
   BIGNUM *pubkey_bn = NULL;
-  size_t secret_len=0;
+  size_t secret_len=0, secret_tmp_len=0;
   int result=0;
   tor_assert(dh);
   tor_assert(secret_bytes_out/DIGEST_LEN <= 255);
@@ -1839,7 +2034,8 @@ crypto_dh_compute_secret(int severity, crypto_dh_env_t *dh,
     log_fn(severity, LD_CRYPTO,"Rejected invalid g^x");
     goto error;
   }
-  secret_tmp = tor_malloc(crypto_dh_get_bytes(dh));
+  secret_tmp_len = crypto_dh_get_bytes(dh);
+  secret_tmp = tor_malloc(secret_tmp_len);
   result = DH_compute_key((unsigned char*)secret_tmp, pubkey_bn, dh->dh);
   if (result < 0) {
     log_warn(LD_CRYPTO,"DH_compute_key() failed.");
@@ -1858,7 +2054,10 @@ crypto_dh_compute_secret(int severity, crypto_dh_env_t *dh,
   crypto_log_errors(LOG_WARN, "completing DH handshake");
   if (pubkey_bn)
     BN_free(pubkey_bn);
-  tor_free(secret_tmp);
+  if (secret_tmp) {
+    memset(secret_tmp, 0, secret_tmp_len);
+    tor_free(secret_tmp);
+  }
   if (result < 0)
     return result;
   else
@@ -1917,15 +2116,22 @@ crypto_dh_free(crypto_dh_env_t *dh)
 
 /* random numbers */
 
-/* This is how much entropy OpenSSL likes to add right now, so maybe it will
+/** How many bytes of entropy we add at once.
+ *
+ * This is how much entropy OpenSSL likes to add right now, so maybe it will
  * work for us too. */
 #define ADD_ENTROPY 32
 
-/* Use RAND_poll if OpenSSL is 0.9.6 release or later.  (The "f" means
-   "release".)  */
+/** True iff we should use OpenSSL's RAND_poll function to add entropy to its
+ * pool.
+ *
+ * Use RAND_poll if OpenSSL is 0.9.6 release or later.  (The "f" means
+ *"release".)  */
 #define HAVE_RAND_POLL (OPENSSL_VERSION_NUMBER >= 0x0090600fl)
 
-/* Versions of OpenSSL prior to 0.9.7k and 0.9.8c had a bug where RAND_poll
+/** True iff it's safe to use RAND_poll after setup.
+ *
+ * Versions of OpenSSL prior to 0.9.7k and 0.9.8c had a bug where RAND_poll
  * would allocate an fd_set on the stack, open a new file, and try to FD_SET
  * that fd without checking whether it fit in the fd_set.  Thus, if the
  * system has not just been started up, it is unsafe to call */
@@ -1934,6 +2140,15 @@ crypto_dh_free(crypto_dh_env_t *dh)
     OPENSSL_VERSION_NUMBER <= 0x00907fffl) ||   \
    (OPENSSL_VERSION_NUMBER >= 0x0090803fl))
 
+/** Set the seed of the weak RNG to a random value. */
+static void
+seed_weak_rng(void)
+{
+  unsigned seed;
+  crypto_rand((void*)&seed, sizeof(seed));
+  tor_init_weak_random(seed);
+}
+
 /** Seed OpenSSL's random number generator with bytes from the operating
  * system.  <b>startup</b> should be true iff we have just started Tor and
  * have not yet allocated a bunch of fds.  Return 0 on success, -1 on failure.
@@ -1941,14 +2156,15 @@ crypto_dh_free(crypto_dh_env_t *dh)
 int
 crypto_seed_rng(int startup)
 {
-  char buf[ADD_ENTROPY];
   int rand_poll_status = 0;
 
   /* local variables */
 #ifdef MS_WINDOWS
+  unsigned char buf[ADD_ENTROPY];
   static int provider_set = 0;
   static HCRYPTPROV provider;
 #else
+  char buf[ADD_ENTROPY];
   static const char *filenames[] = {
     "/dev/srandom", "/dev/urandom", "/dev/random", NULL
   };
@@ -1984,6 +2200,7 @@ crypto_seed_rng(int startup)
   }
   RAND_seed(buf, sizeof(buf));
   memset(buf, 0, sizeof(buf));
+  seed_weak_rng();
   return 0;
 #else
   for (i = 0; filenames[i]; ++i) {
@@ -2000,6 +2217,7 @@ crypto_seed_rng(int startup)
     }
     RAND_seed(buf, (int)sizeof(buf));
     memset(buf, 0, sizeof(buf));
+    seed_weak_rng();
     return 0;
   }
 
@@ -2024,13 +2242,14 @@ crypto_rand(char *to, size_t n)
 }
 
 /** Return a pseudorandom integer, chosen uniformly from the values
- * between 0 and <b>max</b>-1. */
+ * between 0 and <b>max</b>-1 inclusive.  <b>max</b> must be between 1 and
+ * INT_MAX+1, inclusive. */
 int
 crypto_rand_int(unsigned int max)
 {
   unsigned int val;
   unsigned int cutoff;
-  tor_assert(max < UINT_MAX);
+  tor_assert(max <= ((unsigned int)INT_MAX)+1);
   tor_assert(max > 0); /* don't div by 0 */
 
   /* We ignore any values that are >= 'cutoff,' to avoid biasing the
@@ -2176,9 +2395,12 @@ base64_encode(char *dest, size_t destlen, const char *src, size_t srclen)
   return ret;
 }
 
+/** @{ */
+/** Special values used for the base64_decode_table */
 #define X 255
 #define SP 64
 #define PAD 65
+/** @} */
 /** Internal table mapping byte values to what they represent in base64.
  * Numbers 0..63 are 6-bit integers.  SPs are spaces, and should be
  * skipped.  Xs are invalid and must not appear in base64. PAD indicates
@@ -2391,9 +2613,10 @@ digest256_from_base64(char *digest, const char *d64)
 void
 base32_encode(char *dest, size_t destlen, const char *src, size_t srclen)
 {
-  unsigned int i, bit, v, u;
-  size_t nbits = srclen * 8;
+  unsigned int i, v, u;
+  size_t nbits = srclen * 8, bit;
 
+  tor_assert(srclen < SIZE_T_CEILING/8);
   tor_assert((nbits%5) == 0); /* We need an even multiple of 5 bits. */
   tor_assert((nbits/5)+1 <= destlen); /* We need enough space. */
   tor_assert(destlen < SIZE_T_CEILING);
@@ -2417,11 +2640,12 @@ base32_decode(char *dest, size_t destlen, const char *src, size_t srclen)
 {
   /* XXXX we might want to rewrite this along the lines of base64_decode, if
    * it ever shows up in the profile. */
-  unsigned int i, j, bit;
-  size_t nbits;
+  unsigned int i;
+  size_t nbits, j, bit;
   char *tmp;
   nbits = srclen * 5;
 
+  tor_assert(srclen < SIZE_T_CEILING / 5);
   tor_assert((nbits%8) == 0); /* We need an even multiple of 8 bits. */
   tor_assert((nbits/8) <= destlen); /* We need enough space. */
   tor_assert(destlen < SIZE_T_CEILING);
@@ -2580,6 +2804,7 @@ _openssl_dynlock_destroy_cb(struct CRYPTO_dynlock_value *v,
   tor_free(v);
 }
 
+/** @{ */
 /** Helper: Construct mutexes, and set callbacks to help OpenSSL handle being
  * multithreaded. */
 static int
@@ -2605,4 +2830,5 @@ setup_openssl_threading(void)
   return 0;
 }
 #endif
+/** @} */
 

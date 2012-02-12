@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -12,9 +12,11 @@
 #ifndef _TOR_MAIN_H
 #define _TOR_MAIN_H
 
-extern int has_completed_circuit;
+extern int can_complete_circuit;
 
-int connection_add(connection_t *conn);
+int connection_add_impl(connection_t *conn, int is_connecting);
+#define connection_add(conn) connection_add_impl((conn), 0)
+#define connection_add_connecting(conn) connection_add_impl((conn), 1)
 int connection_remove(connection_t *conn);
 void connection_unregister_events(connection_t *conn);
 int connection_in_array(connection_t *conn);
@@ -22,10 +24,15 @@ void add_connection_to_closeable_list(connection_t *conn);
 int connection_is_on_closeable_list(connection_t *conn);
 
 smartlist_t *get_connection_array(void);
+uint64_t get_bytes_read(void);
+uint64_t get_bytes_written(void);
 
+/** Bitmask for events that we can turn on and off with
+ * connection_watch_events. */
 typedef enum watchable_events {
-  READ_EVENT=0x02,
-  WRITE_EVENT=0x04
+  /* Yes, it is intentional that these match Libevent's EV_READ and EV_WRITE */
+  READ_EVENT=0x02, /**< We want to know when a connection is readable */
+  WRITE_EVENT=0x04 /**< We want to know when a connection is writable */
 } watchable_events_t;
 void connection_watch_events(connection_t *conn, watchable_events_t events);
 int connection_is_reading(connection_t *conn);
@@ -44,10 +51,13 @@ void directory_info_has_arrived(time_t now, int from_cache);
 void ip_address_changed(int at_interface);
 void dns_servers_relaunch_checks(void);
 
-void control_signal_act(int the_signal);
-void handle_signals(int is_parent);
+long get_uptime(void);
+unsigned get_signewnym_epoch(void);
 
-int try_locking(or_options_t *options, int err_if_locked);
+void handle_signals(int is_parent);
+void process_signal(uintptr_t sig);
+
+int try_locking(const or_options_t *options, int err_if_locked);
 int have_lockfile(void);
 void release_lockfile(void);
 

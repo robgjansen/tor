@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -210,13 +210,32 @@ smartlist_string_isin_case(const smartlist_t *sl, const char *element)
 int
 smartlist_string_num_isin(const smartlist_t *sl, int num)
 {
-  char buf[16];
+  char buf[32]; /* long enough for 64-bit int, and then some. */
   tor_snprintf(buf,sizeof(buf),"%d", num);
   return smartlist_string_isin(sl, buf);
 }
 
+/** Return true iff the two lists contain the same strings in the same
+ * order, or if they are both NULL. */
+int
+smartlist_strings_eq(const smartlist_t *sl1, const smartlist_t *sl2)
+{
+  if (sl1 == NULL)
+    return sl2 == NULL;
+  if (sl2 == NULL)
+    return 0;
+  if (smartlist_len(sl1) != smartlist_len(sl2))
+    return 0;
+  SMARTLIST_FOREACH(sl1, const char *, cp1, {
+      const char *cp2 = smartlist_get(sl2, cp1_sl_idx);
+      if (strcmp(cp1, cp2))
+        return 0;
+    });
+  return 1;
+}
+
 /** Return true iff <b>sl</b> has some element E such that
- * !memcmp(E,<b>element</b>,DIGEST_LEN)
+ * tor_memeq(E,<b>element</b>,DIGEST_LEN)
  */
 int
 smartlist_digest_isin(const smartlist_t *sl, const char *element)
@@ -224,7 +243,7 @@ smartlist_digest_isin(const smartlist_t *sl, const char *element)
   int i;
   if (!sl) return 0;
   for (i=0; i < sl->num_used; i++)
-    if (memcmp((const char*)sl->list[i],element,DIGEST_LEN)==0)
+    if (tor_memeq((const char*)sl->list[i],element,DIGEST_LEN))
       return 1;
   return 0;
 }
@@ -268,7 +287,6 @@ smartlist_subtract(smartlist_t *sl1, const smartlist_t *sl2)
 
 /** Remove the <b>idx</b>th element of sl; if idx is not the last
  * element, swap the last element of sl into the <b>idx</b>th space.
- * Return the old value of the <b>idx</b>th element.
  */
 void
 smartlist_del(smartlist_t *sl, int idx)
@@ -319,7 +337,8 @@ smartlist_insert(smartlist_t *sl, int idx, void *val)
 
 /**
  * Split a string <b>str</b> along all occurrences of <b>sep</b>,
- * adding the split strings, in order, to <b>sl</b>.
+ * appending the (newly allocated) split strings, in order, to
+ * <b>sl</b>.  Return the number of strings added to <b>sl</b>.
  *
  * If <b>flags</b>&amp;SPLIT_SKIP_SPACE is true, remove initial and
  * trailing space from each entry.
@@ -328,7 +347,7 @@ smartlist_insert(smartlist_t *sl, int idx, void *val)
  * If <b>flags</b>&amp;SPLIT_STRIP_SPACE is true, strip spaces from each
  * split string.
  *
- * If max>0, divide the string into no more than <b>max</b> pieces. If
+ * If <b>max</b>\>0, divide the string into no more than <b>max</b> pieces. If
  * <b>sep</b> is NULL, split on any sequence of horizontal space.
  */
 int
@@ -639,15 +658,27 @@ smartlist_uniq_strings(smartlist_t *sl)
  *   }
  */
 
-/* For a 1-indexed array, we would use LEFT_CHILD[x] = 2*x and RIGHT_CHILD[x]
- * = 2*x + 1.  But this is C, so we have to adjust a little. */
+/** @{ */
+/** Functions to manipulate heap indices to find a node's parent and children.
+ *
+ * For a 1-indexed array, we would use LEFT_CHILD[x] = 2*x and RIGHT_CHILD[x]
+ *   = 2*x + 1.  But this is C, so we have to adjust a little. */
 //#define LEFT_CHILD(i)  ( ((i)+1)*2 - 1)
 //#define RIGHT_CHILD(i) ( ((i)+1)*2 )
 //#define PARENT(i)      ( ((i)+1)/2 - 1)
 #define LEFT_CHILD(i)  ( 2*(i) + 1 )
 #define RIGHT_CHILD(i) ( 2*(i) + 2 )
 #define PARENT(i)      ( ((i)-1) / 2 )
+/** }@ */
 
+/** @{ */
+/** Helper macros for heaps: Given a local variable <b>idx_field_offset</b>
+ * set to the offset of an integer index within the heap element structure,
+ * IDX_OF_ITEM(p) gives you the index of p, and IDXP(p) gives you a pointer to
+ * where p's index is stored.  Given additionally a local smartlist <b>sl</b>,
+ * UPDATE_IDX(i) sets the index of the element at <b>i</b> to the correct
+ * value (that is, to <b>i</b>).
+ */
 #define IDXP(p) ((int*)STRUCT_VAR_P(p, idx_field_offset))
 
 #define UPDATE_IDX(i)  do {                            \
@@ -656,6 +687,7 @@ smartlist_uniq_strings(smartlist_t *sl)
   } while (0)
 
 #define IDX_OF_ITEM(p) (*IDXP(p))
+/** @} */
 
 /** Helper. <b>sl</b> may have at most one violation of the heap property:
  * the item at <b>idx</b> may be greater than one or both of its children.
@@ -789,7 +821,7 @@ smartlist_pqueue_assert_ok(smartlist_t *sl,
 static int
 _compare_digests(const void **_a, const void **_b)
 {
-  return memcmp((const char*)*_a, (const char*)*_b, DIGEST_LEN);
+  return tor_memcmp((const char*)*_a, (const char*)*_b, DIGEST_LEN);
 }
 
 /** Sort the list of DIGEST_LEN-byte digests into ascending order. */
@@ -811,7 +843,7 @@ smartlist_uniq_digests(smartlist_t *sl)
 static int
 _compare_digests256(const void **_a, const void **_b)
 {
-  return memcmp((const char*)*_a, (const char*)*_b, DIGEST256_LEN);
+  return tor_memcmp((const char*)*_a, (const char*)*_b, DIGEST256_LEN);
 }
 
 /** Sort the list of DIGEST256_LEN-byte digests into ascending order. */
@@ -873,7 +905,7 @@ strmap_entry_hash(const strmap_entry_t *a)
 static INLINE int
 digestmap_entries_eq(const digestmap_entry_t *a, const digestmap_entry_t *b)
 {
-  return !memcmp(a->key, b->key, DIGEST_LEN);
+  return tor_memeq(a->key, b->key, DIGEST_LEN);
 }
 
 /** Helper: return a hash value for a digest_map_t. */

@@ -1,4 +1,3 @@
-
 # We use a two-step process to generate documentation from asciidoc files.
 #
 # First, we use asciidoc/a2x to process the asciidoc files into .1.in and
@@ -13,15 +12,21 @@
 # part of the source distribution, so that people without asciidoc can
 # just use the .1 and .html files.
 
+regular_mans = tor tor-gencert tor-resolve torify
+all_mans = $(regular_mans) tor-fw-helper
+
 if USE_ASCIIDOC
-asciidoc_files = tor tor-gencert tor-resolve torify
-html_in = $(asciidoc_files:=.html.in)
-man_in = $(asciidoc_files:=.1.in)
-txt_in = $(asciidoc_files:=.1.txt)
-nodist_man_MANS = $(asciidoc_files:=.1)
-doc_DATA = $(asciidoc_files:=.html)
+if USE_FW_HELPER
+nodist_man_MANS = $(all_mans:=.1)
+doc_DATA = $(all_mans:=.html)
 else
-asciidoc_files =
+nodist_man_MANS = $(regular_mans:=.1)
+doc_DATA = $(regular_mans:=.html)
+endif
+html_in = $(all_mans:=.html.in)
+man_in = $(all_mans:=.1.in)
+txt_in = $(all_mans:=.1.txt)
+else
 html_in =
 man_in =
 txt_in =
@@ -31,16 +36,12 @@ endif
 
 EXTRA_DIST = HACKING asciidoc-helper.sh                      \
              $(html_in) $(man_in) $(txt_in)                  \
-             tor-osx-dmg-creation.txt tor-rpm-creation.txt   \
-             tor-win32-mingw-creation.txt
+             tor-rpm-creation.txt                            \
+             tor-win32-mingw-creation.txt spec/README
 
 docdir = @docdir@
 
 asciidoc_product = $(nodist_man_MANS) $(doc_DATA)
-
-SUBDIRS = spec
-
-DIST_SUBDIRS = spec
 
 # Generate the html documentation from asciidoc, but don't do
 # machine-specific replacements yet
@@ -51,6 +52,7 @@ tor.html.in : tor.1.txt
 torify.html.in : torify.1.txt
 tor-gencert.html.in : tor-gencert.1.txt
 tor-resolve.html.in : tor-resolve.1.txt
+tor-fw-helper.html.in : tor-fw-helper.1.txt
 
 # Generate the manpage from asciidoc, but don't do
 # machine-specific replacements yet
@@ -61,6 +63,7 @@ tor.1.in : tor.1.txt
 torify.1.in : torify.1.txt
 tor-gencert.1.in : tor-gencert.1.txt
 tor-resolve.1.in : tor-resolve.1.txt
+tor-fw-helper.1.in : tor-fw-helper.1.txt
 
 # use ../config.status to swap all machine-specific magic strings
 # in the asciidoc with their replacements.
@@ -74,10 +77,12 @@ tor.1 : tor.1.in
 torify.1 : torify.1.in
 tor-gencert.1 : tor-gencert.1.in
 tor-resolve.1 : tor-resolve.1.in
+tor-fw-helper.1 : tor-fw-helper.1.in
 tor.html : tor.html.in
 torify.html : torify.html.in
 tor-gencert.html : tor-gencert.html.in
 tor-resolve.html : tor-resolve.html.in
+tor-fw-helper.html : tor-fw-helper.html.in
 
 CLEANFILES = $(asciidoc_product) config.log
 DISTCLEANFILES = $(html_in) $(man_in)

@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -15,6 +15,8 @@
 void control_update_global_event_mask(void);
 void control_adjust_event_log_severity(void);
 
+void control_ports_write_to_file(void);
+
 /** Log information about the connection <b>conn</b>, protecting it as with
  * CONN_LOG_PROTECT. Example:
  *
@@ -25,6 +27,8 @@ void control_adjust_event_log_severity(void);
 
 int connection_control_finished_flushing(control_connection_t *conn);
 int connection_control_reached_eof(control_connection_t *conn);
+void connection_control_closed(control_connection_t *conn);
+
 int connection_control_process_inbuf(control_connection_t *conn);
 
 #define EVENT_AUTHDIR_NEWDESCS 0x000D
@@ -33,7 +37,7 @@ int control_event_is_interesting(int event);
 
 int control_event_circuit_status(origin_circuit_t *circ,
                                  circuit_status_event_t e, int reason);
-int control_event_stream_status(edge_connection_t *conn,
+int control_event_stream_status(entry_connection_t *conn,
                                 stream_status_event_t e,
                                 int reason);
 int control_event_or_conn_status(or_connection_t *conn,
@@ -53,7 +57,7 @@ int control_event_my_descriptor_changed(void);
 int control_event_networkstatus_changed(smartlist_t *statuses);
 
 int control_event_newconsensus(const networkstatus_t *consensus);
-int control_event_networkstatus_changed_single(routerstatus_t *rs);
+int control_event_networkstatus_changed_single(const routerstatus_t *rs);
 int control_event_general_status(int severity, const char *format, ...)
   CHECK_PRINTF(2,3);
 int control_event_client_status(int severity, const char *format, ...)
@@ -62,13 +66,17 @@ int control_event_server_status(int severity, const char *format, ...)
   CHECK_PRINTF(2,3);
 int control_event_guard(const char *nickname, const char *digest,
                         const char *status);
+int control_event_conf_changed(smartlist_t *elements);
 int control_event_buildtimeout_set(const circuit_build_times_t *cbt,
                                    buildtimeout_set_event_t type);
+int control_event_signal(uintptr_t signal);
 
 int init_cookie_authentication(int enabled);
 smartlist_t *decode_hashed_passwords(config_line_t *passwords);
 void disable_control_logging(void);
 void enable_control_logging(void);
+
+void monitor_owning_controller_process(const char *process_spec);
 
 void control_event_bootstrap(bootstrap_status_t status, int progress);
 void control_event_bootstrap_problem(const char *warn, int reason);

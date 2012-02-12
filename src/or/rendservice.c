@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -14,6 +14,7 @@
 #include "config.h"
 #include "directory.h"
 #include "networkstatus.h"
+#include "nodelist.h"
 #include "rendclient.h"
 #include "rendcommon.h"
 #include "rendservice.h"
@@ -171,16 +172,44 @@ rend_add_service(rend_service_t *service)
 
   if (service->auth_type != REND_NO_AUTH &&
       smartlist_len(service->clients) == 0) {
-    log_warn(LD_CONFIG, "Hidden service with client authorization but no "
-                        "clients; ignoring.");
+    log_warn(LD_CONFIG, "Hidden service (%s) with client authorization but no "
+                        "clients; ignoring.",
+             escaped(service->directory));
     rend_service_free(service);
     return;
   }
 
   if (!smartlist_len(service->ports)) {
-    log_warn(LD_CONFIG, "Hidden service with no ports configured; ignoring.");
+    log_warn(LD_CONFIG, "Hidden service (%s) with no ports configured; "
+             "ignoring.",
+             escaped(service->directory));
     rend_service_free(service);
   } else {
+    int dupe = 0;
+    /* XXX This duplicate check has two problems:
+     *
+     * a) It's O(n^2), but the same comment from the bottom of
+     *    rend_config_services() should apply.
+     *
+     * b) We only compare directory paths as strings, so we can't
+     *    detect two distinct paths that specify the same directory
+     *    (which can arise from symlinks, case-insensitivity, bind
+     *    mounts, etc.).
+     *
+     * It also can't detect that two separate Tor instances are trying
+     * to use the same HiddenServiceDir; for that, we would need a
+     * lock file.  But this is enough to detect a simple mistake that
+     * at least one person has actually made.
+     */
+    SMARTLIST_FOREACH(rend_service_list, rend_service_t*, ptr,
+                      dupe = dupe ||
+                             !strcmp(ptr->directory, service->directory));
+    if (dupe) {
+      log_warn(LD_REND, "Another hidden service is already configured for "
+               "directory %s, ignoring.", service->directory);
+      rend_service_free(service);
+      return;
+    }
     smartlist_add(rend_service_list, service);
     log_debug(LD_REND,"Configuring service with directory \"%s\"",
               service->directory);
@@ -232,7 +261,7 @@ parse_port_config(const char *string)
   } else {
     addrport = smartlist_get(sl,1);
     if (strchr(addrport, ':') || strchr(addrport, '.')) {
-      if (tor_addr_port_parse(addrport, &addr, &p)<0) {
+      if (tor_addr_port_lookup(addrport, &addr, &p)<0) {
         log_warn(LD_CONFIG,"Unparseable address in hidden service port "
                  "configuration.");
         goto err;
@@ -266,7 +295,7 @@ parse_port_config(const char *string)
  * normal, but don't actually change the configured services.)
  */
 int
-rend_config_services(or_options_t *options, int validate_only)
+rend_config_services(const or_options_t *options, int validate_only)
 {
   config_line_t *line;
   rend_service_t *service = NULL;
@@ -384,7 +413,7 @@ rend_config_services(or_options_t *options, int validate_only)
         if (strspn(client_name, REND_LEGAL_CLIENTNAME_CHARACTERS) != len) {
           log_warn(LD_CONFIG, "HiddenServiceAuthorizeClient contains an "
                               "illegal client name: '%s'. Valid "
-                              "characters are [A-Za-z0-9+-_].",
+                              "characters are [A-Za-z0-9+_-].",
                    client_name);
           SMARTLIST_FOREACH(clients, char *, cp, tor_free(cp));
           smartlist_free(clients);
@@ -465,7 +494,7 @@ rend_config_services(or_options_t *options, int validate_only)
         int keep_it = 0;
         tor_assert(oc->rend_data);
         SMARTLIST_FOREACH(surviving_services, rend_service_t *, ptr, {
-          if (!memcmp(ptr->pk_digest, oc->rend_data->rend_pk_digest,
+          if (tor_memeq(ptr->pk_digest, oc->rend_data->rend_pk_digest,
                       DIGEST_LEN)) {
             keep_it = 1;
             break;
@@ -474,7 +503,8 @@ rend_config_services(or_options_t *options, int validate_only)
         if (keep_it)
           continue;
         log_info(LD_REND, "Closing intro point %s for service %s.",
-                 safe_str_client(oc->build_state->chosen_exit->nickname),
+                 safe_str_client(extend_info_describe(
+                                            oc->build_state->chosen_exit)),
                  oc->rend_data->onion_address);
         circuit_mark_for_close(circ, END_CIRC_REASON_FINISHED);
         /* XXXX Is there another reason we should use here? */
@@ -543,7 +573,7 @@ rend_service_load_keys(void)
              s->directory);
 
     /* Check/create directory */
-    if (check_private_dir(s->directory, CPD_CREATE) < 0)
+    if (check_private_dir(s->directory, CPD_CREATE, get_options()->User) < 0)
       return -1;
 
     /* Load key */
@@ -609,13 +639,15 @@ rend_service_load_keys(void)
       }
 
       /* Prepare client_keys and hostname files. */
-      if (!(cfile = start_writing_to_stdio_file(cfname, OPEN_FLAGS_REPLACE,
+      if (!(cfile = start_writing_to_stdio_file(cfname,
+                                                OPEN_FLAGS_REPLACE | O_TEXT,
                                                 0600, &open_cfile))) {
         log_warn(LD_CONFIG, "Could not open client_keys file %s",
                  escaped(cfname));
         goto err;
       }
-      if (!(hfile = start_writing_to_stdio_file(fname, OPEN_FLAGS_REPLACE,
+      if (!(hfile = start_writing_to_stdio_file(fname,
+                                                OPEN_FLAGS_REPLACE | O_TEXT,
                                                 0600, &open_hfile))) {
         log_warn(LD_CONFIG, "Could not open hostname file %s", escaped(fname));
         goto err;
@@ -760,7 +792,7 @@ static rend_service_t *
 rend_service_get_by_pk_digest(const char* digest)
 {
   SMARTLIST_FOREACH(rend_service_list, rend_service_t*, s,
-                    if (!memcmp(s->pk_digest,digest,DIGEST_LEN))
+                    if (tor_memeq(s->pk_digest,digest,DIGEST_LEN))
                         return s);
   return NULL;
 }
@@ -800,7 +832,7 @@ rend_check_authorization(rend_service_t *service,
 
   /* Look up client authorization by descriptor cookie. */
   SMARTLIST_FOREACH(service->clients, rend_authorized_client_t *, client, {
-    if (!memcmp(client->descriptor_cookie, descriptor_cookie,
+    if (tor_memeq(client->descriptor_cookie, descriptor_cookie,
                 REND_DESC_COOKIE_LEN)) {
       auth_client = client;
       break;
@@ -848,8 +880,9 @@ clean_accepted_intros(rend_service_t *service, time_t now)
 /** Respond to an INTRODUCE2 cell by launching a circuit to the chosen
  * rendezvous point.
  */
+ /* XXX022 this function sure could use some organizing. -RD */
 int
-rend_service_introduce(origin_circuit_t *circuit, const char *request,
+rend_service_introduce(origin_circuit_t *circuit, const uint8_t *request,
                        size_t request_len)
 {
   char *ptr, *r_cookie;
@@ -875,6 +908,9 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
   time_t now = time(NULL);
   char diffie_hellman_hash[DIGEST_LEN];
   time_t *access_time;
+  const or_options_t *options = get_options();
+
+  tor_assert(!(circuit->build_state->onehop_tunnel));
   tor_assert(circuit->rend_data);
 
   base32_encode(serviceid, REND_SERVICE_ID_LEN_BASE32+1,
@@ -911,9 +947,9 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
 
   /* first DIGEST_LEN bytes of request is intro or service pk digest */
   crypto_pk_get_digest(intro_key, intro_key_digest);
-  if (memcmp(intro_key_digest, request, DIGEST_LEN)) {
+  if (tor_memneq(intro_key_digest, request, DIGEST_LEN)) {
     base32_encode(serviceid, REND_SERVICE_ID_LEN_BASE32+1,
-                  request, REND_SERVICE_ID_LEN);
+                  (char*)request, REND_SERVICE_ID_LEN);
     log_warn(LD_REND, "Got an INTRODUCE2 cell for the wrong service (%s).",
              escaped(serviceid));
     return -1;
@@ -925,10 +961,34 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
              "PK-encrypted portion of INTRODUCE2 cell was truncated.");
     return -1;
   }
+
+  if (!service->accepted_intros)
+    service->accepted_intros = digestmap_new();
+
+  {
+    char pkpart_digest[DIGEST_LEN];
+    /* Check for replay of PK-encrypted portion.  It is slightly naughty to
+       use the same digestmap to check for this and for g^x replays, but
+       collisions are tremendously unlikely.
+    */
+    crypto_digest(pkpart_digest, (char*)request+DIGEST_LEN, keylen);
+    access_time = digestmap_get(service->accepted_intros, pkpart_digest);
+    if (access_time != NULL) {
+      log_warn(LD_REND, "Possible replay detected! We received an "
+               "INTRODUCE2 cell with same PK-encrypted part %d seconds ago. "
+               "Dropping cell.", (int)(now-*access_time));
+      return -1;
+    }
+    access_time = tor_malloc(sizeof(time_t));
+    *access_time = now;
+    digestmap_set(service->accepted_intros, pkpart_digest, access_time);
+  }
+
   /* Next N bytes is encrypted with service key */
   note_crypto_pk_op(REND_SERVER);
   r = crypto_pk_private_hybrid_decrypt(
-       intro_key,buf,request+DIGEST_LEN,request_len-DIGEST_LEN,
+       intro_key,buf,sizeof(buf),
+       (char*)(request+DIGEST_LEN),request_len-DIGEST_LEN,
        PK_PKCS1_OAEP_PADDING,1);
   if (r<0) {
     log_warn(LD_PROTOCOL, "Couldn't decrypt INTRODUCE2 cell.");
@@ -964,7 +1024,9 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
     v3_shift += 4;
     if ((now - ts) < -1 * REND_REPLAY_TIME_INTERVAL / 2 ||
         (now - ts) > REND_REPLAY_TIME_INTERVAL / 2) {
-      log_warn(LD_REND, "INTRODUCE2 cell is too %s. Discarding.",
+      /* This is far more likely to mean that a client's clock is
+       * skewed than that a replay attack is in progress. */
+      log_info(LD_REND, "INTRODUCE2 cell is too %s. Discarding.",
                (now - ts) < 0 ? "old" : "new");
       return -1;
     }
@@ -1001,7 +1063,7 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
   } else {
     char *rp_nickname;
     size_t nickname_field_len;
-    routerinfo_t *router;
+    const node_t *node;
     int version;
     if (*buf == 1) {
       rp_nickname = buf+1;
@@ -1028,8 +1090,8 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
     len -= nickname_field_len;
     len -= rp_nickname - buf; /* also remove header space used by version, if
                                * any */
-    router = router_get_by_nickname(rp_nickname, 0);
-    if (!router) {
+    node = node_get_by_nickname(rp_nickname, 0);
+    if (!node) {
       log_info(LD_REND, "Couldn't find router %s named in introduce2 cell.",
                escaped_safe_str_client(rp_nickname));
       /* XXXX Add a no-such-router reason? */
@@ -1037,12 +1099,21 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
       goto err;
     }
 
-    extend_info = extend_info_from_router(router);
+    extend_info = extend_info_from_node(node);
   }
 
   if (len != REND_COOKIE_LEN+DH_KEY_LEN) {
     log_warn(LD_PROTOCOL, "Bad length %u for INTRODUCE2 cell.", (int)len);
     reason = END_CIRC_REASON_TORPROTOCOL;
+    goto err;
+  }
+
+  /* Check if we'd refuse to talk to this router */
+  if (options->StrictNodes &&
+      routerset_contains_extendinfo(options->ExcludeNodes, extend_info)) {
+    log_warn(LD_REND, "Client asked to rendezvous at a relay that we "
+             "exclude, and StrictNodes is set. Refusing service.");
+    reason = END_CIRC_REASON_INTERNAL; /* XXX might leak why we refused */
     goto err;
   }
 
@@ -1057,12 +1128,16 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
 
   /* Check whether there is a past request with the same Diffie-Hellman,
    * part 1. */
-  if (!service->accepted_intros)
-    service->accepted_intros = digestmap_new();
-
   access_time = digestmap_get(service->accepted_intros, diffie_hellman_hash);
   if (access_time != NULL) {
-    log_warn(LD_REND, "Possible replay detected! We received an "
+    /* A Tor client will send a new INTRODUCE1 cell with the same rend
+     * cookie and DH public key as its previous one if its intro circ
+     * times out while in state CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT .
+     * If we received the first INTRODUCE1 cell (the intro-point relay
+     * converts it into an INTRODUCE2 cell), we are already trying to
+     * connect to that rend point (and may have already succeeded);
+     * drop this cell. */
+    log_info(LD_REND, "We received an "
              "INTRODUCE2 cell with same first part of "
              "Diffie-Hellman handshake %d seconds ago. Dropping "
              "cell.",
@@ -1099,7 +1174,7 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
   }
 
   /* Try DH handshake... */
-  dh = crypto_dh_new();
+  dh = crypto_dh_new(DH_TYPE_REND);
   if (!dh || crypto_dh_generate_public(dh)<0) {
     log_warn(LD_BUG,"Internal error: couldn't build DH state "
              "or generate public key.");
@@ -1133,7 +1208,7 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
   if (!launched) { /* give up */
     log_warn(LD_REND, "Giving up launching first hop of circuit to rendezvous "
              "point %s for service %s.",
-             escaped_safe_str_client(extend_info->nickname),
+             safe_str_client(extend_info_describe(extend_info)),
              serviceid);
     reason = END_CIRC_REASON_CONNECTFAILED;
     goto err;
@@ -1141,7 +1216,7 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
   log_info(LD_REND,
            "Accepted intro; launching circuit to %s "
            "(cookie %s) for service %s.",
-           escaped_safe_str_client(extend_info->nickname),
+           safe_str_client(extend_info_describe(extend_info)),
            hexcookie, serviceid);
   tor_assert(launched->build_state);
   /* Fill in the circuit's state. */
@@ -1164,8 +1239,10 @@ rend_service_introduce(origin_circuit_t *circuit, const char *request,
   memcpy(cpath->handshake_digest, keys, DIGEST_LEN);
   if (extend_info) extend_info_free(extend_info);
 
+  memset(keys, 0, sizeof(keys));
   return 0;
  err:
+  memset(keys, 0, sizeof(keys));
   if (dh) crypto_dh_free(dh);
   if (launched)
     circuit_mark_for_close(TO_CIRCUIT(launched), reason);
@@ -1191,7 +1268,8 @@ rend_service_relaunch_rendezvous(origin_circuit_t *oldcirc)
              "Attempt to build circuit to %s for rendezvous has failed "
              "too many times or expired; giving up.",
              oldcirc->build_state ?
-               oldcirc->build_state->chosen_exit->nickname : "*unknown*");
+             safe_str(extend_info_describe(oldcirc->build_state->chosen_exit))
+             : "*unknown*");
     return;
   }
 
@@ -1205,7 +1283,7 @@ rend_service_relaunch_rendezvous(origin_circuit_t *oldcirc)
   }
 
   log_info(LD_REND,"Reattempting rendezvous circuit to '%s'",
-           oldstate->chosen_exit->nickname);
+           safe_str(extend_info_describe(oldstate->chosen_exit)));
 
   newcirc = circuit_launch_by_extend_info(CIRCUIT_PURPOSE_S_CONNECT_REND,
                             oldstate->chosen_exit,
@@ -1213,7 +1291,7 @@ rend_service_relaunch_rendezvous(origin_circuit_t *oldcirc)
 
   if (!newcirc) {
     log_warn(LD_REND,"Couldn't relaunch rendezvous circuit to '%s'.",
-             oldstate->chosen_exit->nickname);
+             safe_str(extend_info_describe(oldstate->chosen_exit)));
     return;
   }
   newstate = newcirc->build_state;
@@ -1237,7 +1315,7 @@ rend_service_launch_establish_intro(rend_service_t *service,
 
   log_info(LD_REND,
            "Launching circuit to introduction point %s for service %s",
-           escaped_safe_str_client(intro->extend_info->nickname),
+           safe_str_client(extend_info_describe(intro->extend_info)),
            service->service_id);
 
   rep_hist_note_used_internal(time(NULL), 1, 0);
@@ -1250,11 +1328,11 @@ rend_service_launch_establish_intro(rend_service_t *service,
   if (!launched) {
     log_info(LD_REND,
              "Can't launch circuit to establish introduction at %s.",
-             escaped_safe_str_client(intro->extend_info->nickname));
+             safe_str_client(extend_info_describe(intro->extend_info)));
     return -1;
   }
 
-  if (memcmp(intro->extend_info->identity_digest,
+  if (tor_memneq(intro->extend_info->identity_digest,
       launched->build_state->chosen_exit->identity_digest, DIGEST_LEN)) {
     char cann[HEX_DIGEST_LEN+1], orig[HEX_DIGEST_LEN+1];
     base16_encode(cann, sizeof(cann),
@@ -1316,6 +1394,7 @@ rend_service_intro_has_opened(origin_circuit_t *circuit)
   crypto_pk_env_t *intro_key;
 
   tor_assert(circuit->_base.purpose == CIRCUIT_PURPOSE_S_ESTABLISH_INTRO);
+  tor_assert(!(circuit->build_state->onehop_tunnel));
   tor_assert(circuit->cpath);
   tor_assert(circuit->rend_data);
 
@@ -1332,14 +1411,39 @@ rend_service_intro_has_opened(origin_circuit_t *circuit)
   }
 
   /* If we already have enough introduction circuits for this service,
-   * redefine this one as a general circuit. */
+   * redefine this one as a general circuit or close it, depending. */
   if (count_established_intro_points(serviceid) > NUM_INTRO_POINTS) {
-    log_info(LD_CIRC|LD_REND, "We have just finished an introduction "
-             "circuit, but we already have enough. Redefining purpose to "
-             "general.");
-    TO_CIRCUIT(circuit)->purpose = CIRCUIT_PURPOSE_C_GENERAL;
-    circuit_has_opened(circuit);
-    return;
+    const or_options_t *options = get_options();
+    if (options->ExcludeNodes) {
+      /* XXXX in some future version, we can test whether the transition is
+         allowed or not given the actual nodes in the circuit.  But for now,
+         this case, we might as well close the thing. */
+      log_info(LD_CIRC|LD_REND, "We have just finished an introduction "
+               "circuit, but we already have enough.  Closing it.");
+      circuit_mark_for_close(TO_CIRCUIT(circuit), END_CIRC_REASON_NONE);
+      return;
+    } else {
+      tor_assert(circuit->build_state->is_internal);
+      log_info(LD_CIRC|LD_REND, "We have just finished an introduction "
+               "circuit, but we already have enough. Redefining purpose to "
+               "general; leaving as internal.");
+
+      TO_CIRCUIT(circuit)->purpose = CIRCUIT_PURPOSE_C_GENERAL;
+
+      {
+        rend_data_t *rend_data = circuit->rend_data;
+        circuit->rend_data = NULL;
+        rend_data_free(rend_data);
+      }
+      {
+        crypto_pk_env_t *intro_key = circuit->intro_key;
+        circuit->intro_key = NULL;
+        crypto_free_pk_env(intro_key);
+      }
+
+      circuit_has_opened(circuit);
+      return;
+    }
   }
 
   log_info(LD_REND,
@@ -1365,7 +1469,8 @@ rend_service_intro_has_opened(origin_circuit_t *circuit)
     goto err;
   len += 20;
   note_crypto_pk_op(REND_SERVER);
-  r = crypto_pk_private_sign_digest(intro_key, buf+len, buf, len);
+  r = crypto_pk_private_sign_digest(intro_key, buf+len, sizeof(buf)-len,
+                                    buf, len);
   if (r<0) {
     log_warn(LD_BUG, "Internal error: couldn't sign introduction request.");
     reason = END_CIRC_REASON_INTERNAL;
@@ -1390,9 +1495,10 @@ rend_service_intro_has_opened(origin_circuit_t *circuit)
 
 /** Called when we get an INTRO_ESTABLISHED cell; mark the circuit as a
  * live introduction point, and note that the service descriptor is
- * now out-of-date.*/
+ * now out-of-date. */
 int
-rend_service_intro_established(origin_circuit_t *circuit, const char *request,
+rend_service_intro_established(origin_circuit_t *circuit,
+                               const uint8_t *request,
                                size_t request_len)
 {
   rend_service_t *service;
@@ -1444,6 +1550,7 @@ rend_service_rendezvous_has_opened(origin_circuit_t *circuit)
   tor_assert(circuit->_base.purpose == CIRCUIT_PURPOSE_S_CONNECT_REND);
   tor_assert(circuit->cpath);
   tor_assert(circuit->build_state);
+  tor_assert(!(circuit->build_state->onehop_tunnel));
   tor_assert(circuit->rend_data);
   hop = circuit->build_state->pending_final_cpath;
   tor_assert(hop);
@@ -1526,7 +1633,7 @@ find_intro_circuit(rend_intro_point_t *intro, const char *pk_digest)
   tor_assert(intro);
   while ((circ = circuit_get_next_by_pk_and_purpose(circ,pk_digest,
                                                   CIRCUIT_PURPOSE_S_INTRO))) {
-    if (!memcmp(circ->build_state->chosen_exit->identity_digest,
+    if (tor_memeq(circ->build_state->chosen_exit->identity_digest,
                 intro->extend_info->identity_digest, DIGEST_LEN) &&
         circ->rend_data) {
       return circ;
@@ -1536,7 +1643,7 @@ find_intro_circuit(rend_intro_point_t *intro, const char *pk_digest)
   circ = NULL;
   while ((circ = circuit_get_next_by_pk_and_purpose(circ,pk_digest,
                                         CIRCUIT_PURPOSE_S_ESTABLISH_INTRO))) {
-    if (!memcmp(circ->build_state->chosen_exit->identity_digest,
+    if (tor_memeq(circ->build_state->chosen_exit->identity_digest,
                 intro->extend_info->identity_digest, DIGEST_LEN) &&
         circ->rend_data) {
       return circ;
@@ -1572,16 +1679,18 @@ directory_post_to_hs_dir(rend_service_descriptor_t *renddesc,
     for (j = 0; j < smartlist_len(responsible_dirs); j++) {
       char desc_id_base32[REND_DESC_ID_V2_LEN_BASE32 + 1];
       char *hs_dir_ip;
+      const node_t *node;
       hs_dir = smartlist_get(responsible_dirs, j);
       if (smartlist_digest_isin(renddesc->successful_uploads,
                                 hs_dir->identity_digest))
         /* Don't upload descriptor if we succeeded in doing so last time. */
         continue;
-      if (!router_get_by_digest(hs_dir->identity_digest)) {
+      node = node_get_by_id(hs_dir->identity_digest);
+      if (!node || !node_has_descriptor(node)) {
         log_info(LD_REND, "Not sending publish request for v2 descriptor to "
-                          "hidden service directory '%s'; we don't have its "
+                          "hidden service directory %s; we don't have its "
                           "router descriptor. Queuing for later upload.",
-                 hs_dir->nickname);
+                 safe_str_client(routerstatus_describe(hs_dir)));
         failed_upload = -1;
         continue;
       }
@@ -1754,19 +1863,19 @@ void
 rend_services_introduce(void)
 {
   int i,j,r;
-  routerinfo_t *router;
+  const node_t *node;
   rend_service_t *service;
   rend_intro_point_t *intro;
   int changed, prev_intro_nodes;
-  smartlist_t *intro_routers;
+  smartlist_t *intro_nodes;
   time_t now;
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
 
-  intro_routers = smartlist_create();
+  intro_nodes = smartlist_create();
   now = time(NULL);
 
   for (i=0; i < smartlist_len(rend_service_list); ++i) {
-    smartlist_clear(intro_routers);
+    smartlist_clear(intro_nodes);
     service = smartlist_get(rend_service_list, i);
 
     tor_assert(service);
@@ -1786,14 +1895,15 @@ rend_services_introduce(void)
        service. */
     for (j=0; j < smartlist_len(service->intro_nodes); ++j) {
       intro = smartlist_get(service->intro_nodes, j);
-      router = router_get_by_digest(intro->extend_info->identity_digest);
-      if (!router || !find_intro_circuit(intro, service->pk_digest)) {
+      node = node_get_by_id(intro->extend_info->identity_digest);
+      if (!node || !find_intro_circuit(intro, service->pk_digest)) {
         log_info(LD_REND,"Giving up on %s as intro point for %s.",
-                 intro->extend_info->nickname, service->service_id);
+                 safe_str_client(extend_info_describe(intro->extend_info)),
+                 safe_str_client(service->service_id));
         if (service->desc) {
           SMARTLIST_FOREACH(service->desc->intro_nodes, rend_intro_point_t *,
                             dintro, {
-            if (!memcmp(dintro->extend_info->identity_digest,
+            if (tor_memeq(dintro->extend_info->identity_digest,
                 intro->extend_info->identity_digest, DIGEST_LEN)) {
               log_info(LD_REND, "The intro point we are giving up on was "
                                 "included in the last published descriptor. "
@@ -1806,8 +1916,8 @@ rend_services_introduce(void)
         smartlist_del(service->intro_nodes,j--);
         changed = 1;
       }
-      if (router)
-        smartlist_add(intro_routers, router);
+      if (node)
+        smartlist_add(intro_nodes, (void*)node);
     }
 
     /* We have enough intro points, and the intro points we thought we had were
@@ -1836,26 +1946,27 @@ rend_services_introduce(void)
 #define NUM_INTRO_POINTS_INIT (NUM_INTRO_POINTS + 2)
     for (j=prev_intro_nodes; j < (prev_intro_nodes == 0 ?
              NUM_INTRO_POINTS_INIT : NUM_INTRO_POINTS); ++j) {
-      router_crn_flags_t flags = CRN_NEED_UPTIME;
+      router_crn_flags_t flags = CRN_NEED_UPTIME|CRN_NEED_DESC;
       if (get_options()->_AllowInvalid & ALLOW_INVALID_INTRODUCTION)
         flags |= CRN_ALLOW_INVALID;
-      router = router_choose_random_node(intro_routers,
-                                         options->ExcludeNodes, flags);
-      if (!router) {
+      node = router_choose_random_node(intro_nodes,
+                                       options->ExcludeNodes, flags);
+      if (!node) {
         log_warn(LD_REND,
                  "Could only establish %d introduction points for %s.",
                  smartlist_len(service->intro_nodes), service->service_id);
         break;
       }
       changed = 1;
-      smartlist_add(intro_routers, router);
+      smartlist_add(intro_nodes, (void*)node);
       intro = tor_malloc_zero(sizeof(rend_intro_point_t));
-      intro->extend_info = extend_info_from_router(router);
+      intro->extend_info = extend_info_from_node(node);
       intro->intro_key = crypto_new_pk_env();
       tor_assert(!crypto_pk_generate_key(intro->intro_key));
       smartlist_add(service->intro_nodes, intro);
       log_info(LD_REND, "Picked router %s as an intro point for %s.",
-               router->nickname, service->service_id);
+               safe_str_client(node_describe(node)),
+               safe_str_client(service->service_id));
     }
 
     /* If there's no need to launch new circuits, stop here. */
@@ -1868,11 +1979,12 @@ rend_services_introduce(void)
       r = rend_service_launch_establish_intro(service, intro);
       if (r<0) {
         log_warn(LD_REND, "Error launching circuit to node %s for service %s.",
-                 intro->extend_info->nickname, service->service_id);
+                 safe_str_client(extend_info_describe(intro->extend_info)),
+                 safe_str_client(service->service_id));
       }
     }
   }
-  smartlist_free(intro_routers);
+  smartlist_free(intro_nodes);
 }
 
 /** Regenerate and upload rendezvous service descriptors for all

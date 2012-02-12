@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2003, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #ifndef _TOR_TEST_H
@@ -45,7 +45,8 @@
                             _print = tor_malloc(printlen);              \
                             base16_encode(_print, printlen, _value,     \
                                           (len)); },                    \
-                          { tor_free(_print); }                         \
+                          { tor_free(_print); },                        \
+                          TT_EXIT_TEST_FUNCTION                         \
                           );
 
 #define test_memeq(expr1, expr2, len) test_mem_op((expr1), ==, (expr2), len)

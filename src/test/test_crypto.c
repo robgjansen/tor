@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
@@ -12,8 +12,8 @@
 static void
 test_crypto_dh(void)
 {
-  crypto_dh_env_t *dh1 = crypto_dh_new();
-  crypto_dh_env_t *dh2 = crypto_dh_new();
+  crypto_dh_env_t *dh1 = crypto_dh_new(DH_TYPE_CIRCUIT);
+  crypto_dh_env_t *dh2 = crypto_dh_new(DH_TYPE_CIRCUIT);
   char p1[DH_BYTES];
   char p2[DH_BYTES];
   char s1[DH_BYTES];
@@ -69,7 +69,7 @@ test_crypto_rng(void)
     uint64_t big;
     char *host;
     j = crypto_rand_int(100);
-    if (i < 0 || i >= 100)
+    if (j < 0 || j >= 100)
       allok = 0;
     big = crypto_rand_uint64(U64_LITERAL(1)<<40);
     if (big >= (U64_LITERAL(1)<<40))
@@ -231,7 +231,7 @@ test_crypto_sha(void)
 {
   crypto_digest_env_t *d1 = NULL, *d2 = NULL;
   int i;
-  char key[80];
+  char key[160];
   char digest[32];
   char data[50];
   char d_out1[DIGEST_LEN], d_out2[DIGEST256_LEN];
@@ -240,11 +240,13 @@ test_crypto_sha(void)
   /* Test SHA-1 with a test vector from the specification. */
   i = crypto_digest(data, "abc", 3);
   test_memeq_hex(data, "A9993E364706816ABA3E25717850C26C9CD0D89D");
+  tt_int_op(i, ==, 0);
 
   /* Test SHA-256 with a test vector from the specification. */
   i = crypto_digest256(data, "abc", 3, DIGEST_SHA256);
   test_memeq_hex(data, "BA7816BF8F01CFEA414140DE5DAE2223B00361A3"
                        "96177A9CB410FF61F20015AD");
+  tt_int_op(i, ==, 0);
 
   /* Test HMAC-SHA-1 with test cases from RFC2202. */
 
@@ -273,6 +275,75 @@ test_crypto_sha(void)
                    54);
   test_streq(hex_str(digest, 20),
              "AA4AE5E15272D00E95705637CE8A3B55ED402112");
+
+  /* Test HMAC-SHA256 with test cases from wikipedia and RFC 4231 */
+
+  /* Case empty (wikipedia) */
+  crypto_hmac_sha256(digest, "", 0, "", 0);
+  test_streq(hex_str(digest, 32),
+           "B613679A0814D9EC772F95D778C35FC5FF1697C493715653C6C712144292C5AD");
+
+  /* Case quick-brown (wikipedia) */
+  crypto_hmac_sha256(digest, "key", 3,
+                     "The quick brown fox jumps over the lazy dog", 43);
+  test_streq(hex_str(digest, 32),
+           "F7BC83F430538424B13298E6AA6FB143EF4D59A14946175997479DBC2D1A3CD8");
+
+  /* "Test Case 1" from RFC 4231 */
+  memset(key, 0x0b, 20);
+  crypto_hmac_sha256(digest, key, 20, "Hi There", 8);
+  test_memeq_hex(digest,
+                 "b0344c61d8db38535ca8afceaf0bf12b"
+                 "881dc200c9833da726e9376c2e32cff7");
+
+  /* "Test Case 2" from RFC 4231 */
+  memset(key, 0x0b, 20);
+  crypto_hmac_sha256(digest, "Jefe", 4, "what do ya want for nothing?", 28);
+  test_memeq_hex(digest,
+                 "5bdcc146bf60754e6a042426089575c7"
+                 "5a003f089d2739839dec58b964ec3843");
+
+  /* "Test case 3" from RFC 4231 */
+  memset(key, 0xaa, 20);
+  memset(data, 0xdd, 50);
+  crypto_hmac_sha256(digest, key, 20, data, 50);
+  test_memeq_hex(digest,
+                 "773ea91e36800e46854db8ebd09181a7"
+                 "2959098b3ef8c122d9635514ced565fe");
+
+  /* "Test case 4" from RFC 4231 */
+  base16_decode(key, 25,
+                "0102030405060708090a0b0c0d0e0f10111213141516171819", 50);
+  memset(data, 0xcd, 50);
+  crypto_hmac_sha256(digest, key, 25, data, 50);
+  test_memeq_hex(digest,
+                 "82558a389a443c0ea4cc819899f2083a"
+                 "85f0faa3e578f8077a2e3ff46729665b");
+
+  /* "Test case 5" from RFC 4231 */
+  memset(key, 0x0c, 20);
+  crypto_hmac_sha256(digest, key, 20, "Test With Truncation", 20);
+  test_memeq_hex(digest,
+                 "a3b6167473100ee06e0c796c2955552b");
+
+  /* "Test case 6" from RFC 4231 */
+  memset(key, 0xaa, 131);
+  crypto_hmac_sha256(digest, key, 131,
+                     "Test Using Larger Than Block-Size Key - Hash Key First",
+                     54);
+  test_memeq_hex(digest,
+                 "60e431591ee0b67f0d8a26aacbf5b77f"
+                 "8e0bc6213728c5140546040f0ee37f54");
+
+  /* "Test case 7" from RFC 4231 */
+  memset(key, 0xaa, 131);
+  crypto_hmac_sha256(digest, key, 131,
+                     "This is a test using a larger than block-size key and a "
+                     "larger than block-size data. The key needs to be hashed "
+                     "before being used by the HMAC algorithm.", 152);
+  test_memeq_hex(digest,
+                 "9b09ffa71b942fcb27635fbcd5b0e944"
+                 "bfdc63644f0713938a7f51535c3a35e2");
 
   /* Incremental digest code. */
   d1 = crypto_new_digest_env();
@@ -341,27 +412,31 @@ test_crypto_pk(void)
   test_eq(0, crypto_pk_cmp_keys(pk1, pk2));
 
   test_eq(128, crypto_pk_keysize(pk1));
+  test_eq(1024, crypto_pk_num_bits(pk1));
   test_eq(128, crypto_pk_keysize(pk2));
+  test_eq(1024, crypto_pk_num_bits(pk2));
 
-  test_eq(128, crypto_pk_public_encrypt(pk2, data1, "Hello whirled.", 15,
+  test_eq(128, crypto_pk_public_encrypt(pk2, data1, sizeof(data1),
+                                        "Hello whirled.", 15,
                                         PK_PKCS1_OAEP_PADDING));
-  test_eq(128, crypto_pk_public_encrypt(pk1, data2, "Hello whirled.", 15,
+  test_eq(128, crypto_pk_public_encrypt(pk1, data2, sizeof(data1),
+                                        "Hello whirled.", 15,
                                         PK_PKCS1_OAEP_PADDING));
   /* oaep padding should make encryption not match */
   test_memneq(data1, data2, 128);
-  test_eq(15, crypto_pk_private_decrypt(pk1, data3, data1, 128,
+  test_eq(15, crypto_pk_private_decrypt(pk1, data3, sizeof(data3), data1, 128,
                                         PK_PKCS1_OAEP_PADDING,1));
   test_streq(data3, "Hello whirled.");
   memset(data3, 0, 1024);
-  test_eq(15, crypto_pk_private_decrypt(pk1, data3, data2, 128,
+  test_eq(15, crypto_pk_private_decrypt(pk1, data3, sizeof(data3), data2, 128,
                                         PK_PKCS1_OAEP_PADDING,1));
   test_streq(data3, "Hello whirled.");
   /* Can't decrypt with public key. */
-  test_eq(-1, crypto_pk_private_decrypt(pk2, data3, data2, 128,
+  test_eq(-1, crypto_pk_private_decrypt(pk2, data3, sizeof(data3), data2, 128,
                                         PK_PKCS1_OAEP_PADDING,1));
   /* Try again with bad padding */
   memcpy(data2+1, "XYZZY", 5);  /* This has fails ~ once-in-2^40 */
-  test_eq(-1, crypto_pk_private_decrypt(pk1, data3, data2, 128,
+  test_eq(-1, crypto_pk_private_decrypt(pk1, data3, sizeof(data3), data2, 128,
                                         PK_PKCS1_OAEP_PADDING,1));
 
   /* File operations: save and load private key */
@@ -376,19 +451,23 @@ test_crypto_pk(void)
                                                    get_fname("xyzzy")) < 0);
   test_assert(! crypto_pk_read_private_key_from_filename(pk2,
                                                          get_fname("pkey1")));
-  test_eq(15, crypto_pk_private_decrypt(pk2, data3, data1, 128,
+  test_eq(15, crypto_pk_private_decrypt(pk2, data3, sizeof(data3), data1, 128,
                                         PK_PKCS1_OAEP_PADDING,1));
 
   /* Now try signing. */
   strlcpy(data1, "Ossifrage", 1024);
-  test_eq(128, crypto_pk_private_sign(pk1, data2, data1, 10));
-  test_eq(10, crypto_pk_public_checksig(pk1, data3, data2, 128));
+  test_eq(128, crypto_pk_private_sign(pk1, data2, sizeof(data2), data1, 10));
+  test_eq(10,
+          crypto_pk_public_checksig(pk1, data3, sizeof(data3), data2, 128));
   test_streq(data3, "Ossifrage");
   /* Try signing digests. */
-  test_eq(128, crypto_pk_private_sign_digest(pk1, data2, data1, 10));
-  test_eq(20, crypto_pk_public_checksig(pk1, data3, data2, 128));
+  test_eq(128, crypto_pk_private_sign_digest(pk1, data2, sizeof(data2),
+                                             data1, 10));
+  test_eq(20,
+          crypto_pk_public_checksig(pk1, data3, sizeof(data3), data2, 128));
   test_eq(0, crypto_pk_public_checksig_digest(pk1, data1, 10, data2, 128));
   test_eq(-1, crypto_pk_public_checksig_digest(pk1, data1, 11, data2, 128));
+
   /*XXXX test failed signing*/
 
   /* Try encoding */
@@ -409,9 +488,11 @@ test_crypto_pk(void)
         continue;
       p = (i==0)?PK_NO_PADDING:
         (i==1)?PK_PKCS1_PADDING:PK_PKCS1_OAEP_PADDING;
-      len = crypto_pk_public_hybrid_encrypt(pk1,data2,data1,j,p,0);
+      len = crypto_pk_public_hybrid_encrypt(pk1,data2,sizeof(data2),
+                                            data1,j,p,0);
       test_assert(len>=0);
-      len = crypto_pk_private_hybrid_decrypt(pk1,data3,data2,len,p,1);
+      len = crypto_pk_private_hybrid_decrypt(pk1,data3,sizeof(data3),
+                                             data2,len,p,1);
       test_eq(len,j);
       test_memeq(data1,data3,j);
     }
@@ -618,7 +699,7 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(encrypted_size, 16 + 4095);
-  tor_assert(encrypted_size > 0); /* This is obviously true, since 4111 is
+  tt_assert(encrypted_size > 0); /* This is obviously true, since 4111 is
                                    * greater than 0, but its truth is not
                                    * obvious to all analysis tools. */
   cipher = crypto_create_init_cipher(key1, 0);
@@ -627,7 +708,7 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(decrypted_size, 4095);
-  tor_assert(decrypted_size > 0);
+  tt_assert(decrypted_size > 0);
   test_memeq(plain, decrypted1, 4095);
   /* Encrypt a second time (with a new random initialization vector). */
   cipher = crypto_create_init_cipher(key1, 1);
@@ -636,14 +717,14 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(encrypted_size, 16 + 4095);
-  tor_assert(encrypted_size > 0);
+  tt_assert(encrypted_size > 0);
   cipher = crypto_create_init_cipher(key1, 0);
   decrypted_size = crypto_cipher_decrypt_with_iv(cipher, decrypted2, 4095,
                                              encrypted2, encrypted_size);
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(decrypted_size, 4095);
-  tor_assert(decrypted_size > 0);
+  tt_assert(decrypted_size > 0);
   test_memeq(plain, decrypted2, 4095);
   test_memneq(encrypted1, encrypted2, encrypted_size);
   /* Decrypt with the wrong key. */
@@ -668,14 +749,14 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(encrypted_size, 16 + 1);
-  tor_assert(encrypted_size > 0);
+  tt_assert(encrypted_size > 0);
   cipher = crypto_create_init_cipher(key1, 0);
   decrypted_size = crypto_cipher_decrypt_with_iv(cipher, decrypted1, 1,
                                              encrypted1, encrypted_size);
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(decrypted_size, 1);
-  tor_assert(decrypted_size > 0);
+  tt_assert(decrypted_size > 0);
   test_memeq(plain_1, decrypted1, 1);
   /* Special length case: 15. */
   cipher = crypto_create_init_cipher(key1, 1);
@@ -684,14 +765,14 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(encrypted_size, 16 + 15);
-  tor_assert(encrypted_size > 0);
+  tt_assert(encrypted_size > 0);
   cipher = crypto_create_init_cipher(key1, 0);
   decrypted_size = crypto_cipher_decrypt_with_iv(cipher, decrypted1, 15,
                                              encrypted1, encrypted_size);
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(decrypted_size, 15);
-  tor_assert(decrypted_size > 0);
+  tt_assert(decrypted_size > 0);
   test_memeq(plain_15, decrypted1, 15);
   /* Special length case: 16. */
   cipher = crypto_create_init_cipher(key1, 1);
@@ -700,14 +781,14 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(encrypted_size, 16 + 16);
-  tor_assert(encrypted_size > 0);
+  tt_assert(encrypted_size > 0);
   cipher = crypto_create_init_cipher(key1, 0);
   decrypted_size = crypto_cipher_decrypt_with_iv(cipher, decrypted1, 16,
                                              encrypted1, encrypted_size);
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(decrypted_size, 16);
-  tor_assert(decrypted_size > 0);
+  tt_assert(decrypted_size > 0);
   test_memeq(plain_16, decrypted1, 16);
   /* Special length case: 17. */
   cipher = crypto_create_init_cipher(key1, 1);
@@ -716,12 +797,12 @@ test_crypto_aes_iv(void)
   crypto_free_cipher_env(cipher);
   cipher = NULL;
   test_eq(encrypted_size, 16 + 17);
-  tor_assert(encrypted_size > 0);
+  tt_assert(encrypted_size > 0);
   cipher = crypto_create_init_cipher(key1, 0);
   decrypted_size = crypto_cipher_decrypt_with_iv(cipher, decrypted1, 17,
                                              encrypted1, encrypted_size);
   test_eq(decrypted_size, 17);
-  tor_assert(decrypted_size > 0);
+  tt_assert(decrypted_size > 0);
   test_memeq(plain_17, decrypted1, 17);
 
  done:

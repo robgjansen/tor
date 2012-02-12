@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -54,12 +54,19 @@ struct evdns_request;
   evdns_config_windows_nameservers()
 #define evdns_base_set_option_(base, opt, val) \
   evdns_set_option((opt),(val),DNS_OPTIONS_ALL)
+/* Note: our internal eventdns.c, plus Libevent 1.4, used a 1 return to
+ * signify failure to launch a resolve. Libevent 2.0 uses a -1 return to
+ * signify a failure on a resolve, though if we're on Libevent 2.0, we should
+ * have event2/dns.h and never hit these macros.  Regardless, 0 is success. */
 #define evdns_base_resolve_ipv4(base, addr, options, cb, ptr) \
-  ((evdns_resolve_ipv4(addr, options, cb, ptr)<0) ? NULL : ((void*)1))
-#define evdns_base_resolve_reverse(base, addr, options, cb, ptr) \
-  ((evdns_resolve_reverse(addr, options, cb, ptr)<0) ? NULL : ((void*)1))
-#define evdns_base_resolve_reverse_ipv6(base, addr, options, cb, ptr) \
-  ((evdns_resolve_reverse_ipv6(addr, options, cb, ptr)<0) ? NULL : ((void*)1))
+  ((evdns_resolve_ipv4((addr), (options), (cb), (ptr))!=0)    \
+   ? NULL : ((void*)1))
+#define evdns_base_resolve_reverse(base, addr, options, cb, ptr)        \
+  ((evdns_resolve_reverse((addr), (options), (cb), (ptr))!=0)           \
+   ? NULL : ((void*)1))
+#define evdns_base_resolve_reverse_ipv6(base, addr, options, cb, ptr)   \
+  ((evdns_resolve_reverse_ipv6((addr), (options), (cb), (ptr))!=0)      \
+   ? NULL : ((void*)1))
 
 #elif defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER < 0x02000303
 #define evdns_base_set_option_(base, opt, val) \
@@ -269,7 +276,7 @@ dns_init(void)
 int
 dns_reset(void)
 {
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
   if (! server_mode(options)) {
 
     if (!the_evdns_base) {
@@ -668,7 +675,7 @@ dns_resolve_impl(edge_connection_t *exitconn, int is_resolve,
   cached_resolve_t *resolve;
   cached_resolve_t search;
   pending_connection_t *pending_connection;
-  routerinfo_t *me;
+  const routerinfo_t *me;
   tor_addr_t addr;
   time_t now = time(NULL);
   uint8_t is_reverse = 0;
@@ -680,7 +687,7 @@ dns_resolve_impl(edge_connection_t *exitconn, int is_resolve,
 
   /* first check if exitconn->_base.address is an IP. If so, we already
    * know the answer. */
-  if (tor_addr_from_str(&addr, exitconn->_base.address) >= 0) {
+  if (tor_addr_parse(&addr, exitconn->_base.address) >= 0) {
     if (tor_addr_family(&addr) == AF_INET) {
       tor_addr_copy(&exitconn->_base.addr, &addr);
       exitconn->address_ttl = DEFAULT_DNS_TTL;
@@ -714,7 +721,7 @@ dns_resolve_impl(edge_connection_t *exitconn, int is_resolve,
    * .in-addr.arpa address but this isn't a resolve request, kill the
    * connection.
    */
-  if ((r = tor_addr_parse_reverse_lookup_name(&addr, exitconn->_base.address,
+  if ((r = tor_addr_parse_PTR_name(&addr, exitconn->_base.address,
                                               AF_UNSPEC, 0)) != 0) {
     if (r == 1) {
       is_reverse = 1;
@@ -1019,7 +1026,7 @@ add_answer_to_cache(const char *address, uint8_t is_reverse, uint32_t addr,
 static INLINE int
 is_test_address(const char *address)
 {
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
   return options->ServerDNSTestAddresses &&
     smartlist_string_isin_case(options->ServerDNSTestAddresses, address);
 }
@@ -1170,7 +1177,7 @@ evdns_err_is_transient(int err)
 static int
 configure_nameservers(int force)
 {
-  or_options_t *options;
+  const or_options_t *options;
   const char *conf_fname;
   struct stat st;
   int r;
@@ -1191,7 +1198,7 @@ configure_nameservers(int force)
 #ifdef HAVE_EVDNS_SET_DEFAULT_OUTGOING_BIND_ADDRESS
   if (options->OutboundBindAddress) {
     tor_addr_t addr;
-    if (tor_addr_from_str(&addr, options->OutboundBindAddress) < 0) {
+    if (tor_addr_parse(&addr, options->OutboundBindAddress) < 0) {
       log_warn(LD_CONFIG,"Outbound bind address '%s' didn't parse. Ignoring.",
                options->OutboundBindAddress);
     } else {
@@ -1199,7 +1206,7 @@ configure_nameservers(int force)
       struct sockaddr_storage ss;
       socklen = tor_addr_to_sockaddr(&addr, 0,
                                      (struct sockaddr *)&ss, sizeof(ss));
-      if (socklen < 0) {
+      if (socklen <= 0) {
         log_warn(LD_BUG, "Couldn't convert outbound bind address to sockaddr."
                  " Ignoring.");
       } else {
@@ -1288,14 +1295,17 @@ configure_nameservers(int force)
   nameservers_configured = 1;
   if (nameserver_config_failed) {
     nameserver_config_failed = 0;
-    mark_my_descriptor_dirty();
+    /* XXX the three calls to republish the descriptor might be producing
+     * descriptors that are only cosmetically different, especially on
+     * non-exit relays! -RD */
+    mark_my_descriptor_dirty("dns resolvers back");
   }
   return 0;
  err:
   nameservers_configured = 0;
   if (! nameserver_config_failed) {
     nameserver_config_failed = 1;
-    mark_my_descriptor_dirty();
+    mark_my_descriptor_dirty("dns resolvers failed");
   }
   return -1;
 }
@@ -1394,7 +1404,7 @@ launch_resolve(edge_connection_t *exitconn)
     }
   }
 
-  r = tor_addr_parse_reverse_lookup_name(
+  r = tor_addr_parse_PTR_name(
                             &a, exitconn->_base.address, AF_UNSPEC, 0);
 
   tor_assert(the_evdns_base);
@@ -1515,7 +1525,7 @@ add_wildcarded_test_address(const char *address)
         "broken.", address, n);
     if (!dns_is_completely_invalid) {
       dns_is_completely_invalid = 1;
-      mark_my_descriptor_dirty();
+      mark_my_descriptor_dirty("dns hijacking confirmed");
     }
     if (!dns_wildcarded_test_address_notice_given)
       control_event_server_status(LOG_WARN, "DNS_USELESS");
@@ -1585,7 +1595,7 @@ launch_wildcard_check(int min_len, int max_len, const char *suffix)
 static void
 launch_test_addresses(int fd, short event, void *args)
 {
-  or_options_t *options = get_options();
+  const or_options_t *options = get_options();
   struct evdns_request *req;
   (void)fd;
   (void)event;
