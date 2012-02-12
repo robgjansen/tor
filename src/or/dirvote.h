@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -18,9 +18,6 @@
 #define MIN_DIST_SECONDS 20
 /** Smallest allowable voting interval. */
 #define MIN_VOTE_INTERVAL 300
-
-/** Precision multiplier for the Bw weights */
-#define BW_WEIGHT_SCALE   10000
 
 void dirvote_free_all(void);
 
@@ -44,8 +41,8 @@ authority_cert_t *authority_cert_dup(authority_cert_t *cert);
 /* vote scheduling */
 void dirvote_get_preferred_voting_intervals(vote_timing_t *timing_out);
 time_t dirvote_get_start_of_next_interval(time_t now, int interval);
-void dirvote_recalculate_timing(or_options_t *options, time_t now);
-void dirvote_act(or_options_t *options, time_t now);
+void dirvote_recalculate_timing(const or_options_t *options, time_t now);
+void dirvote_act(const or_options_t *options, time_t now);
 
 /* invoked on timers and by outside triggers. */
 struct pending_vote_t * dirvote_add_vote(const char *vote_body,
@@ -63,9 +60,10 @@ const char *dirvote_get_pending_detached_signatures(void);
 #define DGV_INCLUDE_PREVIOUS 4
 const cached_dir_t *dirvote_get_vote(const char *fp, int flags);
 void set_routerstatus_from_routerinfo(routerstatus_t *rs,
+                                      node_t *node,
                                       routerinfo_t *ri, time_t now,
                                       int naming, int listbadexits,
-                                      int listbaddirs);
+                                      int listbaddirs, int vote_on_hsdirs);
 void router_clear_status_flags(routerinfo_t *ri);
 networkstatus_t *
 dirserv_generate_networkstatus_vote_obj(crypto_pk_env_t *private_key,

@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -15,6 +15,8 @@
 /* This is required on rh7 to make strptime not complain.
  * We also need it to make memmem get defined (where available)
  */
+/* XXXX023 We should just use AC_USE_SYSTEM_EXTENSIONS in our autoconf,
+ * and get this (and other important stuff!) automatically */
 #define _GNU_SOURCE
 
 #include "compat.h"
@@ -101,6 +103,35 @@
 #include "strlcat.c"
 #endif
 
+/** As open(path, flags, mode), but return an fd with the close-on-exec mode
+ * set. */
+int
+tor_open_cloexec(const char *path, int flags, unsigned mode)
+{
+#ifdef O_CLOEXEC
+  return open(path, flags|O_CLOEXEC, mode);
+#else
+  int fd = open(path, flags, mode);
+#ifdef FD_CLOEXEC
+  if (fd >= 0)
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+  return fd;
+#endif
+}
+
+/** DOCDOC */
+FILE *
+tor_fopen_cloexec(const char *path, const char *mode)
+{
+  FILE *result = fopen(path, mode);
+#ifdef FD_CLOEXEC
+  if (result != NULL)
+    fcntl(fileno(result), F_SETFD, FD_CLOEXEC);
+#endif
+  return result;
+}
+
 #ifdef HAVE_SYS_MMAN_H
 /** Try to create a memory mapping for <b>filename</b> and return it.  On
  * failure, return NULL.  Sets errno properly, using ERANGE to mean
@@ -116,7 +147,7 @@ tor_mmap_file(const char *filename)
 
   tor_assert(filename);
 
-  fd = open(filename, O_RDONLY, 0);
+  fd = tor_open_cloexec(filename, O_RDONLY, 0);
   if (fd<0) {
     int save_errno = errno;
     int severity = (errno == ENOENT) ? LOG_INFO : LOG_WARN;
@@ -126,6 +157,7 @@ tor_mmap_file(const char *filename)
     return NULL;
   }
 
+  /* XXXX why not just do fstat here? */
   size = filesize = (size_t) lseek(fd, 0, SEEK_END);
   lseek(fd, 0, SEEK_SET);
   /* ensure page alignment */
@@ -169,13 +201,17 @@ tor_munmap_file(tor_mmap_t *handle)
 tor_mmap_t *
 tor_mmap_file(const char *filename)
 {
-  WCHAR wfilename[MAX_PATH]= {0};
+  TCHAR tfilename[MAX_PATH]= {0};
   tor_mmap_t *res = tor_malloc_zero(sizeof(tor_mmap_t));
   int empty = 0;
   res->file_handle = INVALID_HANDLE_VALUE;
   res->mmap_handle = NULL;
-  mbstowcs(wfilename,filename,MAX_PATH);
-  res->file_handle = CreateFileW(wfilename,
+#ifdef UNICODE
+  mbstowcs(tfilename,filename,MAX_PATH);
+#else
+  strlcpy(tfilename,filename,MAX_PATH);
+#endif
+  res->file_handle = CreateFile(tfilename,
                                 GENERIC_READ, FILE_SHARE_READ,
                                 NULL,
                                 OPEN_EXISTING,
@@ -295,7 +331,7 @@ tor_vsnprintf(char *str, size_t size, const char *format, va_list args)
   int r;
   if (size == 0)
     return -1; /* no place for the NUL */
-  if (size > SSIZE_T_MAX-16)
+  if (size > SIZE_T_CEILING)
     return -1;
 #ifdef MS_WINDOWS
   r = _vsnprintf(str, size, format, args);
@@ -406,7 +442,9 @@ tor_vasprintf(char **strp, const char *fmt, va_list args)
  * <b>needle</b>, return a pointer to the first occurrence of the needle
  * within the haystack, or NULL if there is no such occurrence.
  *
- * Requires that nlen be greater than zero.
+ * This function is <em>not</em> timing-safe.
+ *
+ * Requires that <b>nlen</b> be greater than zero.
  */
 const void *
 tor_memmem(const void *_haystack, size_t hlen,
@@ -430,7 +468,7 @@ tor_memmem(const void *_haystack, size_t hlen,
   while ((p = memchr(p, first, end-p))) {
     if (p+nlen > end)
       return NULL;
-    if (!memcmp(p, needle, nlen))
+    if (fast_memeq(p, needle, nlen))
       return p;
     ++p;
   }
@@ -556,7 +594,7 @@ tor_fix_source_file(const char *fname)
  * unaligned memory access.
  */
 uint16_t
-get_uint16(const char *cp)
+get_uint16(const void *cp)
 {
   uint16_t v;
   memcpy(&v,cp,2);
@@ -568,7 +606,7 @@ get_uint16(const char *cp)
  * unaligned memory access.
  */
 uint32_t
-get_uint32(const char *cp)
+get_uint32(const void *cp)
 {
   uint32_t v;
   memcpy(&v,cp,4);
@@ -580,7 +618,7 @@ get_uint32(const char *cp)
  * unaligned memory access.
  */
 uint64_t
-get_uint64(const char *cp)
+get_uint64(const void *cp)
 {
   uint64_t v;
   memcpy(&v,cp,8);
@@ -592,7 +630,7 @@ get_uint64(const char *cp)
  * *(uint16_t*)(cp) = v, but will not cause segfaults on platforms that forbid
  * unaligned memory access. */
 void
-set_uint16(char *cp, uint16_t v)
+set_uint16(void *cp, uint16_t v)
 {
   memcpy(cp,&v,2);
 }
@@ -601,7 +639,7 @@ set_uint16(char *cp, uint16_t v)
  * *(uint32_t*)(cp) = v, but will not cause segfaults on platforms that forbid
  * unaligned memory access. */
 void
-set_uint32(char *cp, uint32_t v)
+set_uint32(void *cp, uint32_t v)
 {
   memcpy(cp,&v,4);
 }
@@ -610,7 +648,7 @@ set_uint32(char *cp, uint32_t v)
  * *(uint64_t*)(cp) = v, but will not cause segfaults on platforms that forbid
  * unaligned memory access. */
 void
-set_uint64(char *cp, uint64_t v)
+set_uint64(void *cp, uint64_t v)
 {
   memcpy(cp,&v,8);
 }
@@ -655,7 +693,9 @@ touch_file(const char *fname)
 
 /** Represents a lockfile on which we hold the lock. */
 struct tor_lockfile_t {
+  /** Name of the file */
   char *filename;
+  /** File descriptor used to hold the file open */
   int fd;
 };
 
@@ -671,7 +711,10 @@ struct tor_lockfile_t {
  *
  * (Implementation note: because we need to fall back to fcntl on some
  *  platforms, these locks are per-process, not per-thread.  If you want
- *  to do in-process locking, use tor_mutex_t like a normal person.)
+ *  to do in-process locking, use tor_mutex_t like a normal person.
+ *  On Windows, when <b>blocking</b> is true, the maximum time that
+ *  is actually waited is 10 seconds, after which NULL is returned
+ *  and <b>locked_out</b> is set to 1.)
  */
 tor_lockfile_t *
 tor_lockfile_lock(const char *filename, int blocking, int *locked_out)
@@ -681,7 +724,7 @@ tor_lockfile_lock(const char *filename, int blocking, int *locked_out)
   *locked_out = 0;
 
   log_info(LD_FS, "Locking \"%s\"", filename);
-  fd = open(filename, O_RDWR|O_CREAT|O_TRUNC, 0600);
+  fd = tor_open_cloexec(filename, O_RDWR|O_CREAT|O_TRUNC, 0600);
   if (fd < 0) {
     log_warn(LD_FS,"Couldn't open \"%s\" for locking: %s", filename,
              strerror(errno));
@@ -691,7 +734,7 @@ tor_lockfile_lock(const char *filename, int blocking, int *locked_out)
 #ifdef WIN32
   _lseek(fd, 0, SEEK_SET);
   if (_locking(fd, blocking ? _LK_LOCK : _LK_NBLCK, 1) < 0) {
-    if (errno != EDEADLOCK)
+    if (errno != EACCES && errno != EDEADLOCK)
       log_warn(LD_FS,"Couldn't lock \"%s\": %s", filename, strerror(errno));
     else
       *locked_out = 1;
@@ -758,7 +801,8 @@ tor_lockfile_unlock(tor_lockfile_t *lockfile)
   tor_free(lockfile);
 }
 
-/* Some old versions of Unix didn't define constants for these values,
+/** @{ */
+/** Some old versions of Unix didn't define constants for these values,
  * and instead expect you to say 0, 1, or 2. */
 #ifndef SEEK_CUR
 #define SEEK_CUR 1
@@ -766,6 +810,7 @@ tor_lockfile_unlock(tor_lockfile_t *lockfile)
 #ifndef SEEK_END
 #define SEEK_END 2
 #endif
+/** @} */
 
 /** Return the position of <b>fd</b> with respect to the start of the file. */
 off_t
@@ -805,6 +850,7 @@ static int n_sockets_open = 0;
 /** Mutex to protect open_sockets, max_socket, and n_sockets_open. */
 static tor_mutex_t *socket_accounting_mutex = NULL;
 
+/** Helper: acquire the socket accounting lock. */
 static INLINE void
 socket_accounting_lock(void)
 {
@@ -813,6 +859,7 @@ socket_accounting_lock(void)
   tor_mutex_acquire(socket_accounting_mutex);
 }
 
+/** Helper: release the socket accounting lock. */
 static INLINE void
 socket_accounting_unlock(void)
 {
@@ -823,7 +870,7 @@ socket_accounting_unlock(void)
  * Windows, where close()ing a socket doesn't work.  Returns 0 on success, -1
  * on failure. */
 int
-tor_close_socket(int s)
+tor_close_socket(tor_socket_t s)
 {
   int r = 0;
 
@@ -871,12 +918,15 @@ tor_close_socket(int s)
   return r;
 }
 
+/** @{ */
 #ifdef DEBUG_SOCKET_COUNTING
 /** Helper: if DEBUG_SOCKET_COUNTING is enabled, remember that <b>s</b> is
  * now an open socket. */
 static INLINE void
-mark_socket_open(int s)
+mark_socket_open(tor_socket_t s)
 {
+  /* XXXX This bitarray business will NOT work on windows: sockets aren't
+     small ints there. */
   if (s > max_socket) {
     if (max_socket == -1) {
       open_sockets = bitarray_init_zero(s+128);
@@ -895,13 +945,22 @@ mark_socket_open(int s)
 #else
 #define mark_socket_open(s) STMT_NIL
 #endif
+/** @} */
 
 /** As socket(), but counts the number of open sockets. */
-int
+tor_socket_t
 tor_open_socket(int domain, int type, int protocol)
 {
-  int s = socket(domain, type, protocol);
-  if (s >= 0) {
+  tor_socket_t s;
+#ifdef SOCK_CLOEXEC
+#define LINUX_CLOEXEC_OPEN_SOCKET
+  type |= SOCK_CLOEXEC;
+#endif
+  s = socket(domain, type, protocol);
+  if (SOCKET_OK(s)) {
+#if !defined(LINUX_CLOEXEC_OPEN_SOCKET) && defined(FD_CLOEXEC)
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+#endif
     socket_accounting_lock();
     ++n_sockets_open;
     mark_socket_open(s);
@@ -911,11 +970,20 @@ tor_open_socket(int domain, int type, int protocol)
 }
 
 /** As socket(), but counts the number of open sockets. */
-int
+tor_socket_t
 tor_accept_socket(int sockfd, struct sockaddr *addr, socklen_t *len)
 {
-  int s = accept(sockfd, addr, len);
-  if (s >= 0) {
+  tor_socket_t s;
+#if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC)
+#define LINUX_CLOEXEC_ACCEPT
+  s = accept4(sockfd, addr, len, SOCK_CLOEXEC);
+#else
+  s = accept(sockfd, addr, len);
+#endif
+  if (SOCKET_OK(s)) {
+#if !defined(LINUX_CLOEXEC_ACCEPT) && defined(FD_CLOEXEC)
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+#endif
     socket_accounting_lock();
     ++n_sockets_open;
     mark_socket_open(s);
@@ -938,7 +1006,7 @@ get_n_open_sockets(void)
 /** Turn <b>socket</b> into a nonblocking socket.
  */
 void
-set_socket_nonblocking(int socket)
+set_socket_nonblocking(tor_socket_t socket)
 {
 #if defined(MS_WINDOWS)
   unsigned long nonblocking = 1;
@@ -966,13 +1034,22 @@ set_socket_nonblocking(int socket)
  **/
 /* It would be nicer just to set errno, but that won't work for windows. */
 int
-tor_socketpair(int family, int type, int protocol, int fd[2])
+tor_socketpair(int family, int type, int protocol, tor_socket_t fd[2])
 {
 //don't use win32 socketpairs (they are always bad)
 #if defined(HAVE_SOCKETPAIR) && !defined(MS_WINDOWS)
   int r;
+#ifdef SOCK_CLOEXEC
+  type |= SOCK_CLOEXEC;
+#endif
   r = socketpair(family, type, protocol, fd);
   if (r == 0) {
+#if !defined(SOCK_CLOEXEC) && defined(FD_CLOEXEC)
+    if (fd[0] >= 0)
+      fcntl(fd[0], F_SETFD, FD_CLOEXEC);
+    if (fd[1] >= 0)
+      fcntl(fd[1], F_SETFD, FD_CLOEXEC);
+#endif
     socket_accounting_lock();
     if (fd[0] >= 0) {
       ++n_sockets_open;
@@ -991,9 +1068,9 @@ tor_socketpair(int family, int type, int protocol, int fd[2])
      * for now, and really, when localhost is down sometimes, we
      * have other problems too.
      */
-    int listener = -1;
-    int connector = -1;
-    int acceptor = -1;
+    tor_socket_t listener = -1;
+    tor_socket_t connector = -1;
+    tor_socket_t acceptor = -1;
     struct sockaddr_in listen_addr;
     struct sockaddr_in connect_addr;
     int size;
@@ -1082,6 +1159,8 @@ tor_socketpair(int family, int type, int protocol, int fd[2])
 #endif
 }
 
+/** Number of extra file descriptors to keep in reserve beyond those that we
+ * tell Tor it's allowed to use. */
 #define ULIMIT_BUFFER 32 /* keep 32 extra fd's beyond _ConnLimit */
 
 /** Learn the maximum allowed number of file descriptors. (Some systems
@@ -1194,13 +1273,15 @@ set_max_file_descriptors(rlim_t limit, int *max_out)
 static int
 log_credential_status(void)
 {
+/** Log level to use when describing non-error UID/GID status. */
 #define CREDENTIAL_LOG_LEVEL LOG_INFO
   /* Real, effective and saved UIDs */
   uid_t ruid, euid, suid;
   /* Read, effective and saved GIDs */
   gid_t rgid, egid, sgid;
   /* Supplementary groups */
-  gid_t sup_gids[NGROUPS_MAX + 1];
+  gid_t *sup_gids = NULL;
+  int sup_gids_size;
   /* Number of supplementary groups */
   int ngids;
 
@@ -1246,9 +1327,19 @@ log_credential_status(void)
 #endif
 
   /* log supplementary groups */
-  if ((ngids = getgroups(NGROUPS_MAX + 1, sup_gids)) < 0) {
+  sup_gids_size = 64;
+  sup_gids = tor_malloc(sizeof(gid_t) * 64);
+  while ((ngids = getgroups(sup_gids_size, sup_gids)) < 0 &&
+         errno == EINVAL &&
+         sup_gids_size < NGROUPS_MAX) {
+    sup_gids_size *= 2;
+    sup_gids = tor_realloc(sup_gids, sizeof(gid_t) * sup_gids_size);
+  }
+
+  if (ngids < 0) {
     log_warn(LD_GENERAL, "Error getting supplementary GIDs: %s",
              strerror(errno));
+    tor_free(sup_gids);
     return -1;
   } else {
     int i, retval = 0;
@@ -1278,6 +1369,7 @@ log_credential_status(void)
       tor_free(cp);
     });
     smartlist_free(elts);
+    tor_free(sup_gids);
 
     return retval;
   }
@@ -1444,6 +1536,45 @@ get_user_homedir(const char *username)
 }
 #endif
 
+/** Modify <b>fname</b> to contain the name of the directory */
+int
+get_parent_directory(char *fname)
+{
+  char *cp;
+  int at_end = 1;
+  tor_assert(fname);
+#ifdef MS_WINDOWS
+  /* If we start with, say, c:, then don't consider that the start of the path
+   */
+  if (fname[0] && fname[1] == ':') {
+    fname += 2;
+  }
+#endif
+  /* Now we want to remove all path-separators at the end of the string,
+   * and to remove the end of the string starting with the path separator
+   * before the last non-path-separator.  In perl, this would be
+   *   s#[/]*$##; s#/[^/]*$##;
+   * on a unixy platform.
+   */
+  cp = fname + strlen(fname);
+  at_end = 1;
+  while (--cp > fname) {
+    int is_sep = (*cp == '/'
+#ifdef MS_WINDOWS
+                  || *cp == '\\'
+#endif
+                  );
+    if (is_sep) {
+      *cp = '\0';
+      if (! at_end)
+        return 0;
+    } else {
+      at_end = 0;
+    }
+  }
+  return -1;
+}
+
 /** Set *addr to the IP address (in dotted-quad notation) stored in c.
  * Return 1 on success, 0 if c is badly formatted.  (Like inet_aton(c,addr),
  * but works on Windows and Solaris.)
@@ -1501,7 +1632,7 @@ tor_inet_ntop(int af, const void *src, char *dst, size_t len)
                      addr->s6_addr[12], addr->s6_addr[13],
                      addr->s6_addr[14], addr->s6_addr[15]);
       }
-      if (strlen(buf) > len)
+      if ((strlen(buf) + 1) > len) /* +1 for \0 */
         return NULL;
       strlcpy(dst, buf, len);
       return dst;
@@ -1542,7 +1673,7 @@ tor_inet_ntop(int af, const void *src, char *dst, size_t len)
       }
     }
     *cp = '\0';
-    if (strlen(buf) > len)
+    if ((strlen(buf) + 1) > len) /* +1 for \0 */
       return NULL;
     strlcpy(dst, buf, len);
     return dst;
@@ -1602,24 +1733,30 @@ tor_inet_pton(int af, const char *src, void *dst)
         return 0;
       if (TOR_ISXDIGIT(*src)) {
         char *next;
+        int len;
         long r = strtol(src, &next, 16);
-        if (next > 4+src)
-          return 0;
-        if (next == src)
-          return 0;
-        if (r<0 || r>65536)
-          return 0;
+        tor_assert(next != NULL);
+        tor_assert(next != src);
 
+        len = *next == '\0' ? eow - src : next - src;
+        if (len > 4)
+          return 0;
+        if (len > 1 && !TOR_ISXDIGIT(src[1]))
+          return 0; /* 0x is not valid */
+
+        tor_assert(r >= 0);
+        tor_assert(r < 65536);
         words[i++] = (uint16_t)r;
         setWords++;
         src = next;
         if (*src != ':' && src != eow)
           return 0;
         ++src;
-      } else if (*src == ':' && i > 0 && gapPos==-1) {
+      } else if (*src == ':' && i > 0 && gapPos == -1) {
         gapPos = i;
         ++src;
-      } else if (*src == ':' && i == 0 && src[1] == ':' && gapPos==-1) {
+      } else if (*src == ':' && i == 0 && src+1 < eow && src[1] == ':' &&
+                 gapPos == -1) {
         gapPos = i;
         src += 2;
       } else {
@@ -1675,6 +1812,30 @@ tor_lookup_hostname(const char *name, uint32_t *addr)
   return -1;
 }
 
+/** Initialize the insecure libc RNG. */
+void
+tor_init_weak_random(unsigned seed)
+{
+#ifdef MS_WINDOWS
+  srand(seed);
+#else
+  srandom(seed);
+#endif
+}
+
+/** Return a randomly chosen value in the range 0..TOR_RAND_MAX.  This
+ * entropy will not be cryptographically strong; do not rely on it
+ * for anything an adversary should not be able to predict. */
+long
+tor_weak_random(void)
+{
+#ifdef MS_WINDOWS
+  return rand();
+#else
+  return random();
+#endif
+}
+
 /** Hold the result of our call to <b>uname</b>. */
 static char uname_result[256];
 /** True iff uname_result is set. */
@@ -1698,11 +1859,7 @@ get_uname(void)
 #endif
       {
 #ifdef MS_WINDOWS
-#if defined (WINCE)
-        OSVERSIONINFO info;
-#else
-        OSVERSIONINFOEXW info;
-#endif
+        OSVERSIONINFOEX info;
         int i;
         const char *plat = NULL;
         const char *extra = NULL;
@@ -1710,6 +1867,7 @@ get_uname(void)
         static struct {
           unsigned major; unsigned minor; const char *version;
         } win_version_table[] = {
+          { 6, 2, "Windows 8" },
           { 6, 1, "Windows 7" },
           { 6, 0, "Windows Vista" },
           { 5, 2, "Windows Server 2003" },
@@ -1724,13 +1882,17 @@ get_uname(void)
         };
         memset(&info, 0, sizeof(info));
         info.dwOSVersionInfoSize = sizeof(info);
-        if (! GetVersionExW((LPOSVERSIONINFOW)&info)) {
+        if (! GetVersionEx((LPOSVERSIONINFO)&info)) {
           strlcpy(uname_result, "Bizarre version of Windows where GetVersionEx"
                   " doesn't work.", sizeof(uname_result));
           uname_result_is_set = 1;
           return uname_result;
         }
+#ifdef UNICODE
         wcstombs(acsd, info.szCSDVersion, MAX_PATH);
+#else
+        strlcpy(acsd, info.szCSDVersion, sizeof(acsd));
+#endif
         if (info.dwMajorVersion == 4 && info.dwMinorVersion == 0) {
           if (info.dwPlatformId == VER_PLATFORM_WIN32_NT)
             plat = "Windows NT 4.0";
@@ -1762,7 +1924,7 @@ get_uname(void)
                        plat, extra);
         } else {
           if (info.dwMajorVersion > 6 ||
-              (info.dwMajorVersion==6 && info.dwMinorVersion>1))
+              (info.dwMajorVersion==6 && info.dwMinorVersion>2))
             tor_snprintf(uname_result, sizeof(uname_result),
                       "Very recent version of Windows [major=%d,minor=%d] %s",
                       (int)info.dwMajorVersion,(int)info.dwMinorVersion,
@@ -1894,6 +2056,52 @@ spawn_exit(void)
 #endif
 }
 
+/** Implementation logic for compute_num_cpus(). */
+static int
+compute_num_cpus_impl(void)
+{
+#ifdef MS_WINDOWS
+  SYSTEM_INFO info;
+  memset(&info, 0, sizeof(info));
+  GetSystemInfo(&info);
+  if (info.dwNumberOfProcessors >= 1 && info.dwNumberOfProcessors < INT_MAX)
+    return (int)info.dwNumberOfProcessors;
+  else
+    return -1;
+#elif defined(HAVE_SYSCONF) && defined(_SC_NPROCESSORS_CONF)
+  long cpus = sysconf(_SC_NPROCESSORS_CONF);
+  if (cpus >= 1 && cpus < INT_MAX)
+    return (int)cpus;
+  else
+    return -1;
+#else
+  return -1;
+#endif
+}
+
+#define MAX_DETECTABLE_CPUS 16
+
+/** Return how many CPUs we are running with.  We assume that nobody is
+ * using hot-swappable CPUs, so we don't recompute this after the first
+ * time.  Return -1 if we don't know how to tell the number of CPUs on this
+ * system.
+ */
+int
+compute_num_cpus(void)
+{
+  static int num_cpus = -2;
+  if (num_cpus == -2) {
+    num_cpus = compute_num_cpus_impl();
+    tor_assert(num_cpus != -2);
+    if (num_cpus > MAX_DETECTABLE_CPUS)
+      log_notice(LD_GENERAL, "Wow!  I detected that you have %d CPUs. I "
+                 "will not autodetect any more than %d, though.  If you "
+                 "want to configure more, set NumCPUs in your torrc",
+                 num_cpus, MAX_DETECTABLE_CPUS);
+  }
+  return num_cpus;
+}
+
 /** Set *timeval to the current time of day.  On error, log and terminate.
  * (Same as gettimeofday(timeval,NULL), but never returns -1.)
  */
@@ -1951,36 +2159,130 @@ tor_gettimeofday(struct timeval *timeval)
 #define TIME_FNS_NEED_LOCKS
 #endif
 
-#ifndef HAVE_LOCALTIME_R
-#ifdef TIME_FNS_NEED_LOCKS
-struct tm *
-tor_localtime_r(const time_t *timep, struct tm *result)
+static struct tm *
+correct_tm(int islocal, const time_t *timep, struct tm *resultbuf,
+           struct tm *r)
 {
-  struct tm *r;
-  static tor_mutex_t *m=NULL;
-  if (!m) { m=tor_mutex_new(); }
-  tor_assert(result);
-  tor_mutex_acquire(m);
-  r = localtime(timep);
-  memcpy(result, r, sizeof(struct tm));
-  tor_mutex_release(m);
-  return result;
-}
-#else
-struct tm *
-tor_localtime_r(const time_t *timep, struct tm *result)
-{
-  struct tm *r;
-  tor_assert(result);
-  r = localtime(timep);
-  memcpy(result, r, sizeof(struct tm));
-  return result;
-}
-#endif
-#endif
+  const char *outcome;
 
-#ifndef HAVE_GMTIME_R
-#ifdef TIME_FNS_NEED_LOCKS
+  if (PREDICT_LIKELY(r)) {
+    if (r->tm_year > 8099) { /* We can't strftime dates after 9999 CE. */
+      r->tm_year = 8099;
+      r->tm_mon = 11;
+      r->tm_mday = 31;
+      r->tm_yday = 365;
+      r->tm_hour = 23;
+      r->tm_min = 59;
+      r->tm_sec = 59;
+    }
+    return r;
+  }
+
+  /* If we get here, gmtime or localtime returned NULL. It might have done
+   * this because of overrun or underrun, or it might have done it because of
+   * some other weird issue. */
+  if (timep) {
+    if (*timep < 0) {
+      r = resultbuf;
+      r->tm_year = 70; /* 1970 CE */
+      r->tm_mon = 0;
+      r->tm_mday = 1;
+      r->tm_yday = 1;
+      r->tm_hour = 0;
+      r->tm_min = 0 ;
+      r->tm_sec = 0;
+      outcome = "Rounding up to 1970";
+      goto done;
+    } else if (*timep >= INT32_MAX) {
+      /* Rounding down to INT32_MAX isn't so great, but keep in mind that we
+       * only do it if gmtime/localtime tells us NULL. */
+      r = resultbuf;
+      r->tm_year = 137; /* 2037 CE */
+      r->tm_mon = 11;
+      r->tm_mday = 31;
+      r->tm_yday = 365;
+      r->tm_hour = 23;
+      r->tm_min = 59;
+      r->tm_sec = 59;
+      outcome = "Rounding down to 2037";
+      goto done;
+    }
+  }
+
+  /* If we get here, then gmtime/localtime failed without getting an extreme
+   * value for *timep */
+
+  tor_fragile_assert();
+  r = resultbuf;
+  memset(resultbuf, 0, sizeof(struct tm));
+  outcome="can't recover";
+ done:
+  log_warn(LD_BUG, "%s("I64_FORMAT") failed with error %s: %s",
+           islocal?"localtime":"gmtime",
+           timep?I64_PRINTF_ARG(*timep):0,
+           strerror(errno),
+           outcome);
+  return r;
+}
+
+/** @{ */
+/** As localtime_r, but defined for platforms that don't have it:
+ *
+ * Convert *<b>timep</b> to a struct tm in local time, and store the value in
+ * *<b>result</b>.  Return the result on success, or NULL on failure.
+ */
+#ifdef HAVE_LOCALTIME_R
+struct tm *
+tor_localtime_r(const time_t *timep, struct tm *result)
+{
+  struct tm *r;
+  r = localtime_r(timep, result);
+  return correct_tm(1, timep, result, r);
+}
+#elif defined(TIME_FNS_NEED_LOCKS)
+struct tm *
+tor_localtime_r(const time_t *timep, struct tm *result)
+{
+  struct tm *r;
+  static tor_mutex_t *m=NULL;
+  if (!m) { m=tor_mutex_new(); }
+  tor_assert(result);
+  tor_mutex_acquire(m);
+  r = localtime(timep);
+  if (r)
+    memcpy(result, r, sizeof(struct tm));
+  tor_mutex_release(m);
+  return correct_tm(1, timep, result, r);
+}
+#else
+struct tm *
+tor_localtime_r(const time_t *timep, struct tm *result)
+{
+  struct tm *r;
+  tor_assert(result);
+  r = localtime(timep);
+  if (r)
+    memcpy(result, r, sizeof(struct tm));
+  return correct_tm(1, timep, result, r);
+}
+#endif
+/** @} */
+
+/** @{ */
+/** As gmtimee_r, but defined for platforms that don't have it:
+ *
+ * Convert *<b>timep</b> to a struct tm in UTC, and store the value in
+ * *<b>result</b>.  Return the result on success, or NULL on failure.
+ */
+#ifdef HAVE_GMTIME_R
+struct tm *
+tor_gmtime_r(const time_t *timep, struct tm *result)
+{
+  struct tm *r;
+  r = gmtime_r(timep, result);
+  return correct_tm(0, timep, result, r);
+}
+#elif defined(TIME_FNS_NEED_LOCKS)
 struct tm *
 tor_gmtime_r(const time_t *timep, struct tm *result)
 {
@@ -1990,9 +2292,10 @@ tor_gmtime_r(const time_t *timep, struct tm *result)
   tor_assert(result);
   tor_mutex_acquire(m);
   r = gmtime(timep);
-  memcpy(result, r, sizeof(struct tm));
+  if (r)
+    memcpy(result, r, sizeof(struct tm));
   tor_mutex_release(m);
-  return result;
+  return correct_tm(0, timep, result, r);
 }
 #else
 struct tm *
@@ -2001,10 +2304,10 @@ tor_gmtime_r(const time_t *timep, struct tm *result)
   struct tm *r;
   tor_assert(result);
   r = gmtime(timep);
-  memcpy(result, r, sizeof(struct tm));
-  return result;
+  if (r)
+    memcpy(result, r, sizeof(struct tm));
+  return correct_tm(0, timep, result, r);
 }
-#endif
 #endif
 
 #if defined(USE_WIN32_THREADS)
@@ -2396,11 +2699,11 @@ in_main_thread(void)
  */
 #if defined(MS_WINDOWS)
 int
-tor_socket_errno(int sock)
+tor_socket_errno(tor_socket_t sock)
 {
   int optval, optvallen=sizeof(optval);
   int err = WSAGetLastError();
-  if (err == WSAEWOULDBLOCK && sock >= 0) {
+  if (err == WSAEWOULDBLOCK && SOCKET_OK(sock)) {
     if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (void*)&optval, &optvallen))
       return err;
     if (optval)
@@ -2517,22 +2820,26 @@ network_init(void)
 char *
 format_win32_error(DWORD err)
 {
-  LPVOID str = NULL;
-  char abuf[1024] = {0};
+  TCHAR *str = NULL;
   char *result;
 
   /* Somebody once decided that this interface was better than strerror(). */
-  FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+  FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
                  FORMAT_MESSAGE_FROM_SYSTEM |
                  FORMAT_MESSAGE_IGNORE_INSERTS,
                  NULL, err,
                  MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                 (LPWSTR) &str,
+                (LPVOID)&str,
                  0, NULL);
 
   if (str) {
+#ifdef UNICODE
+    char abuf[1024] = {0};
     wcstombs(abuf,str,1024);
-    result = tor_strdup((char*)abuf);
+    result = tor_strdup(abuf);
+#else
+    result = tor_strdup(str);
+#endif
     LocalFree(str); /* LocalFree != free() */
   } else {
     result = tor_strdup("<unformattable error>");

@@ -1,9 +1,16 @@
-/* Copyright (c) 2009-2010, The Tor Project, Inc. */
+/* Copyright (c) 2009-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "or.h"
 #include "config.h"
+#include "directory.h"
+#include "dirserv.h"
 #include "microdesc.h"
+#include "networkstatus.h"
+#include "nodelist.h"
+#include "policies.h"
+#include "router.h"
+#include "routerlist.h"
 #include "routerparse.h"
 
 /** A data structure to hold a bunch of cached microdescriptors.  There are
@@ -23,6 +30,8 @@ struct microdesc_cache_t {
   tor_mmap_t *cache_content;
   /** Number of bytes used in the journal file. */
   size_t journal_len;
+  /** Number of bytes in descriptors removed as too old. */
+  size_t bytes_dropped;
 
   /** Total bytes of microdescriptor bodies we have added to this cache */
   uint64_t total_len_seen;
@@ -46,7 +55,7 @@ _microdesc_hash(microdesc_t *md)
 static INLINE int
 _microdesc_eq(microdesc_t *a, microdesc_t *b)
 {
-  return !memcmp(a->digest, b->digest, DIGEST256_LEN);
+  return tor_memeq(a->digest, b->digest, DIGEST256_LEN);
 }
 
 HT_PROTOTYPE(microdesc_map, microdesc_t, node,
@@ -119,15 +128,19 @@ get_microdesc_cache(void)
  * ending at <b>eos</b>, and store them in <b>cache</b>.  If <b>no-save</b>,
  * mark them as non-writable to disk.  If <b>where</b> is SAVED_IN_CACHE,
  * leave their bodies as pointers to the mmap'd cache.  If where is
- * <b>SAVED_NOWHERE</b>, do not allow annotations.  Return a list of the added
- * microdescriptors.  */
+ * <b>SAVED_NOWHERE</b>, do not allow annotations.  If listed_at is positive,
+ * set the last_listed field of every microdesc to listed_at.  If
+ * requested_digests is non-null, then it contains a list of digests we mean
+ * to allow, so we should reject any non-requested microdesc with a different
+ * digest, and alter the list to contain only the digests of those microdescs
+ * we didn't find.
+ * Return a newly allocated list of the added microdescriptors, or NULL  */
 smartlist_t *
 microdescs_add_to_cache(microdesc_cache_t *cache,
                         const char *s, const char *eos, saved_location_t where,
-                        int no_save)
+                        int no_save, time_t listed_at,
+                        smartlist_t *requested_digests256)
 {
-  /*XXXX need an argument that sets last_listed as appropriate. */
-
   smartlist_t *descriptors, *added;
   const int allow_annotations = (where != SAVED_NOWHERE);
   const int copy_body = (where != SAVED_IN_CACHE);
@@ -135,6 +148,33 @@ microdescs_add_to_cache(microdesc_cache_t *cache,
   descriptors = microdescs_parse_from_string(s, eos,
                                              allow_annotations,
                                              copy_body);
+  if (listed_at > 0) {
+    SMARTLIST_FOREACH(descriptors, microdesc_t *, md,
+                      md->last_listed = listed_at);
+  }
+  if (requested_digests256) {
+    digestmap_t *requested; /* XXXX actuqlly we should just use a
+                               digest256map */
+    requested = digestmap_new();
+    SMARTLIST_FOREACH(requested_digests256, const char *, cp,
+      digestmap_set(requested, cp, (void*)1));
+    SMARTLIST_FOREACH_BEGIN(descriptors, microdesc_t *, md) {
+      if (digestmap_get(requested, md->digest)) {
+        digestmap_set(requested, md->digest, (void*)2);
+      } else {
+        log_fn(LOG_PROTOCOL_WARN, LD_DIR, "Received non-requested microcdesc");
+        microdesc_free(md);
+        SMARTLIST_DEL_CURRENT(descriptors, md);
+      }
+    } SMARTLIST_FOREACH_END(md);
+    SMARTLIST_FOREACH_BEGIN(requested_digests256, char *, cp) {
+      if (digestmap_get(requested, cp) == (void*)2) {
+        tor_free(cp);
+        SMARTLIST_DEL_CURRENT(requested_digests256, cp);
+      }
+    } SMARTLIST_FOREACH_END(cp);
+    digestmap_free(requested, NULL);
+  }
 
   added = microdescs_add_list_to_cache(cache, descriptors, where, no_save);
   smartlist_free(descriptors);
@@ -142,7 +182,7 @@ microdescs_add_to_cache(microdesc_cache_t *cache,
 }
 
 /* As microdescs_add_to_cache, but takes a list of micrdescriptors instead of
- * a string to encode.  Frees any members of <b>descriptors</b> that it does
+ * a string to decode.  Frees any members of <b>descriptors</b> that it does
  * not add. */
 smartlist_t *
 microdescs_add_list_to_cache(microdesc_cache_t *cache,
@@ -175,6 +215,8 @@ microdescs_add_list_to_cache(microdesc_cache_t *cache,
       if (md2->last_listed < md->last_listed)
         md2->last_listed = md->last_listed;
       microdesc_free(md);
+      if (where != SAVED_NOWHERE)
+        cache->bytes_dropped += size;
       continue;
     }
 
@@ -196,6 +238,7 @@ microdescs_add_list_to_cache(microdesc_cache_t *cache,
     md->no_save = no_save;
 
     HT_INSERT(microdesc_map, &cache->map, md);
+    md->held_in_map = 1;
     smartlist_add(added, md);
     ++cache->n_seen;
     cache->total_len_seen += md->bodylen;
@@ -205,13 +248,13 @@ microdescs_add_list_to_cache(microdesc_cache_t *cache,
     finish_writing_to_file(open_file); /*XXX Check me.*/
 
   {
-    size_t old_content_len =
-      cache->cache_content ? cache->cache_content->size : 0;
-    if (cache->journal_len > 16384 + old_content_len &&
-        cache->journal_len > old_content_len * 2) {
-      microdesc_cache_rebuild(cache);
-    }
+    networkstatus_t *ns = networkstatus_get_latest_consensus();
+    if (ns && ns->flavor == FLAV_MICRODESC)
+      SMARTLIST_FOREACH(added, microdesc_t *, md, nodelist_add_microdesc(md));
   }
+
+  if (smartlist_len(added))
+    router_dir_info_changed();
 
   return added;
 }
@@ -224,6 +267,7 @@ microdesc_cache_clear(microdesc_cache_t *cache)
   for (entry = HT_START(microdesc_map, &cache->map); entry; entry = next) {
     microdesc_t *md = *entry;
     next = HT_NEXT_RMV(microdesc_map, &cache->map, entry);
+    md->held_in_map = 0;
     microdesc_free(md);
   }
   HT_CLEAR(microdesc_map, &cache->map);
@@ -233,6 +277,7 @@ microdesc_cache_clear(microdesc_cache_t *cache)
   }
   cache->total_len_seen = 0;
   cache->n_seen = 0;
+  cache->bytes_dropped = 0;
 }
 
 /** Reload the contents of <b>cache</b> from disk.  If it is empty, load it
@@ -251,7 +296,7 @@ microdesc_cache_reload(microdesc_cache_t *cache)
   mm = cache->cache_content = tor_mmap_file(cache->cache_fname);
   if (mm) {
     added = microdescs_add_to_cache(cache, mm->data, mm->data+mm->size,
-                                    SAVED_IN_CACHE, 0);
+                                    SAVED_IN_CACHE, 0, -1, NULL);
     if (added) {
       total += smartlist_len(added);
       smartlist_free(added);
@@ -261,9 +306,10 @@ microdesc_cache_reload(microdesc_cache_t *cache)
   journal_content = read_file_to_str(cache->journal_fname,
                                      RFTS_IGNORE_MISSING, &st);
   if (journal_content) {
+    cache->journal_len = (size_t) st.st_size;
     added = microdescs_add_to_cache(cache, journal_content,
                                     journal_content+st.st_size,
-                                    SAVED_IN_JOURNAL, 0);
+                                    SAVED_IN_JOURNAL, 0, -1, NULL);
     if (added) {
       total += smartlist_len(added);
       smartlist_free(added);
@@ -272,14 +318,84 @@ microdesc_cache_reload(microdesc_cache_t *cache)
   }
   log_notice(LD_DIR, "Reloaded microdescriptor cache.  Found %d descriptors.",
              total);
+
+  microdesc_cache_rebuild(cache, 0 /* don't force */);
+
   return 0;
+}
+
+/** By default, we remove any microdescriptors that have gone at least this
+ * long without appearing in a current consensus. */
+#define TOLERATE_MICRODESC_AGE (7*24*60*60)
+
+/** Remove all microdescriptors from <b>cache</b> that haven't been listed for
+ * a long time.  Does not rebuild the cache on disk.  If <b>cutoff</b> is
+ * positive, specifically remove microdescriptors that have been unlisted
+ * since <b>cutoff</b>.  If <b>force</b> is true, remove microdescriptors even
+ * if we have no current live microdescriptor consensus.
+ */
+void
+microdesc_cache_clean(microdesc_cache_t *cache, time_t cutoff, int force)
+{
+  microdesc_t **mdp, *victim;
+  int dropped=0, kept=0;
+  size_t bytes_dropped = 0;
+  time_t now = time(NULL);
+
+  /* If we don't know a live consensus, don't believe last_listed values: we
+   * might be starting up after being down for a while. */
+  if (! force &&
+      ! networkstatus_get_reasonably_live_consensus(now, FLAV_MICRODESC))
+      return;
+
+  if (cutoff <= 0)
+    cutoff = now - TOLERATE_MICRODESC_AGE;
+
+  for (mdp = HT_START(microdesc_map, &cache->map); mdp != NULL; ) {
+    if ((*mdp)->last_listed < cutoff) {
+      ++dropped;
+      victim = *mdp;
+      mdp = HT_NEXT_RMV(microdesc_map, &cache->map, mdp);
+      victim->held_in_map = 0;
+      bytes_dropped += victim->bodylen;
+      microdesc_free(victim);
+    } else {
+      ++kept;
+      mdp = HT_NEXT(microdesc_map, &cache->map, mdp);
+    }
+  }
+
+  if (dropped) {
+    log_notice(LD_DIR, "Removed %d/%d microdescriptors as old.",
+               dropped,dropped+kept);
+    cache->bytes_dropped += bytes_dropped;
+  }
+}
+
+static int
+should_rebuild_md_cache(microdesc_cache_t *cache)
+{
+    const size_t old_len =
+      cache->cache_content ? cache->cache_content->size : 0;
+    const size_t journal_len = cache->journal_len;
+    const size_t dropped = cache->bytes_dropped;
+
+    if (journal_len < 16384)
+      return 0; /* Don't bother, not enough has happened yet. */
+    if (dropped > (journal_len + old_len) / 3)
+      return 1; /* We could save 1/3 or more of the currently used space. */
+    if (journal_len > old_len / 2)
+      return 1; /* We should append to the regular file */
+
+    return 0;
 }
 
 /** Regenerate the main cache file for <b>cache</b>, clear the journal file,
  * and update every microdesc_t in the cache with pointers to its new
- * location. */
+ * location.  If <b>force</b> is true, do this unconditionally.  If
+ * <b>force</b> is false, do it only if we expect to save space on disk. */
 int
-microdesc_cache_rebuild(microdesc_cache_t *cache)
+microdesc_cache_rebuild(microdesc_cache_t *cache, int force)
 {
   open_file_t *open_file;
   FILE *f;
@@ -289,7 +405,20 @@ microdesc_cache_rebuild(microdesc_cache_t *cache)
   off_t off = 0;
   int orig_size, new_size;
 
+  if (cache == NULL) {
+    cache = the_microdesc_cache;
+    if (cache == NULL)
+      return 0;
+  }
+
+  /* Remove dead descriptors */
+  microdesc_cache_clean(cache, 0/*cutoff*/, 0/*force*/);
+
+  if (!force && !should_rebuild_md_cache(cache))
+    return 0;
+
   log_info(LD_DIR, "Rebuilding the microdescriptor cache...");
+
   orig_size = (int)(cache->cache_content ? cache->cache_content->size : 0);
   orig_size += (int)cache->journal_len;
 
@@ -313,6 +442,7 @@ microdesc_cache_rebuild(microdesc_cache_t *cache)
       /* log?  return -1?  die?  coredump the universe? */
       continue;
     }
+    tor_assert(((size_t)size) == annotation_len + md->bodylen);
     md->off = off + annotation_len;
     off += size;
     if (md->saved_location != SAVED_IN_CACHE) {
@@ -322,10 +452,11 @@ microdesc_cache_rebuild(microdesc_cache_t *cache)
     smartlist_add(wrote, md);
   }
 
-  finish_writing_to_file(open_file); /*XXX Check me.*/
-
   if (cache->cache_content)
     tor_munmap_file(cache->cache_content);
+
+  finish_writing_to_file(open_file); /*XXX Check me.*/
+
   cache->cache_content = tor_mmap_file(cache->cache_fname);
 
   if (!cache->cache_content && smartlist_len(wrote)) {
@@ -337,20 +468,57 @@ microdesc_cache_rebuild(microdesc_cache_t *cache)
   SMARTLIST_FOREACH_BEGIN(wrote, microdesc_t *, md) {
     tor_assert(md->saved_location == SAVED_IN_CACHE);
     md->body = (char*)cache->cache_content->data + md->off;
-    tor_assert(!memcmp(md->body, "onion-key", 9));
+    if (PREDICT_UNLIKELY(
+             md->bodylen < 9 || fast_memneq(md->body, "onion-key", 9) != 0)) {
+      /* XXXX023 once bug 2022 is solved, we can kill this block and turn it
+       * into just the tor_assert(!memcmp) */
+      off_t avail = cache->cache_content->size - md->off;
+      char *bad_str;
+      tor_assert(avail >= 0);
+      bad_str = tor_strndup(md->body, MIN(128, (size_t)avail));
+      log_err(LD_BUG, "After rebuilding microdesc cache, offsets seem wrong. "
+              " At offset %d, I expected to find a microdescriptor starting "
+              " with \"onion-key\".  Instead I got %s.",
+              (int)md->off, escaped(bad_str));
+      tor_free(bad_str);
+      tor_assert(fast_memeq(md->body, "onion-key", 9));
+    }
   } SMARTLIST_FOREACH_END(md);
 
   smartlist_free(wrote);
 
   write_str_to_file(cache->journal_fname, "", 1);
   cache->journal_len = 0;
+  cache->bytes_dropped = 0;
 
-  new_size = (int)cache->cache_content->size;
+  new_size = cache->cache_content ? (int)cache->cache_content->size : 0;
   log_info(LD_DIR, "Done rebuilding microdesc cache. "
            "Saved %d bytes; %d still used.",
            orig_size-new_size, new_size);
 
   return 0;
+}
+
+/** Make sure that the reference count of every microdescriptor in cache is
+ * accurate. */
+void
+microdesc_check_counts(void)
+{
+  microdesc_t **mdp;
+  if (!the_microdesc_cache)
+    return;
+
+  HT_FOREACH(mdp, microdesc_map, &the_microdesc_cache->map) {
+    microdesc_t *md = *mdp;
+    unsigned int found=0;
+    const smartlist_t *nodes = nodelist_get_list();
+    SMARTLIST_FOREACH(nodes, node_t *, node, {
+        if (node->md == md) {
+          ++found;
+        }
+      });
+    tor_assert(found == md->held_by_nodes);
+  }
 }
 
 /** Deallocate a single microdescriptor.  Note: the microdescriptor MUST have
@@ -360,7 +528,43 @@ microdesc_free(microdesc_t *md)
 {
   if (!md)
     return;
-  /* Must be removed from hash table! */
+
+  /* Make sure that the microdesc was really removed from the appropriate data
+     structures. */
+  if (md->held_in_map) {
+    microdesc_cache_t *cache = get_microdesc_cache();
+    microdesc_t *md2 = HT_FIND(microdesc_map, &cache->map, md);
+    if (md2 == md) {
+      log_warn(LD_BUG, "microdesc_free() called, but md was still in "
+               "microdesc_map");
+      HT_REMOVE(microdesc_map, &cache->map, md);
+    } else {
+      log_warn(LD_BUG, "microdesc_free() called with held_in_map set, but "
+               "microdesc was not in the map.");
+    }
+    tor_fragile_assert();
+  }
+  if (md->held_by_nodes) {
+    int found=0;
+    const smartlist_t *nodes = nodelist_get_list();
+    SMARTLIST_FOREACH(nodes, node_t *, node, {
+        if (node->md == md) {
+          ++found;
+          node->md = NULL;
+        }
+      });
+    if (found) {
+      log_warn(LD_BUG, "microdesc_free() called, but md was still referenced "
+               "%d node(s); held_by_nodes == %u", found, md->held_by_nodes);
+    } else {
+      log_warn(LD_BUG, "microdesc_free() called with held_by_nodes set to %u, "
+               "but md was not referenced by any nodes", md->held_by_nodes);
+    }
+    tor_fragile_assert();
+  }
+  //tor_assert(md->held_in_map == 0);
+  //tor_assert(md->held_by_nodes == 0);
+
   if (md->onion_pkey)
     crypto_free_pk_env(md->onion_pkey);
   if (md->body && md->saved_location != SAVED_IN_CACHE)
@@ -370,7 +574,7 @@ microdesc_free(microdesc_t *md)
     SMARTLIST_FOREACH(md->family, char *, cp, tor_free(cp));
     smartlist_free(md->family);
   }
-  tor_free(md->exitsummary);
+  short_policy_free(md->exit_policy);
 
   tor_free(md);
 }
@@ -410,5 +614,149 @@ microdesc_average_size(microdesc_cache_t *cache)
   if (!cache->n_seen)
     return 512;
   return (size_t)(cache->total_len_seen / cache->n_seen);
+}
+
+/** Return a smartlist of all the sha256 digest of the microdescriptors that
+ * are listed in <b>ns</b> but not present in <b>cache</b>. Returns pointers
+ * to internals of <b>ns</b>; you should not free the members of the resulting
+ * smartlist.  Omit all microdescriptors whose digest appear in <b>skip</b>. */
+smartlist_t *
+microdesc_list_missing_digest256(networkstatus_t *ns, microdesc_cache_t *cache,
+                                 int downloadable_only, digestmap_t *skip)
+{
+  smartlist_t *result = smartlist_create();
+  time_t now = time(NULL);
+  tor_assert(ns->flavor == FLAV_MICRODESC);
+  SMARTLIST_FOREACH_BEGIN(ns->routerstatus_list, routerstatus_t *, rs) {
+    if (microdesc_cache_lookup_by_digest256(cache, rs->descriptor_digest))
+      continue;
+    if (downloadable_only &&
+        !download_status_is_ready(&rs->dl_status, now,
+                                  MAX_MICRODESC_DOWNLOAD_FAILURES))
+      continue;
+    if (skip && digestmap_get(skip, rs->descriptor_digest))
+      continue;
+    if (tor_mem_is_zero(rs->descriptor_digest, DIGEST256_LEN))
+      continue; /* This indicates a bug somewhere XXXX023*/
+    /* XXXX Also skip if we're a noncache and wouldn't use this router.
+     * XXXX NM Microdesc
+     */
+    smartlist_add(result, rs->descriptor_digest);
+  } SMARTLIST_FOREACH_END(rs);
+  return result;
+}
+
+/** Launch download requests for mircodescriptors as appropriate.
+ *
+ * Specifically, we should launch download requests if we are configured to
+ * download mirodescriptors, and there are some microdescriptors listed the
+ * current microdesc consensus that we don't have, and either we never asked
+ * for them, or we failed to download them but we're willing to retry.
+ */
+void
+update_microdesc_downloads(time_t now)
+{
+  const or_options_t *options = get_options();
+  networkstatus_t *consensus;
+  smartlist_t *missing;
+  digestmap_t *pending;
+
+  if (should_delay_dir_fetches(options))
+    return;
+  if (directory_too_idle_to_fetch_descriptors(options, now))
+    return;
+
+  consensus = networkstatus_get_reasonably_live_consensus(now, FLAV_MICRODESC);
+  if (!consensus)
+    return;
+
+  if (!we_fetch_microdescriptors(options))
+    return;
+
+  pending = digestmap_new();
+  list_pending_microdesc_downloads(pending);
+
+  missing = microdesc_list_missing_digest256(consensus,
+                                             get_microdesc_cache(),
+                                             1,
+                                             pending);
+  digestmap_free(pending, NULL);
+
+  launch_descriptor_downloads(DIR_PURPOSE_FETCH_MICRODESC,
+                              missing, NULL, now);
+
+  smartlist_free(missing);
+}
+
+/** For every microdescriptor listed in the current microdecriptor consensus,
+ * update its last_listed field to be at least as recent as the publication
+ * time of the current microdescriptor consensus.
+ */
+void
+update_microdescs_from_networkstatus(time_t now)
+{
+  microdesc_cache_t *cache = get_microdesc_cache();
+  microdesc_t *md;
+  networkstatus_t *ns =
+    networkstatus_get_reasonably_live_consensus(now, FLAV_MICRODESC);
+
+  if (! ns)
+    return;
+
+  tor_assert(ns->flavor == FLAV_MICRODESC);
+
+  SMARTLIST_FOREACH_BEGIN(ns->routerstatus_list, routerstatus_t *, rs) {
+    md = microdesc_cache_lookup_by_digest256(cache, rs->descriptor_digest);
+    if (md && ns->valid_after > md->last_listed)
+      md->last_listed = ns->valid_after;
+  } SMARTLIST_FOREACH_END(rs);
+}
+
+/** Return true iff we should prefer to use microdescriptors rather than
+ * routerdescs for building circuits. */
+int
+we_use_microdescriptors_for_circuits(const or_options_t *options)
+{
+  int ret = options->UseMicrodescriptors;
+  if (ret == -1) {
+    /* UseMicrodescriptors is "auto"; we need to decide: */
+    /* So we decide that we'll use microdescriptors iff we are not a server,
+     * and we're not autofetching everything. */
+    ret = !server_mode(options) && !options->FetchUselessDescriptors;
+  }
+  return ret;
+}
+
+/** Return true iff we should try to download microdescriptors at all. */
+int
+we_fetch_microdescriptors(const or_options_t *options)
+{
+  if (directory_caches_dir_info(options))
+    return 1;
+  if (options->FetchUselessDescriptors)
+    return 1;
+  return we_use_microdescriptors_for_circuits(options);
+}
+
+/** Return true iff we should try to download router descriptors at all. */
+int
+we_fetch_router_descriptors(const or_options_t *options)
+{
+  if (directory_caches_dir_info(options))
+    return 1;
+  if (options->FetchUselessDescriptors)
+    return 1;
+  return ! we_use_microdescriptors_for_circuits(options);
+}
+
+/** Return the consensus flavor we actually want to use to build circuits. */
+int
+usable_consensus_flavor(void)
+{
+  if (we_use_microdescriptors_for_circuits(get_options())) {
+    return FLAV_MICRODESC;
+  } else {
+    return FLAV_NS;
+  }
 }
 

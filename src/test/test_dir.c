@@ -1,16 +1,18 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
 #define DIRSERV_PRIVATE
 #define DIRVOTE_PRIVATE
 #define ROUTER_PRIVATE
+#define HIBERNATE_PRIVATE
 #include "or.h"
 #include "directory.h"
 #include "dirserv.h"
 #include "dirvote.h"
+#include "hibernate.h"
 #include "networkstatus.h"
 #include "router.h"
 #include "routerlist.h"
@@ -85,6 +87,8 @@ test_dir_formats(void)
 
   test_assert(pk1 && pk2 && pk3);
 
+  hibernate_set_state_for_testing_(HIBERNATE_STATE_LIVE);
+
   get_platform_str(platform, sizeof(platform));
   r1 = tor_malloc_zero(sizeof(routerinfo_t));
   r1->address = tor_strdup("18.244.0.1");
@@ -150,7 +154,6 @@ test_dir_formats(void)
    * uptime, that still wouldn't make it right, because the two
    * descriptors might be made on different seconds... hm. */
          "bandwidth 1000 5000 10000\n"
-          "opt extra-info-digest 0000000000000000000000000000000000000000\n"
           "onion-key\n", sizeof(buf2));
   strlcat(buf2, pk1_str, sizeof(buf2));
   strlcat(buf2, "signing-key\n", sizeof(buf2));
@@ -299,7 +302,7 @@ test_dir_versions(void)
 
 #define tt_versionstatus_op(vs1, op, vs2)                               \
   tt_assert_test_type(vs1,vs2,#vs1" "#op" "#vs2,version_status_t,       \
-                      (_val1 op _val2),"%d")
+                      (_val1 op _val2),"%d",TT_EXIT_TEST_FUNCTION)
 #define test_v_i_o(val, ver, lst)                                       \
   tt_versionstatus_op(val, ==, tor_version_is_obsolete(ver, lst))
 
@@ -610,8 +613,11 @@ test_dir_param_voting(void)
                          "abcd=20 c=60 cw=500 x-yz=-9 zzzzz=101", NULL, 0, 0);
   smartlist_split_string(vote4.net_params,
                          "ab=900 abcd=200 c=1 cw=51 x-yz=100", NULL, 0, 0);
-  test_eq(100, networkstatus_get_param(&vote4, "x-yz", 50));
-  test_eq(222, networkstatus_get_param(&vote4, "foobar", 222));
+  test_eq(100, networkstatus_get_param(&vote4, "x-yz", 50, 0, 300));
+  test_eq(222, networkstatus_get_param(&vote4, "foobar", 222, 0, 300));
+  test_eq(80, networkstatus_get_param(&vote4, "ab", 12, 0, 80));
+  test_eq(-8, networkstatus_get_param(&vote4, "ab", -12, -100, -8));
+  test_eq(0, networkstatus_get_param(&vote4, "foobar", 0, -100, 8));
 
   smartlist_add(votes, &vote1);
   smartlist_add(votes, &vote2);
@@ -746,11 +752,11 @@ test_dir_v3_networkstatus(void)
   sign_skey_leg1 = pk_generate(4);
 
   test_assert(!crypto_pk_read_private_key_from_string(sign_skey_1,
-                                                      AUTHORITY_SIGNKEY_1));
+                                                   AUTHORITY_SIGNKEY_1, -1));
   test_assert(!crypto_pk_read_private_key_from_string(sign_skey_2,
-                                                      AUTHORITY_SIGNKEY_2));
+                                                   AUTHORITY_SIGNKEY_2, -1));
   test_assert(!crypto_pk_read_private_key_from_string(sign_skey_3,
-                                                      AUTHORITY_SIGNKEY_3));
+                                                   AUTHORITY_SIGNKEY_3, -1));
 
   test_assert(!crypto_pk_cmp_keys(sign_skey_1, cert1->signing_key));
   test_assert(!crypto_pk_cmp_keys(sign_skey_2, cert2->signing_key));
@@ -801,7 +807,7 @@ test_dir_v3_networkstatus(void)
   rs->or_port = 443;
   rs->dir_port = 8000;
   /* all flags but running cleared */
-  rs->is_running = 1;
+  rs->is_flagged_running = 1;
   smartlist_add(vote->routerstatus_list, vrs);
   test_assert(router_add_to_routerlist(generate_ri_from_rs(vrs), &msg,0,0)>=0);
 
@@ -816,7 +822,7 @@ test_dir_v3_networkstatus(void)
   rs->addr = 0x99009901;
   rs->or_port = 443;
   rs->dir_port = 0;
-  rs->is_exit = rs->is_stable = rs->is_fast = rs->is_running =
+  rs->is_exit = rs->is_stable = rs->is_fast = rs->is_flagged_running =
     rs->is_valid = rs->is_v2_dir = rs->is_possible_guard = 1;
   smartlist_add(vote->routerstatus_list, vrs);
   test_assert(router_add_to_routerlist(generate_ri_from_rs(vrs), &msg,0,0)>=0);
@@ -833,7 +839,8 @@ test_dir_v3_networkstatus(void)
   rs->or_port = 400;
   rs->dir_port = 9999;
   rs->is_authority = rs->is_exit = rs->is_stable = rs->is_fast =
-    rs->is_running = rs->is_valid = rs->is_v2_dir = rs->is_possible_guard = 1;
+    rs->is_flagged_running = rs->is_valid = rs->is_v2_dir =
+    rs->is_possible_guard = 1;
   smartlist_add(vote->routerstatus_list, vrs);
   test_assert(router_add_to_routerlist(generate_ri_from_rs(vrs), &msg,0,0)>=0);
 
@@ -1073,7 +1080,8 @@ test_dir_v3_networkstatus(void)
   test_assert(!rs->is_fast);
   test_assert(!rs->is_possible_guard);
   test_assert(!rs->is_stable);
-  test_assert(rs->is_running); /* If it wasn't running it wouldn't be here */
+  /* (If it wasn't running it wouldn't be here) */
+  test_assert(rs->is_flagged_running);
   test_assert(!rs->is_v2_dir);
   test_assert(!rs->is_valid);
   test_assert(!rs->is_named);
@@ -1095,7 +1103,7 @@ test_dir_v3_networkstatus(void)
   test_assert(rs->is_fast);
   test_assert(rs->is_possible_guard);
   test_assert(rs->is_stable);
-  test_assert(rs->is_running);
+  test_assert(rs->is_flagged_running);
   test_assert(rs->is_v2_dir);
   test_assert(rs->is_valid);
   test_assert(!rs->is_named);
@@ -1165,10 +1173,10 @@ test_dir_v3_networkstatus(void)
 
     /* Extract a detached signature from con3. */
     detached_text1 = get_detached_sigs(con3, con_md3);
-    tor_assert(detached_text1);
+    tt_assert(detached_text1);
     /* Try to parse it. */
     dsig1 = networkstatus_parse_detached_signatures(detached_text1, NULL);
-    tor_assert(dsig1);
+    tt_assert(dsig1);
 
     /* Are parsed values as expected? */
     test_eq(dsig1->valid_after, con3->valid_after);
@@ -1299,7 +1307,7 @@ test_dir_v3_networkstatus(void)
 }
 
 #define DIR_LEGACY(name)                                                   \
-  { #name, legacy_test_helper, 0, &legacy_setup, test_dir_ ## name }
+  { #name, legacy_test_helper, TT_FORK, &legacy_setup, test_dir_ ## name }
 
 #define DIR(name)                               \
   { #name, test_dir_##name, 0, NULL, NULL }

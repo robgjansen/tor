@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #ifndef _TOR_COMPAT_H
@@ -9,8 +9,12 @@
 #include "orconfig.h"
 #include "torint.h"
 #ifdef MS_WINDOWS
+#ifndef WIN32_WINNT
 #define WIN32_WINNT 0x400
+#endif
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x400
+#endif
 #define WIN32_LEAN_AND_MEAN
 #if defined(_MSC_VER) && (_MSC_VER < 1300)
 #include <winsock.h>
@@ -31,7 +35,7 @@
 #ifdef HAVE_STRING_H
 #include <string.h>
 #endif
-#ifdef HAVE_PTHREAD_H
+#if defined(HAVE_PTHREAD_H) && !defined(MS_WINDOWS)
 #include <pthread.h>
 #endif
 #include <stdarg.h>
@@ -41,15 +45,14 @@
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
-#ifdef HAVE_SYS_TYPES_H
-#include <sys/types.h>
-#endif
 #ifdef HAVE_NETINET_IN_H
 #include <netinet/in.h>
 #endif
 #ifdef HAVE_NETINET6_IN6_H
 #include <netinet6/in6.h>
 #endif
+
+#include <stdio.h>
 
 #if defined (WINCE)
 #include <fcntl.h>
@@ -176,6 +179,10 @@ extern INLINE double U64_TO_DBL(uint64_t x) {
 
 /** Expands to a syntactically valid empty statement.  */
 #define STMT_NIL (void)0
+
+/** Expands to a syntactically valid empty statement, explicitly (void)ing its
+ * argument. */
+#define STMT_VOID(a) while (0) { (void)(a); }
 
 #ifdef __GNUC__
 /** STMT_BEGIN and STMT_END are used to wrap blocks inside macros so that
@@ -312,6 +319,7 @@ const char *tor_fix_source_file(const char *fname);
 
 /* ===== Time compatibility */
 #if !defined(HAVE_GETTIMEOFDAY) && !defined(HAVE_STRUCT_TIMEVAL_TV_SEC)
+/** Implementation of timeval for platforms that don't have it. */
 struct timeval {
   time_t tv_sec;
   unsigned int tv_usec;
@@ -320,19 +328,55 @@ struct timeval {
 
 void tor_gettimeofday(struct timeval *timeval);
 
-#ifdef HAVE_LOCALTIME_R
-#define tor_localtime_r localtime_r
-#else
 struct tm *tor_localtime_r(const time_t *timep, struct tm *result);
+struct tm *tor_gmtime_r(const time_t *timep, struct tm *result);
+
+#ifndef timeradd
+/** Replacement for timeradd on platforms that do not have it: sets tvout to
+ * the sum of tv1 and tv2. */
+#define timeradd(tv1,tv2,tvout) \
+  do {                                                  \
+    (tvout)->tv_sec = (tv1)->tv_sec + (tv2)->tv_sec;    \
+    (tvout)->tv_usec = (tv2)->tv_usec + (tv2)->tv_usec; \
+    if ((tvout)->tv_usec >= 1000000) {                  \
+      (tvout)->tv_usec -= 1000000;                      \
+      (tvout)->tv_sec++;                                \
+    }                                                   \
+  } while (0)
 #endif
 
-#ifdef HAVE_GMTIME_R
-#define tor_gmtime_r gmtime_r
-#else
-struct tm *tor_gmtime_r(const time_t *timep, struct tm *result);
+#ifndef timersub
+/** Replacement for timersub on platforms that do not have it: sets tvout to
+ * tv1 minus tv2. */
+#define timersub(tv1,tv2,tvout) \
+  do {                                                  \
+    (tvout)->tv_sec = (tv1)->tv_sec - (tv2)->tv_sec;    \
+    (tvout)->tv_usec = (tv2)->tv_usec - (tv2)->tv_usec; \
+    if ((tvout)->tv_usec < 0) {                         \
+      (tvout)->tv_usec += 1000000;                      \
+      (tvout)->tv_sec--;                                \
+    }                                                   \
+  } while (0)
+#endif
+
+#ifndef timercmp
+/** Replacement for timersub on platforms that do not have it: returns true
+ * iff the relational operator "op" makes the expression tv1 op tv2 true.
+ *
+ * Note that while this definition should work for all boolean opeators, some
+ * platforms' native timercmp definitions do not support >=, <=, or ==.  So
+ * don't use those.
+ */
+#define timercmp(tv1,tv2,op)                    \
+  (((tv1)->tv_sec == (tv2)->tv_sec) ?           \
+   ((tv1)->tv_usec op (tv2)->tv_usec) :         \
+   ((tv1)->tv_sec op (tv2)->tv_sec))
 #endif
 
 /* ===== File compatibility */
+int tor_open_cloexec(const char *path, int flags, unsigned mode);
+FILE *tor_fopen_cloexec(const char *path, const char *mode);
+
 int replace_file(const char *from, const char *to);
 int touch_file(const char *fname);
 
@@ -356,17 +400,26 @@ int tor_fd_seekend(int fd);
 typedef int socklen_t;
 #endif
 
-int tor_close_socket(int s);
-int tor_open_socket(int domain, int type, int protocol);
-int tor_accept_socket(int sockfd, struct sockaddr *addr, socklen_t *len);
+#ifdef MS_WINDOWS
+#define tor_socket_t intptr_t
+#define SOCKET_OK(s) ((unsigned)(s) != INVALID_SOCKET)
+#else
+#define tor_socket_t int
+#define SOCKET_OK(s) ((s) >= 0)
+#endif
+
+int tor_close_socket(tor_socket_t s);
+tor_socket_t tor_open_socket(int domain, int type, int protocol);
+tor_socket_t tor_accept_socket(int sockfd, struct sockaddr *addr,
+                                  socklen_t *len);
 int get_n_open_sockets(void);
 
 #define tor_socket_send(s, buf, len, flags) send(s, buf, len, flags)
 #define tor_socket_recv(s, buf, len, flags) recv(s, buf, len, flags)
 
-/* Define struct in6_addr on platforms that do not have it.  Generally,
- * these platforms are ones without IPv6 support, but we want to have
- * a working in6_addr there anyway, so we can use it to parse IPv6
+/** Implementation of struct in6_addr for platforms that do not have it.
+ * Generally, these platforms are ones without IPv6 support, but we want to
+ * have a working in6_addr there anyway, so we can use it to parse IPv6
  * addresses. */
 #if !defined(HAVE_STRUCT_IN6_ADDR)
 struct in6_addr
@@ -382,9 +435,10 @@ struct in6_addr
 };
 #endif
 
+/** @{ */
+/** Many BSD variants seem not to define these. */
 #if defined(__APPLE__) || defined(__darwin__) || defined(__FreeBSD__) \
     || defined(__NetBSD__) || defined(__OpenBSD__)
-/* Many BSD variants seem not to define these. */
 #ifndef s6_addr16
 #define s6_addr16 __u6_addr.__u6_addr16
 #endif
@@ -392,12 +446,15 @@ struct in6_addr
 #define s6_addr32 __u6_addr.__u6_addr32
 #endif
 #endif
+/** @} */
 
 #ifndef HAVE_SA_FAMILY_T
 typedef uint16_t sa_family_t;
 #endif
 
-/* Apparently, MS and Solaris don't define s6_addr16 or s6_addr32. */
+/** @{ */
+/** Apparently, MS and Solaris don't define s6_addr16 or s6_addr32; these
+ * macros get you a pointer to s6_addr32 or local equivalent. */
 #ifdef HAVE_STRUCT_IN6_ADDR_S6_ADDR32
 #define S6_ADDR32(x) ((uint32_t*)(x).s6_addr32)
 #else
@@ -408,9 +465,10 @@ typedef uint16_t sa_family_t;
 #else
 #define S6_ADDR16(x) ((uint16_t*)((char*)&(x).s6_addr))
 #endif
+/** @} */
 
-/* Define struct sockaddr_in6 on platforms that do not have it. See notes
- * on struct in6_addr. */
+/** Implementation of struct sockaddr_in6 on platforms that do not have
+ * it. See notes on struct in6_addr. */
 #if !defined(HAVE_STRUCT_SOCKADDR_IN6)
 struct sockaddr_in6 {
   sa_family_t sin6_family;
@@ -425,8 +483,8 @@ int tor_inet_aton(const char *cp, struct in_addr *addr) ATTR_NONNULL((1,2));
 const char *tor_inet_ntop(int af, const void *src, char *dst, size_t len);
 int tor_inet_pton(int af, const char *src, void *dst);
 int tor_lookup_hostname(const char *name, uint32_t *addr) ATTR_NONNULL((1,2));
-void set_socket_nonblocking(int socket);
-int tor_socketpair(int family, int type, int protocol, int fd[2]);
+void set_socket_nonblocking(tor_socket_t socket);
+int tor_socketpair(int family, int type, int protocol, tor_socket_t fd[2]);
 int network_init(void);
 
 /* For stupid historical reasons, windows sockets have an independent
@@ -453,7 +511,7 @@ int network_init(void);
   ((e) == WSAEMFILE || (e) == WSAENOBUFS)
 /** Return true if e is EADDRINUSE or the local equivalent. */
 #define ERRNO_IS_EADDRINUSE(e)      ((e) == WSAEADDRINUSE)
-int tor_socket_errno(int sock);
+int tor_socket_errno(tor_socket_t sock);
 const char *tor_socket_strerror(int e);
 #else
 #define ERRNO_IS_EAGAIN(e)           ((e) == EAGAIN)
@@ -480,21 +538,26 @@ typedef enum {
   SOCKS5_ADDRESS_TYPE_NOT_SUPPORTED = 0x08,
 } socks5_reply_status_t;
 
+/* ===== Insecure rng */
+void tor_init_weak_random(unsigned seed);
+long tor_weak_random(void);
+#define TOR_RAND_MAX (RAND_MAX)
+
 /* ===== OS compatibility */
 const char *get_uname(void);
 
-uint16_t get_uint16(const char *cp) ATTR_PURE ATTR_NONNULL((1));
-uint32_t get_uint32(const char *cp) ATTR_PURE ATTR_NONNULL((1));
-uint64_t get_uint64(const char *cp) ATTR_PURE ATTR_NONNULL((1));
-void set_uint16(char *cp, uint16_t v) ATTR_NONNULL((1));
-void set_uint32(char *cp, uint32_t v) ATTR_NONNULL((1));
-void set_uint64(char *cp, uint64_t v) ATTR_NONNULL((1));
+uint16_t get_uint16(const void *cp) ATTR_PURE ATTR_NONNULL((1));
+uint32_t get_uint32(const void *cp) ATTR_PURE ATTR_NONNULL((1));
+uint64_t get_uint64(const void *cp) ATTR_PURE ATTR_NONNULL((1));
+void set_uint16(void *cp, uint16_t v) ATTR_NONNULL((1));
+void set_uint32(void *cp, uint32_t v) ATTR_NONNULL((1));
+void set_uint64(void *cp, uint64_t v) ATTR_NONNULL((1));
 
 /* These uint8 variants are defined to make the code more uniform. */
 #define get_uint8(cp) (*(const uint8_t*)(cp))
-static void set_uint8(char *cp, uint8_t v);
+static void set_uint8(void *cp, uint8_t v);
 static INLINE void
-set_uint8(char *cp, uint8_t v)
+set_uint8(void *cp, uint8_t v)
 {
   *(uint8_t*)cp = v;
 }
@@ -507,6 +570,8 @@ int switch_id(const char *user);
 #ifdef HAVE_PWD_H
 char *get_user_homedir(const char *username);
 #endif
+
+int get_parent_directory(char *fname);
 
 int spawn_func(void (*func)(void *), void *data);
 void spawn_exit(void) ATTR_NORETURN;
@@ -522,6 +587,8 @@ void spawn_exit(void) ATTR_NORETURN;
 #undef TOR_IS_MULTITHREADED
 #endif
 
+int compute_num_cpus(void);
+
 /* Because we use threads instead of processes on most platforms (Windows,
  * Linux, etc), we need locking for them.  On platforms with poor thread
  * support or broken gethostbyname_r, these functions are no-ops. */
@@ -529,10 +596,14 @@ void spawn_exit(void) ATTR_NORETURN;
 /** A generic lock structure for multithreaded builds. */
 typedef struct tor_mutex_t {
 #if defined(USE_WIN32_THREADS)
+  /** Windows-only: on windows, we implement locks with CRITICAL_SECTIONS. */
   CRITICAL_SECTION mutex;
 #elif defined(USE_PTHREADS)
+  /** Pthreads-only: with pthreads, we implement locks with
+   * pthread_mutex_t. */
   pthread_mutex_t mutex;
 #else
+  /** No-threads only: Dummy variable so that tor_mutex_t takes up space. */
   int _unused;
 #endif
 } tor_mutex_t;
@@ -551,7 +622,7 @@ void tor_threads_init(void);
 #else
 #define tor_mutex_new() ((tor_mutex_t*)tor_malloc(sizeof(int)))
 #define tor_mutex_init(m) STMT_NIL
-#define tor_mutex_acquire(m) STMT_NIL
+#define tor_mutex_acquire(m) STMT_VOID(m)
 #define tor_mutex_release(m) STMT_NIL
 #define tor_mutex_free(m) STMT_BEGIN tor_free(m); STMT_END
 #define tor_mutex_uninit(m) STMT_NIL

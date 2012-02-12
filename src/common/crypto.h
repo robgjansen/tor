@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -112,40 +112,45 @@ int crypto_pk_write_private_key_to_string(crypto_pk_env_t *env,
 int crypto_pk_read_public_key_from_string(crypto_pk_env_t *env,
                                           const char *src, size_t len);
 int crypto_pk_read_private_key_from_string(crypto_pk_env_t *env,
-                                           const char *s);
+                                           const char *s, ssize_t len);
 int crypto_pk_write_private_key_to_filename(crypto_pk_env_t *env,
                                             const char *fname);
 
 int crypto_pk_check_key(crypto_pk_env_t *env);
 int crypto_pk_cmp_keys(crypto_pk_env_t *a, crypto_pk_env_t *b);
 size_t crypto_pk_keysize(crypto_pk_env_t *env);
+int crypto_pk_num_bits(crypto_pk_env_t *env);
 crypto_pk_env_t *crypto_pk_dup_key(crypto_pk_env_t *orig);
 crypto_pk_env_t *crypto_pk_copy_full(crypto_pk_env_t *orig);
 int crypto_pk_key_is_private(const crypto_pk_env_t *key);
+int crypto_pk_public_exponent_ok(crypto_pk_env_t *env);
 
-int crypto_pk_public_encrypt(crypto_pk_env_t *env, char *to,
+int crypto_pk_public_encrypt(crypto_pk_env_t *env, char *to, size_t tolen,
                              const char *from, size_t fromlen, int padding);
-int crypto_pk_private_decrypt(crypto_pk_env_t *env, char *to,
+int crypto_pk_private_decrypt(crypto_pk_env_t *env, char *to, size_t tolen,
                               const char *from, size_t fromlen,
                               int padding, int warnOnFailure);
-int crypto_pk_public_checksig(crypto_pk_env_t *env, char *to,
+int crypto_pk_public_checksig(crypto_pk_env_t *env, char *to, size_t tolen,
                               const char *from, size_t fromlen);
 int crypto_pk_public_checksig_digest(crypto_pk_env_t *env, const char *data,
                                size_t datalen, const char *sig, size_t siglen);
-int crypto_pk_private_sign(crypto_pk_env_t *env, char *to,
+int crypto_pk_private_sign(crypto_pk_env_t *env, char *to, size_t tolen,
                            const char *from, size_t fromlen);
-int crypto_pk_private_sign_digest(crypto_pk_env_t *env, char *to,
+int crypto_pk_private_sign_digest(crypto_pk_env_t *env, char *to, size_t tolen,
                                   const char *from, size_t fromlen);
 int crypto_pk_public_hybrid_encrypt(crypto_pk_env_t *env, char *to,
+                                    size_t tolen,
                                     const char *from, size_t fromlen,
                                     int padding, int force);
 int crypto_pk_private_hybrid_decrypt(crypto_pk_env_t *env, char *to,
+                                     size_t tolen,
                                      const char *from, size_t fromlen,
                                      int padding, int warnOnFailure);
 
 int crypto_pk_asn1_encode(crypto_pk_env_t *pk, char *dest, size_t dest_len);
 crypto_pk_env_t *crypto_pk_asn1_decode(const char *str, size_t len);
 int crypto_pk_get_digest(crypto_pk_env_t *pk, char *digest_out);
+int crypto_pk_get_all_digests(crypto_pk_env_t *pk, digests_t *digests_out);
 int crypto_pk_get_fingerprint(crypto_pk_env_t *pk, char *fp_out,int add_space);
 int crypto_pk_check_fingerprint_syntax(const char *s);
 
@@ -191,9 +196,15 @@ void crypto_digest_assign(crypto_digest_env_t *into,
 void crypto_hmac_sha1(char *hmac_out,
                       const char *key, size_t key_len,
                       const char *msg, size_t msg_len);
+void crypto_hmac_sha256(char *hmac_out,
+                        const char *key, size_t key_len,
+                        const char *msg, size_t msg_len);
 
 /* Key negotiation */
-crypto_dh_env_t *crypto_dh_new(void);
+#define DH_TYPE_CIRCUIT 1
+#define DH_TYPE_REND 2
+#define DH_TYPE_TLS 3
+crypto_dh_env_t *crypto_dh_new(int dh_type);
 int crypto_dh_get_bytes(crypto_dh_env_t *dh);
 int crypto_dh_generate_public(crypto_dh_env_t *dh);
 int crypto_dh_get_public(crypto_dh_env_t *dh, char *pubkey_out,
@@ -238,13 +249,13 @@ void secret_to_key(char *key_out, size_t key_out_len, const char *secret,
                    size_t secret_len, const char *s2k_specifier);
 
 #ifdef CRYPTO_PRIVATE
-/* Prototypes for private functions only used by tortls.c and crypto.c */
+/* Prototypes for private functions only used by tortls.c, crypto.c, and the
+ * unit tests. */
 struct rsa_st;
 struct evp_pkey_st;
 struct dh_st;
 struct rsa_st *_crypto_pk_env_get_rsa(crypto_pk_env_t *env);
 crypto_pk_env_t *_crypto_new_pk_env_rsa(struct rsa_st *rsa);
-crypto_pk_env_t *_crypto_new_pk_env_evp_pkey(struct evp_pkey_st *pkey);
 struct evp_pkey_st *_crypto_pk_env_get_evp_pkey(crypto_pk_env_t *env,
                                                 int private);
 struct dh_st *_crypto_dh_env_get_dh(crypto_dh_env_t *dh);

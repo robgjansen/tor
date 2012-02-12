@@ -1,4 +1,4 @@
-/* tinytest.c -- Copyright 2009 Nick Mathewson
+/* tinytest.c -- Copyright 2009-2010 Nick Mathewson
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -28,7 +28,11 @@
 #include <string.h>
 #include <assert.h>
 
-#ifdef WIN32
+#ifdef TINYTEST_LOCAL
+#include "tinytest_local.h"
+#endif
+
+#ifdef _WIN32
 #include <windows.h>
 #else
 #include <sys/types.h>
@@ -58,10 +62,10 @@ const char *verbosity_flag = "";
 enum outcome { SKIP=2, OK=1, FAIL=0 };
 static enum outcome cur_test_outcome = 0;
 const char *cur_test_prefix = NULL; /**< prefix of the current test group */
-/** Name of the  current test, if we haven't logged is yet. Used for --quiet */
+/** Name of the current test, if we haven't logged is yet. Used for --quiet */
 const char *cur_test_name = NULL;
 
-#ifdef WIN32
+#ifdef _WIN32
 /** Pointer to argv[0] for win32. */
 static const char *commandname = NULL;
 #endif
@@ -76,7 +80,7 @@ _testcase_run_bare(const struct testcase_t *testcase)
 	int outcome;
 	if (testcase->setup) {
 		env = testcase->setup->setup_fn(testcase);
-                if (!env)
+		if (!env)
 			return FAIL;
 		else if (env == (void*)TT_SKIP)
 			return SKIP;
@@ -100,7 +104,7 @@ static enum outcome
 _testcase_run_forked(const struct testgroup_t *group,
 		     const struct testcase_t *testcase)
 {
-#ifdef WIN32
+#ifdef _WIN32
 	/* Fork? On Win32?  How primitive!  We'll do what the smart kids do:
 	   we'll invoke our own exe (whose name we recall from the command
 	   line) with a command line that tells it to run just the test we
@@ -111,7 +115,7 @@ _testcase_run_forked(const struct testgroup_t *group,
 	 */
 	int ok;
 	char buffer[LONGEST_TEST_NAME+256];
-	STARTUPINFO si;
+	STARTUPINFOA si;
 	PROCESS_INFORMATION info;
 	DWORD exitcode;
 
@@ -130,7 +134,7 @@ _testcase_run_forked(const struct testgroup_t *group,
 	memset(&info, 0, sizeof(info));
 	si.cb = sizeof(si);
 
-	ok = CreateProcess(commandname, buffer, NULL, NULL, 0,
+	ok = CreateProcessA(commandname, buffer, NULL, NULL, 0,
 			   0, NULL, NULL, &si, &info);
 	if (!ok) {
 		printf("CreateProcess failed!\n");
@@ -149,7 +153,7 @@ _testcase_run_forked(const struct testgroup_t *group,
 #else
 	int outcome_pipe[2];
 	pid_t pid;
-        (void)group;
+	(void)group;
 
 	if (pipe(outcome_pipe))
 		perror("opening pipe");
@@ -165,12 +169,13 @@ _testcase_run_forked(const struct testgroup_t *group,
 		test_r = _testcase_run_bare(testcase);
 		assert(0<=(int)test_r && (int)test_r<=2);
 		b[0] = "NYS"[test_r];
-	        write_r = (int)write(outcome_pipe[1], b, 1);
+		write_r = (int)write(outcome_pipe[1], b, 1);
 		if (write_r != 1) {
 			perror("write outcome to pipe");
 			exit(1);
 		}
 		exit(0);
+		return FAIL; /* unreachable */
 	} else {
 		/* parent */
 		int status, r;
@@ -217,7 +222,7 @@ testcase_run_one(const struct testgroup_t *group,
 	if ((testcase->flags & TT_FORK) && !(opt_forked||opt_nofork)) {
 		outcome = _testcase_run_forked(group, testcase);
 	} else {
-		outcome  = _testcase_run_bare(testcase);
+		outcome = _testcase_run_bare(testcase);
 	}
 
 	if (outcome == OK) {
@@ -236,6 +241,7 @@ testcase_run_one(const struct testgroup_t *group,
 
 	if (opt_forked) {
 		exit(outcome==OK ? 0 : (outcome==SKIP?MAGIC_EXITCODE : 1));
+		return 1; /* unreachable */
 	} else {
 		return (int)outcome;
 	}
@@ -270,6 +276,7 @@ usage(struct testgroup_t *groups, int list_groups)
 {
 	puts("Options are: [--verbose|--quiet|--terse] [--no-fork]");
 	puts("  Specify tests by name, or using a prefix ending with '..'");
+	puts("  To skip a test, list give its name prefixed with a colon.");
 	puts("  Use --list-tests for a list of tests.");
 	if (list_groups) {
 		puts("Known tests are:");
@@ -283,7 +290,7 @@ tinytest_main(int c, const char **v, struct testgroup_t *groups)
 {
 	int i, j, n=0;
 
-#ifdef WIN32
+#ifdef _WIN32
 	commandname = v[0];
 #endif
 	for (i=1; i<c; ++i) {
@@ -310,8 +317,15 @@ tinytest_main(int c, const char **v, struct testgroup_t *groups)
 				return -1;
 			}
 		} else {
-			++n;
-			if (!_tinytest_set_flag(groups, v[i], _TT_ENABLED)) {
+			const char *test = v[i];
+			int flag = _TT_ENABLED;
+			if (test[0] == ':') {
+				++test;
+				flag = TT_SKIP;
+			} else {
+				++n;
+			}
+			if (!_tinytest_set_flag(groups, test, flag)) {
 				printf("No such test as %s!\n", v[i]);
 				return -1;
 			}

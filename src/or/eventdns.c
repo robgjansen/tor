@@ -1,12 +1,18 @@
-/* The original version of this module was written by Adam Langley; for
- * a history of modifications, check out the subversion logs.
+/* READ THIS COMMENT BEFORE HACKING THIS FILE.
  *
- * When editing this module, try to keep it re-mergeable by Adam.  Don't
- * reformat the whitespace, add Tor dependencies, or so on.
+ * This eventdns.c copy has diverged a bit from Libevent's version, and it's
+ * no longer easy to resynchronize them.  Once Tor requires Libevent 2.0, we
+ * will just dump this file and use Libevent's evdns code.
  *
- * TODO:
- *	 - Replace all externally visible magic numbers with #defined constants.
- *	 - Write documentation for APIs of all external functions.
+ * Therefore, you probably shouldn't make any change here without making it to
+ * Libevent as well: it's not good for the implementation to diverge even
+ * more.  Also, we can't shouldn't wantonly the API here (since Libevent APIs
+ * can't change in ways that break user behavior).  Also, we shouldn't bother
+ * with cosmetic changes: the whole module is slated for demolition, so
+ * there's no point dusting the linebreaks or re-painting the parser.
+ *
+ * (We can't just drop the Libevent 2.0 evdns implementation in here instead,
+ * since it depends pretty heavily on parts of Libevent 2.0.)
  */
 
 /* Async DNS Library
@@ -75,7 +81,6 @@
 #include <stdint.h>
 #endif
 #include <stdlib.h>
-#include <string.h>
 #include <errno.h>
 #include <assert.h>
 #ifdef HAVE_UNISTD_H
@@ -461,7 +466,7 @@ sockaddr_eq(const struct sockaddr *sa1, const struct sockaddr *sa2,
 		const struct sockaddr_in6 *sin1, *sin2;
 		sin1 = (const struct sockaddr_in6 *)sa1;
 		sin2 = (const struct sockaddr_in6 *)sa2;
-		if (memcmp(sin1->sin6_addr.s6_addr, sin2->sin6_addr.s6_addr, 16))
+		if (tor_memneq(sin1->sin6_addr.s6_addr, sin2->sin6_addr.s6_addr, 16))
 			return 0;
 		else if (include_port && sin1->sin6_port != sin2->sin6_port)
 			return 0;
@@ -1028,6 +1033,9 @@ request_parse(u8 *packet, ssize_t length, struct evdns_server_port *port, struct
 	GET16(answers);
 	GET16(authority);
 	GET16(additional);
+	(void)additional;
+	(void)authority;
+	(void)answers;
 
 	if (flags & 0x8000) return -1; /* Must not be an answer. */
 	flags &= 0x0110; /* Only RD and CD get preserved. */
@@ -1245,7 +1253,8 @@ nameserver_read(struct nameserver *ns) {
 
 	for (;;) {
 		const int r =
-            (int)recvfrom(ns->socket, packet, (socklen_t)sizeof(packet), 0,
+            (int)recvfrom(ns->socket, (void*)packet,
+						  (socklen_t)sizeof(packet), 0,
 						  sa, &addrlen);
 		if (r < 0) {
 			int err = last_error(ns->socket);
@@ -1276,7 +1285,7 @@ server_port_read(struct evdns_server_port *s) {
 
 	for (;;) {
 		addrlen = (socklen_t)sizeof(struct sockaddr_storage);
-		r = recvfrom(s->socket, packet, sizeof(packet), 0,
+		r = recvfrom(s->socket, (void*)packet, sizeof(packet), 0,
 					 (struct sockaddr*) &addr, &addrlen);
 		if (r < 0) {
 			int err = last_error(s->socket);
@@ -1559,7 +1568,7 @@ evdns_request_data_build(const char *const name, const size_t name_len,
 
 /* exported function */
 struct evdns_server_port *
-evdns_add_server_port(int socket, int is_tcp, evdns_request_callback_fn_type cb, void *user_data)
+evdns_add_server_port(tor_socket_t socket, int is_tcp, evdns_request_callback_fn_type cb, void *user_data)
 {
 	struct evdns_server_port *port;
 	if (!(port = mm_malloc(sizeof(struct evdns_server_port))))
@@ -1667,7 +1676,7 @@ evdns_server_request_add_reply(struct evdns_server_request *_req, int section, c
 
 /* exported function */
 int
-evdns_server_request_add_a_reply(struct evdns_server_request *req, const char *name, int n, void *addrs, int ttl)
+evdns_server_request_add_a_reply(struct evdns_server_request *req, const char *name, int n, const void *addrs, int ttl)
 {
 	return evdns_server_request_add_reply(
 		  req, EVDNS_ANSWER_SECTION, name, TYPE_A, CLASS_INET,
@@ -1676,7 +1685,7 @@ evdns_server_request_add_a_reply(struct evdns_server_request *req, const char *n
 
 /* exported function */
 int
-evdns_server_request_add_aaaa_reply(struct evdns_server_request *req, const char *name, int n, void *addrs, int ttl)
+evdns_server_request_add_aaaa_reply(struct evdns_server_request *req, const char *name, int n, const void *addrs, int ttl)
 {
 	return evdns_server_request_add_reply(
 		  req, EVDNS_ANSWER_SECTION, name, TYPE_AAAA, CLASS_INET,
@@ -1827,8 +1836,8 @@ evdns_server_request_respond(struct evdns_server_request *_req, int err)
 	r = sendto(port->socket, req->response, req->response_len, 0,
 			   (struct sockaddr*) &req->addr, req->addrlen);
 	if (r<0) {
-		int err = last_error(port->socket);
-		if (! error_is_eagain(err))
+		int error = last_error(port->socket);
+		if (! error_is_eagain(error))
 			return -1;
 
 		if (port->pending_replies) {
@@ -1903,7 +1912,7 @@ server_request_free(struct server_request *req)
 
 	if (req->port) {
 		if (req->port->pending_replies == req) {
-			if (req->next_pending)
+			if (req->next_pending && req->next_pending != req)
 				req->port->pending_replies = req->next_pending;
 			else
 				req->port->pending_replies = NULL;
@@ -1998,7 +2007,7 @@ evdns_request_timeout_callback(int fd, short events, void *arg) {
 		/* retransmit it */
 		/* Stop waiting for the timeout.  No need to do this in
 		 * request_finished; that one already deletes the timeout event.
-		 * XXXX021 port this change to libevent. */
+		 * XXXX023 port this change to libevent. */
 		del_timeout_event(req);
 		evdns_request_transmit(req);
 	}
@@ -2012,7 +2021,8 @@ evdns_request_timeout_callback(int fd, short events, void *arg) {
 /* 2 other failure */
 static int
 evdns_request_transmit_to(struct evdns_request *req, struct nameserver *server) {
-	const ssize_t r = send(server->socket, req->request, req->request_len, 0);
+	const ssize_t r = send(server->socket, (void*)req->request,
+                         req->request_len, 0);
 	if (r < 0) {
 		int err = last_error(server->socket);
 		if (error_is_eagain(err)) return 1;
@@ -2251,7 +2261,7 @@ sockaddr_is_loopback(const struct sockaddr *addr)
 		return (ntohl(sin->sin_addr.s_addr) & 0xff000000) == 0x7f000000;
 	} else if (addr->sa_family == AF_INET6) {
 		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
-		return !memcmp(sin6->sin6_addr.s6_addr, LOOPBACK_S6, 16);
+		return fast_memeq(sin6->sin6_addr.s6_addr, LOOPBACK_S6, 16);
 	}
 	return 0;
 }
@@ -2286,7 +2296,7 @@ _evdns_nameserver_add_impl(const struct sockaddr *address,
 
 	evtimer_set(&ns->timeout_event, nameserver_prod_callback, ns);
 
-	ns->socket = socket(PF_INET, SOCK_DGRAM, 0);
+	ns->socket = tor_open_socket(address->sa_family, SOCK_DGRAM, 0);
 	if (ns->socket < 0) { err = 1; goto out1; }
 #ifdef WIN32
 	{
@@ -3035,7 +3045,7 @@ evdns_resolv_conf_parse(int flags, const char *const filename) {
 
 	log(EVDNS_LOG_DEBUG, "Parsing resolv.conf file %s", filename);
 
-	fd = open(filename, O_RDONLY);
+	fd = tor_open_cloexec(filename, O_RDONLY, 0);
 	if (fd < 0) {
 		evdns_resolv_set_defaults(flags);
 		return 1;
@@ -3131,8 +3141,7 @@ load_nameservers_with_getnetworkparams(void)
 	IP_ADDR_STRING *ns;
 	GetNetworkParams_fn_t fn;
 
-	/* XXXX Possibly, we should hardcode the location of this DLL. */
-	if (!(handle = LoadLibraryW(L"iphlpapi.dll"))) {
+	if (!(handle = load_windows_system_library(TEXT("iphlpapi.dll")))) {
 		log(EVDNS_LOG_WARN, "Could not open iphlpapi.dll");
 		/* right now status = 0, doesn't that mean "good" - mikec */
 		status = -1;
@@ -3201,24 +3210,22 @@ load_nameservers_with_getnetworkparams(void)
 }
 
 static int
-config_nameserver_from_reg_key(HKEY key, const char *subkey)
+config_nameserver_from_reg_key(HKEY key, const TCHAR *subkey)
 {
 	char *buf;
+  char ansibuf[MAX_PATH] = {0};
 	DWORD bufsz = 0, type = 0;
-	WCHAR wsubkey[MAX_PATH] = {0};
-	char ansibuf[MAX_PATH] = {0};
 	int status = 0;
 
-	mbstowcs(wsubkey,subkey,MAX_PATH);
-	if (RegQueryValueExW(key, wsubkey, 0, &type, NULL, &bufsz)
+	if (RegQueryValueEx(key, subkey, 0, &type, NULL, &bufsz)
 		!= ERROR_MORE_DATA)
 		return -1;
 	if (!(buf = mm_malloc(bufsz)))
 		return -1;
 
-	if (RegQueryValueExW(key, wsubkey, 0, &type, (LPBYTE)buf, &bufsz)
+	if (RegQueryValueEx(key, subkey, 0, &type, (LPBYTE)buf, &bufsz)
 		== ERROR_SUCCESS && bufsz > 1) {
-		wcstombs(ansibuf,(wchar_t*)buf,MAX_PATH);
+		wcstombs(ansibuf,(wchar_t*)buf,MAX_PATH);/*XXXX UNICODE */
 		status = evdns_nameserver_ip_add_line(ansibuf);
 	}
 
@@ -3226,21 +3233,22 @@ config_nameserver_from_reg_key(HKEY key, const char *subkey)
 	return status;
 }
 
-#define SERVICES_KEY L"System\\CurrentControlSet\\Services\\"
-#define WIN_NS_9X_KEY  SERVICES_KEY L"VxD\\MSTCP"
-#define WIN_NS_NT_KEY  SERVICES_KEY L"Tcpip\\Parameters"
+#define SERVICES_KEY TEXT("System\\CurrentControlSet\\Services\\")
+#define WIN_NS_9X_KEY  SERVICES_KEY TEXT("VxD\\MSTCP")
+#define WIN_NS_NT_KEY  SERVICES_KEY TEXT("Tcpip\\Parameters")
 
 static int
 load_nameservers_from_registry(void)
 {
 	int found = 0;
 	int r;
-	OSVERSIONINFO info = {0};
+	OSVERSIONINFO info;
+	memset(&info, 0, sizeof(info));
 	info.dwOSVersionInfoSize = sizeof (info);
-	GetVersionExW((LPOSVERSIONINFO)&info);
+	GetVersionEx(&info);
 
 #define TRY(k, name)													\
-	if (!found && config_nameserver_from_reg_key(k,name) == 0) {		\
+	if (!found && config_nameserver_from_reg_key(k,TEXT(name)) == 0) {	\
 		log(EVDNS_LOG_DEBUG,"Found nameservers in %s/%s",#k,name);		\
 		found = 1;														\
 	} else if (!found) {												\
@@ -3251,12 +3259,12 @@ load_nameservers_from_registry(void)
 	if (info.dwMajorVersion >= 5) { /* NT */
 		HKEY nt_key = 0, interfaces_key = 0;
 
-		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, WIN_NS_NT_KEY, 0,
+		if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, WIN_NS_NT_KEY, 0,
 						 KEY_READ, &nt_key) != ERROR_SUCCESS) {
 			log(EVDNS_LOG_DEBUG,"Couldn't open nt key, %d",(int)GetLastError());
 			return -1;
 		}
-		r = RegOpenKeyExW(nt_key, L"Interfaces", 0,
+		r = RegOpenKeyEx(nt_key, TEXT("Interfaces"), 0,
 						 KEY_QUERY_VALUE|KEY_ENUMERATE_SUB_KEYS,
 						 &interfaces_key);
 		if (r != ERROR_SUCCESS) {
@@ -3271,7 +3279,7 @@ load_nameservers_from_registry(void)
 		RegCloseKey(nt_key);
 	} else {
 		HKEY win_key = 0;
-		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, WIN_NS_9X_KEY, 0,
+		if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, WIN_NS_9X_KEY, 0,
 						 KEY_READ, &win_key) != ERROR_SUCCESS) {
 			log(EVDNS_LOG_DEBUG, "Couldn't open registry key, %d", (int)GetLastError());
 			return -1;
@@ -3457,7 +3465,7 @@ main(int c, char **v) {
 	if (servertest) {
 		int sock;
 		struct sockaddr_in my_addr;
-		sock = socket(PF_INET, SOCK_DGRAM, 0);
+		sock = tor_open_socket(PF_INET, SOCK_DGRAM, 0);
 		fcntl(sock, F_SETFL, O_NONBLOCK);
 		my_addr.sin_family = AF_INET;
 		my_addr.sin_port = htons(10053);

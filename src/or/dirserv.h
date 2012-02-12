@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -11,6 +11,18 @@
 
 #ifndef _TOR_DIRSERV_H
 #define _TOR_DIRSERV_H
+
+/** What fraction (1 over this number) of the relay ID space do we
+ * (as a directory authority) launch connections to at each reachability
+ * test? */
+#define REACHABILITY_MODULO_PER_TEST 128
+
+/** How often (in seconds) do we launch reachability tests? */
+#define REACHABILITY_TEST_INTERVAL 10
+
+/** How many seconds apart are the reachability tests for a given relay? */
+#define REACHABILITY_TEST_CYCLE_PERIOD \
+  (REACHABILITY_TEST_INTERVAL*REACHABILITY_MODULO_PER_TEST)
 
 /** Maximum length of an exit policy summary. */
 #define MAX_EXITPOLICY_SUMMARY_LEN 1000
@@ -40,8 +52,6 @@
    MAX_V_LINE_LEN                                                       \
    )
 
-#define UNNAMED_ROUTER_NICKNAME "Unnamed"
-
 int connection_dirserv_flushed_some(dir_connection_t *conn);
 
 int dirserv_add_own_fingerprint(const char *nickname, crypto_pk_env_t *pk);
@@ -61,15 +71,16 @@ int list_server_status_v1(smartlist_t *routers, char **router_status_out,
 int dirserv_dump_directory_to_string(char **dir_out,
                                      crypto_pk_env_t *private_key);
 
-int directory_fetches_from_authorities(or_options_t *options);
-int directory_fetches_dir_info_early(or_options_t *options);
-int directory_fetches_dir_info_later(or_options_t *options);
-int directory_caches_v2_dir_info(or_options_t *options);
+int directory_fetches_from_authorities(const or_options_t *options);
+int directory_fetches_dir_info_early(const or_options_t *options);
+int directory_fetches_dir_info_later(const or_options_t *options);
+int directory_caches_v2_dir_info(const or_options_t *options);
 #define directory_caches_v1_dir_info(o) directory_caches_v2_dir_info(o)
-int directory_caches_dir_info(or_options_t *options);
-int directory_permits_begindir_requests(or_options_t *options);
-int directory_permits_controller_requests(or_options_t *options);
-int directory_too_idle_to_fetch_descriptors(or_options_t *options, time_t now);
+int directory_caches_dir_info(const or_options_t *options);
+int directory_permits_begindir_requests(const or_options_t *options);
+int directory_permits_controller_requests(const or_options_t *options);
+int directory_too_idle_to_fetch_descriptors(const or_options_t *options,
+                                            time_t now);
 
 void directory_set_dirty(void);
 cached_dir_t *dirserv_get_directory(void);
@@ -99,11 +110,19 @@ void dirserv_orconn_tls_done(const char *address,
                              uint16_t or_port,
                              const char *digest_rcvd,
                              int as_advertised);
+int dirserv_should_launch_reachability_test(const routerinfo_t *ri,
+                                            const routerinfo_t *ri_old);
 void dirserv_single_reachability_test(time_t now, routerinfo_t *router);
 void dirserv_test_reachability(time_t now);
 int authdir_wants_to_reject_router(routerinfo_t *ri, const char **msg,
-                                   int complain);
-int dirserv_would_reject_router(routerstatus_t *rs);
+                                   int complain,
+                                   int *valid_out);
+uint32_t dirserv_router_get_status(const routerinfo_t *router,
+                                   const char **msg);
+void dirserv_set_node_flags_from_authoritative_status(node_t *node,
+                                                      uint32_t authstatus);
+
+int dirserv_would_reject_router(const routerstatus_t *rs);
 int dirserv_remove_old_statuses(smartlist_t *fps, time_t cutoff);
 int dirserv_have_any_serverdesc(smartlist_t *fps, int spool_src);
 int dirserv_have_any_microdesc(const smartlist_t *fps);
@@ -112,7 +131,7 @@ size_t dirserv_estimate_data_size(smartlist_t *fps, int is_serverdescs,
 size_t dirserv_estimate_microdesc_size(const smartlist_t *fps, int compressed);
 
 int routerstatus_format_entry(char *buf, size_t buf_len,
-                              routerstatus_t *rs, const char *platform,
+                              const routerstatus_t *rs, const char *platform,
                               routerstatus_format_type_t format);
 void dirserv_free_all(void);
 void cached_dir_decref(cached_dir_t *d);

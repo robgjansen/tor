@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2010, The Tor Project, Inc. */
+ * Copyright (c) 2007-2011, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #ifndef _TOR_CONTAINER_H
@@ -15,6 +15,7 @@
  * and macros defined here.
  **/
 typedef struct smartlist_t {
+  /** @{ */
   /** <b>list</b> has enough capacity to store exactly <b>capacity</b> elements
    * before it needs to be resized.  Only the first <b>num_used</b> (\<=
    * capacity) elements point to valid data.
@@ -22,6 +23,7 @@ typedef struct smartlist_t {
   void **list;
   int num_used;
   int capacity;
+  /** @} */
 } smartlist_t;
 
 smartlist_t *smartlist_create(void);
@@ -40,6 +42,8 @@ int smartlist_string_pos(const smartlist_t *, const char *elt) ATTR_PURE;
 int smartlist_string_isin_case(const smartlist_t *sl, const char *element)
   ATTR_PURE;
 int smartlist_string_num_isin(const smartlist_t *sl, int num) ATTR_PURE;
+int smartlist_strings_eq(const smartlist_t *sl1, const smartlist_t *sl2)
+  ATTR_PURE;
 int smartlist_digest_isin(const smartlist_t *sl, const char *element)
   ATTR_PURE;
 int smartlist_overlap(const smartlist_t *sl1, const smartlist_t *sl2)
@@ -257,7 +261,7 @@ char *smartlist_join_strings2(smartlist_t *sl, const char *join,
  * Example use:
  *  SMARTLIST_FOREACH_JOIN(routerstatus_list, routerstatus_t *, rs,
  *                     routerinfo_list, routerinfo_t *, ri,
- *                     memcmp(rs->identity_digest, ri->identity_digest, 20),
+ *                    tor_memcmp(rs->identity_digest, ri->identity_digest, 20),
  *                     log_info(LD_GENERAL,"No match for %s", ri->nickname)) {
  *    log_info(LD_GENERAL, "%s matches routerstatus %p", ri->nickname, rs);
  * } SMARTLIST_FOREACH_JOIN_END(rs, ri);
@@ -272,7 +276,7 @@ char *smartlist_join_strings2(smartlist_t *sl, const char *join,
  *    ri = smartlist_get(routerinfo_list, ri_sl_idx);
  *    while (rs_sl_idx < rs_sl_len) {
  *      rs = smartlist_get(routerstatus_list, rs_sl_idx);
- *      rs_ri_cmp = memcmp(rs->identity_digest, ri->identity_digest, 20);
+ *      rs_ri_cmp = tor_memcmp(rs->identity_digest, ri->identity_digest, 20);
  *      if (rs_ri_cmp > 0) {
  *        break;
  *      } else if (rs_ri_cmp == 0) {
@@ -595,9 +599,9 @@ bitarray_is_set(bitarray_t *b, int bit)
 
 /** A set of digests, implemented as a Bloom filter. */
 typedef struct {
-  int mask; /* One less than the number of bits in <b>ba</b>; always one less
+  int mask; /**< One less than the number of bits in <b>ba</b>; always one less
              * than a power of two. */
-  bitarray_t *ba; /* A bit array to implement the Bloom filter. */
+  bitarray_t *ba; /**< A bit array to implement the Bloom filter. */
 } digestset_t;
 
 #define BIT(n) ((n) & set->mask)
