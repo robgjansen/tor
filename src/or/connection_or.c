@@ -57,7 +57,7 @@ static void connection_or_handle_event_cb(struct bufferevent *bufev,
 static digestmap_t *orconn_identity_map = NULL;
 
 /* global state for adaptively throttling connections */
-pc_throttle_globals_t pcbw_globals = {0,0,0,0,0,};
+pc_throttle_globals_t pcbw_globals = {0,0.0,0,0};
 pc_throttle_globals_t* get_pc_throttle_globals() {
 	return &pcbw_globals;
 }
@@ -651,17 +651,20 @@ connection_or_update_token_buckets(smartlist_t *conns,
 }
 
 /**
- * create and return new list of all open or connections to nonrelays.
- * caller must free list.
+ * return list of active client connections with positive EWMA that are not
+ * currently being throttled. caller must free list.
  */
 static smartlist_t *
-connection_or_get_active_nonrelay(smartlist_t *conns) {
+connection_or_get_active_unthrottled_clients(smartlist_t *conns) {
   smartlist_t* or_conns = smartlist_create();
   SMARTLIST_FOREACH(conns, connection_t *, conn,
   {
 	if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
 		or_connection_t* or_conn = TO_OR_CONN(conn);
-		if(!connection_or_digest_is_known_relay(or_conn->identity_digest)) {
+		if(!connection_or_digest_is_known_relay(or_conn->identity_digest) &&
+		/*if(or_conn->is_connection_with_client && /* client */
+				or_conn->throttle.ewma.cell_count > 100.0 && /* truely active */
+				or_conn->throttle.cell_count_penalty < 0.0) { /* unthrottled */
 		  smartlist_add(or_conns, TO_OR_CONN(conn));
 		}
 	}
@@ -669,64 +672,207 @@ connection_or_get_active_nonrelay(smartlist_t *conns) {
   return or_conns;
 }
 
+static double*
+connection_or_cluster_cumulative_distances(double* x, int n, int do_reverse) {
+  double* d = tor_malloc_zero(n*sizeof(double));
+  double* sum = tor_malloc_zero(n*sizeof(double));
+  int i = 0;
+
+  if (do_reverse) {
+    /* compute reverse cumulative sum of distances (right distances) */
+	for (i = (n-2); i >= 0; i--) {
+	  double d_i = x[i+1] - x[i];
+      d_i *= d_i; /* weight distances to increase sensitivity to outliers */
+	  d[i] = ((n-1-i) * d_i) + d[i+1];
+	  sum[i] = sum[i+1] + d[i];
+	}
+  } else {
+    /* compute cumulative sum of distances (left distances) */
+    for (i = 1; i < n; i++) {
+      double d_i = x[i] - x[i-1];
+	  d_i *= d_i; /* weight distances to increase sensitivity to outliers */
+	  d[i] = i * d_i + d[i-1];
+	  sum[i] = sum[i-1] + d[i];
+    }
+  }
+
+  tor_free(d);
+  return sum;
+}
+
+static int
+connection_or_cluster_sort(const void** a, const void** b) {
+  const or_connection_t* oa = *a;
+  const or_connection_t* ob = *b;
+  return oa->throttle.ewma.cell_count < ob->throttle.ewma.cell_count ? -1 :
+         oa->throttle.ewma.cell_count == ob->throttle.ewma.cell_count ? 0 : 1;
+}
+
+/**
+ * Classify connections into two clusters: "high" throughput and "low"
+ * throughput. This approach computes the clustering by minimizing the
+ * intra-cluster distances that would result from any partition point.
+ *
+ * @param conns active unthrottled client connections
+ * @param partition_out return var for the partition threshold: the cell
+ * 		  count value below which is "low" class and above which is "high"
+ * @param intra_distance_out return var for the total intra-cluster distances
+ * @param inter_distance_out return var for the distance between the 2 clusters
+ */
+static void
+connection_or_cluster(smartlist_t *conns, double* partition_out,
+		double* intra_distance_out, double* inter_distance_out) {
+  assert(conns && partition_out && intra_distance_out && inter_distance_out);
+
+  /* we need a sorted array of conn cell counts */
+  smartlist_sort(conns, connection_or_cluster_sort);
+
+  /* get the actual values */
+  int n = smartlist_len(conns);
+  double* cell_counts = tor_malloc_zero(n*sizeof(double));
+  int i = 0;
+  SMARTLIST_FOREACH(conns, or_connection_t*, orc, {
+    assert(i < n);
+    cell_counts[i] = orc->throttle.ewma.cell_count;
+    i++;
+  });
+
+  /* compute left and right cumulative distances between all pairs of points */
+  double* ld = connection_or_cluster_cumulative_distances(cell_counts, n, 0);
+  double* rd = connection_or_cluster_cumulative_distances(cell_counts, n, 1);
+
+  /* find the partitioning point to minimize intra-cluster distances.
+   * start from the right so we prefer throttling no one in edge cases. */
+  int p = 1;
+  double min = rd[0];
+  for (i = 1; i < n; i++) {
+	double cd = ld[i-1] + rd[i];
+    if (cd < min) {
+    	min = cd;
+    	p = i;
+    }
+  }
+
+  /* difference of center (median) of each cluster */
+  double lcenter = 0.0, rcenter = 0.0; /* [0,p) and [p,n) */
+  if(min > 0.0) {
+    if (p%2) {
+	  lcenter = cell_counts[(p-1)/2];
+    } else {
+	  lcenter = (cell_counts[(p/2)-1] + cell_counts[p/2]) / 2.0;
+    }
+    if ((n-p)%2) {
+	  rcenter = cell_counts[p+((n-p-1)/2)];
+    } else {
+	  rcenter = (cell_counts[p+((n-p)/2)] + cell_counts[p+((n-p)/2)-1]) / 2.0;
+    }
+  }
+
+  /* return our results */
+  *partition_out = (cell_counts[p] + cell_counts[p-1]) / 2.0;
+  *intra_distance_out = min;
+  *inter_distance_out = rcenter - lcenter;
+
+  tor_free(cell_counts);
+  tor_free(ld);
+  tor_free(rd);
+}
+
+/**
+ * Throttle connections using statistical fingerprinting, using only the
+ * statistical properties of the connection to avoid privacy risks.
+ * Connections are classified into "high" and "low" bandwidth classes using
+ * 1-dimensional 2-clustering. Connections in the "high" class are throttled
+ * according to the the configured PerConnBWFingerprintRate, only if the
+ * distance between high and low clusters is greater than the configured
+ * PerConnBWFingerprintThreshold.
+ *
+ * @param conns all connections at this relay
+ * @param options global options for this relay
+ */
 void
-connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, time_t now){
-  pc_throttle_globals_t *pct = get_pc_throttle_globals();
+connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options) {
+  /* get new list of only active client connections */
+  smartlist_t* client_conns = connection_or_get_active_unthrottled_clients(conns);
 
-  /* keep track of the cell count that would be achieved by fair usage */
-  double conn_len = ((double)smartlist_len(conns));
-  if(conn_len <= 0)
-	  return;
-  double rate = (double)options->BandwidthRate;
-  double cell_share_increment = rate / conn_len / CELL_NETWORK_SIZE;
+  /* make sure we have client connections */
+  int n = smartlist_len(client_conns);
+  if(n <= 0)
+    return;
 
-  pct->fingerprint_ewma.cell_count += cell_share_increment;
-  scale_single_cell_ewma(&pct->fingerprint_ewma,
-    pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
+  /* compute the 1-d 2-cluster. connections above partition are in the "high"
+   * bandwidth class, and below are in the "low" bandwidth class. we also
+   * get the intra- and inter-cluster distances. */
+  double partition_count = 0, intracd = 0, intercd = 0;
+  connection_or_cluster(client_conns, &partition_count, &intracd, &intercd);
 
-  log_info(LD_OR, "fingerprint ewma incremented by %f, scaled to %f",
-  		cell_share_increment, pct->fingerprint_ewma.cell_count);
+  /* log throttling information if option is set */
+  int throttled_addresses_len;
+  char* throttled_addresses;
+  if(options->PerConnBWFingerprintVerbose) {
+	throttled_addresses_len = 10;
+	throttled_addresses = tor_malloc_zero(throttled_addresses_len);
+    tor_snprintf(throttled_addresses, throttled_addresses_len, "throttled");
+  }
 
-  /* any connection with cell count over fair fingerprint gets throttled */
-  smartlist_t* or_conns = connection_or_get_active_nonrelay(conns);
-  SMARTLIST_FOREACH(or_conns, or_connection_t *, or_conn,
+  SMARTLIST_FOREACH(client_conns, or_connection_t *, orc,
   {
-    int old_rate = or_conn->throttle.bandwidthrate;
+    int old_rate = orc->throttle.bandwidthrate;
 
     /* if this connection is already being throttled, see if we've cooled
-     * down enough to stop throttling. */
-	int was_throttled = or_conn->throttle.cell_count_penalty >= 0;
+     * down enough to stop throttling, based on our penalty config. */
+	int was_throttled = orc->throttle.cell_count_penalty >= 0;
 
 	if(was_throttled) {
-	  /* stop throttling when cell count falls below penalty */
-	  if(or_conn->throttle.ewma.cell_count <
-			  or_conn->throttle.cell_count_penalty) {
-		  or_conn->throttle.bandwidthrate = -1;
-		  or_conn->throttle.cell_count_penalty = -1.0;
-	 }
-	} else if(or_conn->throttle.ewma.cell_count >=
-			pct->fingerprint_ewma.cell_count) {
-	  /* sent over its fair share, penalize by throttling */
-	  or_conn->throttle.bandwidthrate = options->PerConnBWFingerprint;
-	  or_conn->throttle.cell_count_penalty = pct->fingerprint_ewma.cell_count *
-			  options->PerConnBWFingerprintPenalty;
+	  /* stop throttling when cell count falls below penalty. the penalty
+	   * may be 0 which indicates we will never stop throttling. */
+	  if(orc->throttle.ewma.cell_count < orc->throttle.cell_count_penalty) {
+	    orc->throttle.bandwidthrate = -1;
+	    orc->throttle.cell_count_penalty = -1.0;
+	  }
 	} else {
-	  /* todo: i think this is redundant...? */
-	  or_conn->throttle.bandwidthrate = -1;
-	  or_conn->throttle.cell_count_penalty = -1.0;
+		/* we were not throttled before, should we be throttled now? */
+	  if(orc->throttle.ewma.cell_count > partition_count &&
+			  intercd > options->PerConnBWFingerprintThreshold) {
+	    /* sent over its fair share, penalize by throttling */
+	    orc->throttle.bandwidthrate = options->PerConnBWFingerprintRate;
+	    /* stop throttling when we reach some fraction of our current EWMA */
+	    orc->throttle.cell_count_penalty = orc->throttle.ewma.cell_count *
+			  options->PerConnBWFingerprintPenalty;
+
+	    /* track the addresses we are throttling
+	     * TODO: there is a much better way to do this */
+        if(options->PerConnBWFingerprintVerbose) {
+          throttled_addresses_len += 20;
+	      char* extended = tor_malloc_zero(throttled_addresses_len);
+	      tor_snprintf(extended, throttled_addresses_len, "%s %s",
+	    		  throttled_addresses, orc->_base.address);
+	      tor_free(throttled_addresses);
+	      throttled_addresses = extended;
+	      extended = NULL;
+        }
+	  }
 	}
 
-	if(or_conn->throttle.bandwidthrate != old_rate) {
-		connection_or_update_token_buckets_helper(or_conn, 0, options);
+	/* need to update the token buckets if our throttle rate changed */
+	if(orc->throttle.bandwidthrate != old_rate) {
+	  connection_or_update_token_buckets_helper(orc, 0, options);
 	}
   });
-  smartlist_free(or_conns);
+
+  if(options->PerConnBWFingerprintVerbose) {
+    log_notice(LD_OR,"partition-count %f intra-dist %f inter-dist %f %s",
+    		partition_count, intracd, intercd, throttled_addresses);
+    tor_free(throttled_addresses);
+  }
+
+  smartlist_free(client_conns);
 }
 
 void
 connection_or_log_cell_counts(smartlist_t *conns) {
   /* get all active connections to non-relays */
-  smartlist_t* or_conns = connection_or_get_active_nonrelay(conns);
+  smartlist_t* or_conns = connection_or_get_active_unthrottled_clients(conns);
 
   /* print out cell counts for each */
   SMARTLIST_FOREACH(or_conns, or_connection_t *, or_conn,

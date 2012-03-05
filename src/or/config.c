@@ -347,8 +347,10 @@ static config_var_t _option_vars[] = {
   V(PerConnBWRate,               MEMUNIT,  "0"),
   V(PerConnHalflife,     		 DOUBLE,   "-1.0"),
   V(PerConnHalflifeVerbose,      BOOL,     "0"),
-  V(PerConnBWFingerprint,        MEMUNIT,     "0"),
+  V(PerConnBWFingerprintRate,    MEMUNIT,     "0"),
+  V(PerConnBWFingerprintThreshold,   DOUBLE,     "0.0"),
   V(PerConnBWFingerprintPenalty, DOUBLE,   "0.0"),
+  V(PerConnBWFingerprintVerbose, BOOL,     "0"),
   V(PidFile,                     STRING,   NULL),
   V(TestingTorNetwork,           BOOL,     "0"),
   V(OptimisticData,              AUTOBOOL, "auto"),
@@ -1426,12 +1428,11 @@ options_act(const or_options_t *old_options)
 
   /* check for the adaptive throttling algorithm settings */
   pc_throttle_globals_t* pct = get_pc_throttle_globals();
-  if(options->PerConnBWFingerprint > 0) {
+  if(options->PerConnBWFingerprintRate > 0) {
 	  pct->fingerprint_throttling_enabled = 1;
-	  memset(&pct->fingerprint_ewma, 0, sizeof(cell_ewma_t));
 	  log_notice(LD_CONFIG,"enabled adaptive throttling using fingerprinting:"
 			  "flagged connections will be throttled at %lu Bps",
-			  options->PerConnBWFingerprint);
+			  options->PerConnBWFingerprintRate);
   } else {
 	  pct->fingerprint_throttling_enabled = 0;
   }

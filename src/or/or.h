@@ -978,18 +978,16 @@ typedef struct {
 } cell_ewma_t;
 
 /**
- * used for adaptive throttling. the throttle is enabled if options->PCBWThreshold
- * is non-zero and active if this connection was one of the loudest
- * options->PerConnBWThreshold fraction of all connections during the last interval.
- * bandwidthrate is set to the minimum transfer rate among all
- * connections with active throttles over the last interval. intervals are given
- * by options->PerConnBWRefresh.
+ * used for adaptive throttling. keep a 'virtual' EWMA counter that represents
+ * a connection only using its 'fair' share of bandwidth and no more.
  */
 typedef struct pc_throttle_t {
   /** connection-level cell counts */
   cell_ewma_t ewma;
-  /** our current adaptive bandwidthrate */
+  /** our current adaptive bandwidthrate, < 0 if not throttled */
   int bandwidthrate;
+  /** stop throttling when EWMA count falls below this count.
+   * otherwise this counter is < 0 if not throttled. */
   double cell_count_penalty;
 } pc_throttle_t;
 
@@ -998,11 +996,8 @@ typedef struct pcbw_globals_t {
   unsigned int perconn_ewma_enabled;
   double perconn_ewma_scale_factor;
   unsigned int perconn_ewma_last_recalibrated;
-
   /* do the fingerprinting algorithm where we try to throttle only bulk flows */
   unsigned int fingerprint_throttling_enabled;
-  /* a "virtual" EWMA that tracks the "fair" connection EWMA over time */
-  cell_ewma_t fingerprint_ewma;
 } pc_throttle_globals_t;
 
 /** Description of a connection to another host or process, and associated
@@ -3116,11 +3111,19 @@ typedef struct {
                                  * use in a second for all relayed conns? */
   uint64_t PerConnBWRate; /**< Long-term bw on a single TLS conn, if set. */
   uint64_t PerConnBWBurst; /**< Allowed burst on a single TLS conn, if set. */
-  double PerConnHalflife; /** keep per connection ewma using this halflife */
-  unsigned int PerConnHalflifeVerbose; /** log per-conn cell counts if non-zero */
-  uint64_t PerConnBWFingerprint; /** adaptively fingerprint and throttle bulk
-  	  connections to this rate if non-zero */
-  double PerConnBWFingerprintPenalty; /** un-flag at this fraction of the fair rate */
+
+  double PerConnHalflife; /** keep per-connection ewma using this halflife */
+  unsigned int PerConnHalflifeVerbose; /** log cell counts if non-zero */
+
+  uint64_t PerConnBWFingerprintRate; /** adaptively throttle connections to this
+      rate if non-zero, using statistical fingerprinting based on clustering */
+  double PerConnBWFingerprintThreshold; /** only throttle if the distance
+      between "high" and "low" bandwidth clusters is > than this threshold */
+  double PerConnBWFingerprintPenalty; /** stop throttling when EWMA falls below
+   	  this fraction of what my EWMA was when throttling began */
+  unsigned int PerConnBWFingerprintVerbose; /** log cluster stats and throttled
+   	  connection IPs if non-zero */
+
   int NumCPUs; /**< How many CPUs should we try to use? */
 //int RunTesting; /**< If true, create testing circuits to measure how well the
 //                 * other ORs are running. */
