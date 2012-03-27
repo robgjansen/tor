@@ -358,6 +358,7 @@ static config_var_t _option_vars[] = {
   OBSOLETE("PathlenCoinWeight"),
   V(PerConnBWBurst,              MEMUNIT,  "0"),
   V(PerConnBWRate,               MEMUNIT,  "0"),
+  V(PerConnSplitBits,            BOOL,     "0"),
   V(PidFile,                     STRING,   NULL),
   V(TestingTorNetwork,           BOOL,     "0"),
   V(OptimisticData,              AUTOBOOL, "auto"),
@@ -1542,6 +1543,11 @@ options_act(const or_options_t *old_options)
 
   /* Change the cell EWMA settings */
   cell_ewma_set_scale_factor(options, networkstatus_get_latest_consensus());
+
+  /* check for the adaptive throttling algorithm settings */
+  if(options->PerConnSplitBits) {
+	  log_notice(LD_CONFIG,"enabled adaptive throttling using bit-splitting");
+  }
 
   /* Check for transitions that need action. */
   if (old_options) {

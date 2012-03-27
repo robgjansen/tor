@@ -959,6 +959,16 @@ typedef struct socks_request_t socks_request_t;
 #define CONTROL_CONNECTION_MAGIC 0x8abc765du
 #define LISTENER_CONNECTION_MAGIC 0x1a1ac741u
 
+/**
+ * used for adaptive throttling. the throttle is enabled if
+ * options->PerConnSplitBits is non-zero and active if this connection has sent
+ * more than the fair split rate of all connections.
+ */
+typedef struct pc_throttle_t {
+  /** our current adaptive bandwidth rate */
+  int bandwidthrate;
+} pc_throttle_t;
+
 /** Description of a connection to another host or process, and associated
  * data.
  *
@@ -1278,6 +1288,7 @@ typedef struct or_connection_t {
   unsigned active_circuit_pqueue_last_recalibrated;
   struct or_connection_t *next_with_same_id; /**< Next connection with same
                                               * identity digest as this one. */
+  pc_throttle_t throttle; /* for adaptive throttling */
 } or_connection_t;
 
 /** Subtype of connection_t for an "edge connection" -- that is, an entry (ap)
@@ -3179,6 +3190,9 @@ typedef struct {
                                  * use in a second for all relayed conns? */
   uint64_t PerConnBWRate; /**< Long-term bw on a single TLS conn, if set. */
   uint64_t PerConnBWBurst; /**< Allowed burst on a single TLS conn, if set. */
+  /** split available bandwidth evenly among all connections if not 0.
+   * bit splitting takes precedence over the adaptive threshold algorithm. */
+  unsigned int PerConnSplitBits;
   int NumCPUs; /**< How many CPUs should we try to use? */
 //int RunTesting; /**< If true, create testing circuits to measure how well the
 //                 * other ORs are running. */

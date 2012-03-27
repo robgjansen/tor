@@ -84,5 +84,7 @@ void var_cell_pack_header(const var_cell_t *cell, char *hdr_out);
 var_cell_t *var_cell_new(uint16_t payload_len);
 void var_cell_free(var_cell_t *cell);
 
+void connection_or_throttle_bitsplitting(smartlist_t *conns, or_options_t *options);
+
 #endif
 
