@@ -74,7 +74,7 @@ AM_CPPFLAGS = -DSHARE_DATADIR="\"$(datadir)\"" \
 tor_LDFLAGS = @TOR_LDFLAGS_zlib@ @TOR_LDFLAGS_openssl@ @TOR_LDFLAGS_libevent@
 tor_LDADD = ./libtor.a ../common/libor.a ../common/libor-crypto.a \
 	../common/libor-event.a \
-	@TOR_ZLIB_LIBS@ -lm @TOR_LIBEVENT_LIBS@ @TOR_OPENSSL_LIBS@ \
+	@TOR_ZLIB_LIBS@ @TOR_LIB_MATH@ @TOR_LIBEVENT_LIBS@ @TOR_OPENSSL_LIBS@ \
 	@TOR_LIB_WS32@ @TOR_LIB_GDI@
 
 noinst_HEADERS = \
@@ -126,8 +126,9 @@ tor_main.o: micro-revision.i
 
 micro-revision.i: FORCE
 	@rm -f micro-revision.tmp;					\
-	if test -d ../../.git && test -x "`which git 2>&1;true`"; then 	\
-	  HASH="`git rev-parse --short=16 HEAD`"; 			\
+	if test -d "$(top_srcdir)/.git" &&				\
+	  test -x "`which git 2>&1;true`"; then				\
+	  HASH="`cd "$(top_srcdir)" && git rev-parse --short=16 HEAD`"; 	\
 	  echo \"$$HASH\" > micro-revision.tmp; 			\
         fi;								\
 	if test ! -f micro-revision.tmp ; then				\
@@ -141,11 +142,11 @@ micro-revision.i: FORCE
 
 or_sha1.i: $(tor_SOURCES) $(libtor_a_SOURCES)
 	if test "@SHA1SUM@" != none; then \
-	  @SHA1SUM@ $(tor_SOURCES) $(libtor_a_SOURCES) | \
-	  @SED@ -n 's/^\(.*\)$$/"\1\\n"/p' > or_sha1.i; \
+	  (cd "$(srcdir)" && "@SHA1SUM@" $(tor_SOURCES) $(libtor_a_SOURCES)) | \
+	  "@SED@" -n 's/^\(.*\)$$/"\1\\n"/p' > or_sha1.i; \
 	elif test "@OPENSSL@" != none; then \
-	  @OPENSSL@ sha1 $(tor_SOURCES) $(libtor_a_SOURCES) | \
-	  @SED@ -n 's/SHA1(\(.*\))= \(.*\)/"\2  \1\\n"/p' > or_sha1.i; \
+	  (cd "$(srcdir)" && "@OPENSSL@" sha1 $(tor_SOURCES) $(libtor_a_SOURCES)) | \
+	  "@SED@" -n 's/SHA1(\(.*\))= \(.*\)/"\2  \1\\n"/p' > or_sha1.i; \
 	else \
 	  rm or_sha1.i; \
 	  touch or_sha1.i; \

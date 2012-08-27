@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -57,10 +57,12 @@ int circuit_append_new_exit(origin_circuit_t *circ, extend_info_t *info);
 int circuit_extend_to_new_exit(origin_circuit_t *circ, extend_info_t *info);
 void onion_append_to_cpath(crypt_path_t **head_ptr, crypt_path_t *new_hop);
 extend_info_t *extend_info_alloc(const char *nickname, const char *digest,
-                                 crypto_pk_env_t *onion_key,
+                                 crypto_pk_t *onion_key,
                                  const tor_addr_t *addr, uint16_t port);
-extend_info_t *extend_info_from_router(const routerinfo_t *r);
-extend_info_t *extend_info_from_node(const node_t *node);
+extend_info_t *extend_info_from_router(const routerinfo_t *r,
+                                       int for_direct_connect);
+extend_info_t *extend_info_from_node(const node_t *node,
+                                     int for_direct_connect);
 extend_info_t *extend_info_dup(extend_info_t *info);
 void extend_info_free(extend_info_t *info);
 const node_t *build_state_get_exit_node(cpath_build_state_t *state);
@@ -98,6 +100,8 @@ int any_pending_bridge_descriptor_fetches(void);
 int entries_known_but_down(const or_options_t *options);
 void entries_retry_all(const or_options_t *options);
 
+int any_bridges_dont_support_microdescriptors(void);
+
 void entry_guards_free_all(void);
 
 extern circuit_build_times_t circ_times;
@@ -117,6 +121,7 @@ int circuit_build_times_needs_circuits(circuit_build_times_t *cbt);
 
 int circuit_build_times_needs_circuits_now(circuit_build_times_t *cbt);
 void circuit_build_times_init(circuit_build_times_t *cbt);
+void circuit_build_times_free_timeouts(circuit_build_times_t *cbt);
 void circuit_build_times_new_consensus_params(circuit_build_times_t *cbt,
                                               networkstatus_t *ns);
 double circuit_build_times_timeout_rate(const circuit_build_times_t *cbt);
@@ -143,6 +148,7 @@ void circuit_build_times_network_is_live(circuit_build_times_t *cbt);
 int circuit_build_times_network_check_live(circuit_build_times_t *cbt);
 void circuit_build_times_network_circ_success(circuit_build_times_t *cbt);
 
+/* DOCDOC circuit_build_times_get_bw_scale */
 int circuit_build_times_get_bw_scale(networkstatus_t *ns);
 
 void clear_transport_list(void);
@@ -150,14 +156,16 @@ int transport_add_from_config(const tor_addr_t *addr, uint16_t port,
                                const char *name, int socks_ver);
 int transport_add(transport_t *t);
 void transport_free(transport_t *transport);
-transport_t *transport_create(const tor_addr_t *addr, uint16_t port,
+transport_t *transport_new(const tor_addr_t *addr, uint16_t port,
                                       const char *name, int socks_ver);
+
+/* DOCDOC find_transport_name_by_bridge_addrport */
+const char *find_transport_name_by_bridge_addrport(const tor_addr_t *addr,
+                                                   uint16_t port);
 
 int find_transport_by_bridge_addrport(const tor_addr_t *addr, uint16_t port,
                                       const transport_t **transport);
 transport_t *transport_get_by_name(const char *name);
-
-int validate_pluggable_transports_config(void);
 
 #endif
 

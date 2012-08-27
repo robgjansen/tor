@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -94,7 +94,9 @@ static int stats_prev_global_read_bucket;
 static int stats_prev_global_write_bucket;
 #endif
 
+/* DOCDOC stats_prev_n_read */
 static uint64_t stats_prev_n_read = 0;
+/* DOCDOC stats_prev_n_written */
 static uint64_t stats_prev_n_written = 0;
 
 /* XXX we might want to keep stats about global_relayed_*_bucket too. Or not.*/
@@ -196,6 +198,26 @@ free_old_inbuf(connection_t *conn)
 }
 #endif
 
+#if defined(_WIN32) && defined(USE_BUFFEREVENTS)
+/** Remove the kernel-space send and receive buffers for <b>s</b>. For use
+ * with IOCP only. */
+static int
+set_buffer_lengths_to_zero(tor_socket_t s)
+{
+  int zero = 0;
+  int r = 0;
+  if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, (void*)&zero, sizeof(zero))) {
+    log_warn(LD_NET, "Unable to clear SO_SNDBUF");
+    r = -1;
+  }
+  if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, (void*)&zero, sizeof(zero))) {
+    log_warn(LD_NET, "Unable to clear SO_RCVBUF");
+    r = -1;
+  }
+  return r;
+}
+#endif
+
 /** Add <b>conn</b> to the array of connections that we can poll on.  The
  * connection's socket must be set; the connection starts out
  * non-reading and non-writing.
@@ -216,6 +238,14 @@ connection_add_impl(connection_t *conn, int is_connecting)
 #ifdef USE_BUFFEREVENTS
   if (connection_type_uses_bufferevent(conn)) {
     if (SOCKET_OK(conn->s) && !conn->linked) {
+
+#ifdef _WIN32
+      if (tor_libevent_using_iocp_bufferevents() &&
+          get_options()->UserspaceIOCPBuffers) {
+        set_buffer_lengths_to_zero(conn->s);
+      }
+#endif
+
       conn->bufev = bufferevent_socket_new(
                          tor_libevent_get_base(),
                          conn->s,
@@ -403,7 +433,7 @@ smartlist_t *
 get_connection_array(void)
 {
   if (!connection_array)
-    connection_array = smartlist_create();
+    connection_array = smartlist_new();
   return connection_array;
 }
 
@@ -415,6 +445,7 @@ get_bytes_read(void)
   return stats_n_bytes_read;
 }
 
+/* DOCDOC get_bytes_written */
 uint64_t
 get_bytes_written(void)
 {
@@ -673,7 +704,7 @@ conn_read_callback(evutil_socket_t fd, short event, void *_conn)
 
   if (connection_handle_read(conn) < 0) {
     if (!conn->marked_for_close) {
-#ifndef MS_WINDOWS
+#ifndef _WIN32
       log_warn(LD_BUG,"Unhandled error on read for %s connection "
                "(fd %d); removing",
                conn_type_to_string(conn->type), (int)conn->s);
@@ -817,6 +848,42 @@ conn_close_if_marked(int i)
                            "Holding conn (fd %d) open for more flushing.",
                            (int)conn->s));
         conn->timestamp_lastwritten = now; /* reset so we can flush more */
+      } else if (sz == 0) {
+        /* Also, retval==0.  If we get here, we didn't want to write anything
+         * (because of rate-limiting) and we didn't. */
+
+        /* Connection must flush before closing, but it's being rate-limited.
+         * Let's remove from Libevent, and mark it as blocked on bandwidth
+         * so it will be re-added on next token bucket refill. Prevents
+         * busy Libevent loops where we keep ending up here and returning
+         * 0 until we are no longer blocked on bandwidth.
+         */
+        if (connection_is_writing(conn)) {
+          conn->write_blocked_on_bw = 1;
+          connection_stop_writing(conn);
+        }
+        if (connection_is_reading(conn)) {
+          /* XXXX024 We should make this code unreachable; if a connection is
+           * marked for close and flushing, there is no point in reading to it
+           * at all. Further, checking at this point is a bit of a hack: it
+           * would make much more sense to react in
+           * connection_handle_read_impl, or to just stop reading in
+           * mark_and_flush */
+#if 0
+#define MARKED_READING_RATE 180
+          static ratelim_t marked_read_lim = RATELIM_INIT(MARKED_READING_RATE);
+          char *m;
+          if ((m = rate_limit_log(&marked_read_lim, now))) {
+            log_warn(LD_BUG, "Marked connection (fd %d, type %s, state %s) "
+                     "is still reading; that shouldn't happen.%s",
+                     (int)conn->s, conn_type_to_string(conn->type),
+                     conn_state_to_string(conn->type, conn->state), m);
+            tor_free(m);
+          }
+#endif
+          conn->read_blocked_on_bw = 1;
+          connection_stop_reading(conn);
+        }
       }
       return 0;
     }
@@ -906,7 +973,7 @@ directory_info_has_arrived(time_t now, int from_cache)
       update_extrainfo_downloads(now);
   }
 
-  if (server_mode(options) && !we_are_hibernating() && !from_cache &&
+  if (server_mode(options) && !net_is_disabled() && !from_cache &&
       (can_complete_circuit || !any_predicted_circuits(now)))
     consider_testing_reachability(1, 1);
 }
@@ -1087,7 +1154,6 @@ run_scheduled_events(time_t now)
   static int should_init_bridge_stats = 1;
   static time_t time_to_retry_dns_init = 0;
   static time_t time_to_next_heartbeat = 0;
-  static int has_validated_pt = 0;
   const or_options_t *options = get_options();
 
   int is_server = server_mode(options);
@@ -1133,11 +1199,11 @@ run_scheduled_events(time_t now)
     if (router_rebuild_descriptor(1)<0) {
       log_info(LD_CONFIG, "Couldn't rebuild router descriptor");
     }
-    if (advertised_server_mode())
+    if (advertised_server_mode() & !options->DisableNetwork)
       router_upload_dir_desc_to_dirservers(0);
   }
 
-  if (time_to_try_getting_descriptors < now) {
+  if (!options->DisableNetwork && time_to_try_getting_descriptors < now) {
     update_all_descriptor_downloads(now);
     update_extrainfo_downloads(now);
     if (router_have_minimum_dir_info())
@@ -1161,10 +1227,7 @@ run_scheduled_events(time_t now)
     last_rotated_x509_certificate = now;
   if (last_rotated_x509_certificate+MAX_SSL_KEY_LIFETIME_INTERNAL < now) {
     log_info(LD_GENERAL,"Rotating tls context.");
-    if (tor_tls_context_init(public_server_mode(options),
-                             get_tlsclient_identity_key(),
-                             is_server ? get_server_identity_key() : NULL,
-                             MAX_SSL_KEY_LIFETIME_ADVERTISED) < 0) {
+    if (router_initialize_tls_context() < 0) {
       log_warn(LD_BUG, "Error reinitializing TLS context");
       /* XXX is it a bug here, that we just keep going? -RD */
     }
@@ -1191,7 +1254,7 @@ run_scheduled_events(time_t now)
 
   if (time_to_launch_reachability_tests < now &&
       (authdir_mode_tests_reachability(options)) &&
-       !we_are_hibernating()) {
+       !net_is_disabled()) {
     time_to_launch_reachability_tests = now + REACHABILITY_TEST_INTERVAL;
     /* try to determine reachability of the other Tor relays */
     dirserv_test_reachability(now);
@@ -1327,7 +1390,7 @@ run_scheduled_events(time_t now)
 
   /* 2b. Once per minute, regenerate and upload the descriptor if the old
    * one is inaccurate. */
-  if (time_to_check_descriptor < now) {
+  if (time_to_check_descriptor < now && !options->DisableNetwork) {
     static int dirport_reachability_count = 0;
     time_to_check_descriptor = now + CHECK_DESCRIPTOR_INTERVAL;
     check_descriptor_bandwidth_changed(now);
@@ -1383,11 +1446,8 @@ run_scheduled_events(time_t now)
    *    We do this before step 4, so it can try building more if
    *    it's not comfortable with the number of available circuits.
    */
-  /* XXXX022 If our circuit build timeout is much lower than a second, maybe
-   * we should do this more often? -NM
-   * It can't be lower than 1.5 seconds currently; see
-   * circuit_build_times_min_timeout(). -RD
-   */
+  /* (If our circuit build timeout can ever become lower than a second (which
+   * it can't, currently), we should do this more often.) */
   circuit_expire_building();
 
   /** 3b. Also look at pending streams and prune the ones that 'began'
@@ -1402,8 +1462,8 @@ run_scheduled_events(time_t now)
   connection_expire_held_open();
 
   /** 3d. And every 60 seconds, we relaunch listeners if any died. */
-  if (!we_are_hibernating() && time_to_check_listeners < now) {
-    retry_all_listeners(NULL, NULL);
+  if (!net_is_disabled() && time_to_check_listeners < now) {
+    retry_all_listeners(NULL, NULL, 0);
     time_to_check_listeners = now+60;
   }
 
@@ -1413,7 +1473,7 @@ run_scheduled_events(time_t now)
    *    and we make a new circ if there are no clean circuits.
    */
   have_dir_info = router_have_minimum_dir_info();
-  if (have_dir_info && !we_are_hibernating())
+  if (have_dir_info && !net_is_disabled())
     circuit_build_needed_circs(now);
 
   /* every 10 seconds, but not at the same second as other such events */
@@ -1444,7 +1504,7 @@ run_scheduled_events(time_t now)
   circuit_close_all_marked();
 
   /** 7. And upload service descriptors if necessary. */
-  if (can_complete_circuit && !we_are_hibernating()) {
+  if (can_complete_circuit && !net_is_disabled()) {
     rend_consider_services_upload(now);
     rend_consider_descriptor_republication();
   }
@@ -1461,7 +1521,8 @@ run_scheduled_events(time_t now)
 
   /** 9. and if we're a server, check whether our DNS is telling stories to
    * us. */
-  if (public_server_mode(options) && time_to_check_for_correct_dns < now) {
+  if (!net_is_disabled() &&
+      public_server_mode(options) && time_to_check_for_correct_dns < now) {
     if (!time_to_check_for_correct_dns) {
       time_to_check_for_correct_dns = now + 60 + crypto_rand_int(120);
     } else {
@@ -1480,32 +1541,26 @@ run_scheduled_events(time_t now)
   }
 
   /** 11. check the port forwarding app */
-  if (time_to_check_port_forwarding < now &&
+  if (!net_is_disabled() &&
+      time_to_check_port_forwarding < now &&
       options->PortForwarding &&
       is_server) {
 #define PORT_FORWARDING_CHECK_INTERVAL 5
+    /* XXXXX this should take a list of ports, not just two! */
     tor_check_port_forwarding(options->PortForwardingHelper,
-                              options->DirPort,
-                              options->ORPort,
+                              get_primary_dir_port(),
+                              get_primary_or_port(),
                               now);
     time_to_check_port_forwarding = now+PORT_FORWARDING_CHECK_INTERVAL;
   }
 
   /** 11b. check pending unconfigured managed proxies */
-  if (pt_proxies_configuration_pending())
+  if (!net_is_disabled() && pt_proxies_configuration_pending())
     pt_configure_remaining_proxies();
-
-  /** 11c. validate pluggable transports configuration if we need to */
-  if (!has_validated_pt &&
-      (options->Bridges || options->ClientTransportPlugin)) {
-    if (validate_pluggable_transports_config() == 0) {
-      has_validated_pt = 1;
-    }
-  }
 
   /** 12. write the heartbeat message */
   if (options->HeartbeatPeriod &&
-      time_to_next_heartbeat < now) {
+      time_to_next_heartbeat <= now) {
     log_heartbeat(now);
     time_to_next_heartbeat = now+options->HeartbeatPeriod;
   }
@@ -1564,7 +1619,7 @@ second_elapsed_callback(periodic_timer_t *timer, void *arg)
   control_event_stream_bandwidth_used();
 
   if (server_mode(options) &&
-      !we_are_hibernating() &&
+      !net_is_disabled() &&
       seconds_elapsed > 0 &&
       can_complete_circuit &&
       stats_n_seconds_working / TIMEOUT_UNTIL_UNREACHABILITY_COMPLAINT !=
@@ -1661,7 +1716,7 @@ refill_callback(periodic_timer_t *timer, void *arg)
 }
 #endif
 
-#ifndef MS_WINDOWS
+#ifndef _WIN32
 /** Called when a possibly ignorable libevent error occurs; ensures that we
  * don't get into an infinite loop by ignoring too many errors from
  * libevent. */
@@ -1745,8 +1800,16 @@ do_hup(void)
     }
     options = get_options(); /* they have changed now */
   } else {
+    char *msg = NULL;
     log_notice(LD_GENERAL, "Not reloading config file: the controller told "
                "us not to.");
+    /* Make stuff get rescanned, reloaded, etc. */
+    if (set_options((or_options_t*)options, &msg) < 0) {
+      if (!msg)
+        msg = tor_strdup("Unknown error");
+      log_warn(LD_GENERAL, "Unable to re-set previous options: %s", msg);
+      tor_free(msg);
+    }
   }
   if (authdir_mode_handles_descs(options, -1)) {
     /* reload the approved-routers file */
@@ -1765,7 +1828,8 @@ do_hup(void)
   /* retry appropriate downloads */
   router_reset_status_download_failures();
   router_reset_descriptor_download_failures();
-  update_networkstatus_downloads(time(NULL));
+  if (!options->DisableNetwork)
+    update_networkstatus_downloads(time(NULL));
 
   /* We'll retry routerstatus downloads in about 10 seconds; no need to
    * force a retry there. */
@@ -1879,7 +1943,7 @@ do_main_loop(void)
     if (nt_service_is_stopping())
       return 0;
 
-#ifndef MS_WINDOWS
+#ifndef _WIN32
     /* Make it easier to tell whether libevent failure is our fault or not. */
     errno = 0;
 #endif
@@ -1903,7 +1967,7 @@ do_main_loop(void)
         log_err(LD_NET,"libevent call with %s failed: %s [%d]",
                 tor_libevent_get_method(), tor_socket_strerror(e), e);
         return -1;
-#ifndef MS_WINDOWS
+#ifndef _WIN32
       } else if (e == EINVAL) {
         log_warn(LD_NET, "EINVAL from libevent: should you upgrade libevent?");
         if (got_libevent_error())
@@ -1922,7 +1986,7 @@ do_main_loop(void)
   }
 }
 
-#ifndef MS_WINDOWS /* Only called when we're willing to use signals */
+#ifndef _WIN32 /* Only called when we're willing to use signals */
 /** Libevent callback: invoked when we get a signal.
  */
 static void
@@ -2041,8 +2105,7 @@ dumpstats(int severity)
 
   log(severity, LD_GENERAL, "Dumping stats:");
 
-  SMARTLIST_FOREACH(connection_array, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(connection_array, connection_t *, conn) {
     int i = conn_sl_idx;
     log(severity, LD_GENERAL,
         "Conn %d (socket %d) type %d (%s), state %d (%s), created %d secs ago",
@@ -2080,7 +2143,7 @@ dumpstats(int severity)
     }
     circuit_dump_by_conn(conn, severity); /* dump info about all the circuits
                                            * using this conn */
-  });
+  } SMARTLIST_FOREACH_END(conn);
   log(severity, LD_NET,
       "Cells processed: "U64_FORMAT" padding\n"
       "                 "U64_FORMAT" create\n"
@@ -2139,7 +2202,7 @@ exit_function(void)
 {
   /* NOTE: If we ever daemonize, this gets called immediately.  That's
    * okay for now, because we only use this on Windows.  */
-#ifdef MS_WINDOWS
+#ifdef _WIN32
   WSACleanup();
 #endif
 }
@@ -2148,7 +2211,7 @@ exit_function(void)
 void
 handle_signals(int is_parent)
 {
-#ifndef MS_WINDOWS /* do signal stuff only on Unix */
+#ifndef _WIN32 /* do signal stuff only on Unix */
   int i;
   static const int signals[] = {
     SIGINT,  /* do a controlled slow shutdown */
@@ -2201,11 +2264,11 @@ tor_init(int argc, char *argv[])
   int i, quiet = 0;
   time_of_process_start = time(NULL);
   if (!connection_array)
-    connection_array = smartlist_create();
+    connection_array = smartlist_new();
   if (!closeable_connection_lst)
-    closeable_connection_lst = smartlist_create();
+    closeable_connection_lst = smartlist_new();
   if (!active_linked_connection_lst)
-    active_linked_connection_lst = smartlist_create();
+    active_linked_connection_lst = smartlist_new();
   /* Have the log set up with our application name. */
   tor_snprintf(buf, sizeof(buf), "Tor %s", get_version());
   log_set_application_name(buf);
@@ -2237,14 +2300,28 @@ tor_init(int argc, char *argv[])
   }
   quiet_level = quiet;
 
-  log(LOG_NOTICE, LD_GENERAL, "Tor v%s%s. This is experimental software. "
-      "Do not rely on it for strong anonymity. (Running on %s)", get_version(),
+  {
+    const char *version = get_version();
 #ifdef USE_BUFFEREVENTS
-      " (with bufferevents)",
+    log_notice(LD_GENERAL, "Tor v%s (with bufferevents) running on %s.",
+                version, get_uname());
 #else
-      "",
+    log_notice(LD_GENERAL, "Tor v%s running on %s.", version, get_uname());
 #endif
-      get_uname());
+
+    log_notice(LD_GENERAL, "Tor can't help you if you use it wrong! "
+               "Learn how to be safe at "
+               "https://www.torproject.org/download/download#warning");
+
+    if (strstr(version, "alpha") || strstr(version, "beta"))
+      log_notice(LD_GENERAL, "This version is not a stable Tor release. "
+                 "Expect more bugs than usual.");
+  }
+
+#ifdef NON_ANONYMOUS_MODE_ENABLED
+  log(LOG_WARN, LD_GENERAL, "This copy of Tor was compiled to run in a "
+      "non-anonymous mode. It will provide NO ANONYMITY.");
+#endif
 
   if (network_init()<0) {
     log_err(LD_BUG,"Error initializing network; exiting.");
@@ -2257,7 +2334,7 @@ tor_init(int argc, char *argv[])
     return -1;
   }
 
-#ifndef MS_WINDOWS
+#ifndef _WIN32
   if (geteuid()==0)
     log_warn(LD_GENERAL,"You are running Tor as root. You don't need to, "
              "and you probably shouldn't.");
@@ -2299,7 +2376,7 @@ try_locking(const or_options_t *options, int err_if_locked)
         log_warn(LD_GENERAL, "It looks like another Tor process is running "
                  "with the same data directory.  Waiting 5 seconds to see "
                  "if it goes away.");
-#ifndef WIN32
+#ifndef _WIN32
         sleep(5);
 #else
         Sleep(5000);
@@ -2434,7 +2511,7 @@ tor_cleanup(void)
 do_list_fingerprint(void)
 {
   char buf[FINGERPRINT_LEN+1];
-  crypto_pk_env_t *k;
+  crypto_pk_t *k;
   const char *nickname = get_options()->Nickname;
   if (!server_mode(get_options())) {
     log_err(LD_GENERAL,
@@ -2519,8 +2596,7 @@ tor_main(int argc, char *argv[])
   // a file on a folder shared by the wm emulator.
   // if no flashcard (real or emulated) is present,
   // log files will be written in the root folder
-  if (find_flashcard_path(path,MAX_PATH) == -1)
-  {
+  if (find_flashcard_path(path,MAX_PATH) == -1) {
     redir = _wfreopen( L"\\stdout.log", L"w", stdout );
     redirdbg = _wfreopen( L"\\stderr.log", L"w", stderr );
   } else {
@@ -2535,7 +2611,7 @@ tor_main(int argc, char *argv[])
   }
 #endif
 
-#ifdef MS_WINDOWS
+#ifdef _WIN32
   /* Call SetProcessDEPPolicy to permanently enable DEP.
      The function will not resolve on earlier versions of Windows,
      and failure is not dangerous. */

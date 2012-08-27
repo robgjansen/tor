@@ -1,5 +1,5 @@
 /* Copyright (c) 2010, Jacob Appelbaum, Steven J. Murdoch.
- * Copyright (c) 2010-2011, The Tor Project, Inc. */
+ * Copyright (c) 2010-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -9,14 +9,21 @@
 
 #include "orconfig.h"
 #ifdef NAT_PMP
+#ifdef _WIN32
+#define STATICLIB
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#ifndef _WIN32
 #include <arpa/inet.h>
+#endif
 
 // debugging stuff
 #include <assert.h>
+
+#include "compat.h"
 
 #include "tor-fw-helper.h"
 #include "tor-fw-helper-natpmp.h"
@@ -82,7 +89,7 @@ tor_natpmp_cleanup(tor_fw_options_t *tor_fw_options, void *backend_state)
 
 /** Use select() to wait until we can read on fd. */
 static int
-wait_until_fd_readable(int fd, struct timeval *timeout)
+wait_until_fd_readable(tor_socket_t fd, struct timeval *timeout)
 {
   int r;
   fd_set fds;

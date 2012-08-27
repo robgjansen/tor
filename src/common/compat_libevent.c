@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2011, The Tor Project, Inc. */
+/* Copyright (c) 2009-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -6,9 +6,8 @@
  * \brief Wrappers to handle porting between different versions of libevent.
  *
  * In an ideal world, we'd just use Libevent 2.0 from now on.  But as of June
- * 2009, Libevent 2.0 is still in alpha, and we will have old versions of
- * Libevent for the forseeable future.
- **/
+ * 2012, Libevent 1.4 is still all over, and some poor souls are stuck on
+ * Libevent 1.3e. */
 
 #include "orconfig.h"
 #include "compat.h"
@@ -57,7 +56,7 @@ typedef uint32_t le_version_t;
 
 static le_version_t tor_get_libevent_version(const char **v_out);
 
-#ifdef HAVE_EVENT_SET_LOG_CALLBACK
+#if defined(HAVE_EVENT_SET_LOG_CALLBACK) || defined(RUNNING_DOXYGEN)
 /** A string which, if it appears in a libevent log, should be ignored. */
 static const char *suppress_msg = NULL;
 /** Callback function passed to event_set_log() so we can intercept
@@ -205,7 +204,7 @@ tor_libevent_initialize(tor_libevent_cfg *torcfg)
     cfg = event_config_new();
     tor_assert(cfg);
 
-#if defined(MS_WINDOWS) && defined(USE_BUFFEREVENTS)
+#if defined(_WIN32) && defined(USE_BUFFEREVENTS)
     if (! torcfg->disable_iocp) {
       evthread_use_windows_threads();
       event_config_set_flag(cfg, EVENT_BASE_FLAG_STARTUP_IOCP);
@@ -241,10 +240,10 @@ tor_libevent_initialize(tor_libevent_cfg *torcfg)
       /* This could be a socketpair() failure, which can happen sometimes on
        * windows boxes with obnoxious firewall rules.  Downgrade and try
        * again. */
-#if defined(MS_WINDOWS) && defined(USE_BUFFEREVENTS)
+#if defined(_WIN32) && defined(USE_BUFFEREVENTS)
       if (torcfg->disable_iocp == 0) {
-        log_warn(LD_GENERAL, "Unable to initialize Libevent. Trying again with "
-                 "IOCP disabled.");
+        log_warn(LD_GENERAL, "Unable to initialize Libevent. Trying again "
+                 "with IOCP disabled.");
       } else
 #endif
       {
@@ -254,7 +253,6 @@ tor_libevent_initialize(tor_libevent_cfg *torcfg)
       torcfg->disable_iocp = 1;
       goto retry;
     }
-
   }
 #else
   the_event_base = event_init();
@@ -688,6 +686,41 @@ tor_add_bufferevent_to_rate_limit_group(struct bufferevent *bev,
                                         struct bufferevent_rate_limit_group *g)
 {
   return bufferevent_add_to_rate_limit_group(tor_get_root_bufferevent(bev), g);
+}
+#endif
+
+#if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= V(2,1,1)
+void
+tor_gettimeofday_cached(struct timeval *tv)
+{
+  event_base_gettimeofday_cached(the_event_base, tv);
+}
+void
+tor_gettimeofday_cache_clear(void)
+{
+  event_base_update_cache_time(the_event_base);
+}
+#else
+/** Cache the current hi-res time; the cache gets reset when libevent
+ * calls us. */
+static struct timeval cached_time_hires = {0, 0};
+
+/** Return a fairly recent view of the current time. */
+void
+tor_gettimeofday_cached(struct timeval *tv)
+{
+  if (cached_time_hires.tv_sec == 0) {
+    tor_gettimeofday(&cached_time_hires);
+  }
+  *tv = cached_time_hires;
+}
+
+/** Reset the cached view of the current time, so that the next time we try
+ * to learn it, we will get an up-to-date value. */
+void
+tor_gettimeofday_cache_clear(void)
+{
+  cached_time_hires.tv_sec = 0;
 }
 #endif
 

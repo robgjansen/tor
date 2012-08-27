@@ -1,7 +1,7 @@
 /* Copyright 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -39,6 +39,7 @@ static smartlist_t *circuits_pending_or_conns=NULL;
 static void circuit_free(circuit_t *circ);
 static void circuit_free_cpath(crypt_path_t *cpath);
 static void circuit_free_cpath_node(crypt_path_t *victim);
+static void cpath_ref_decref(crypt_path_reference_t *cpath_ref);
 
 /********* END VARIABLES ************/
 
@@ -201,7 +202,7 @@ circuit_set_state(circuit_t *circ, uint8_t state)
   if (state == circ->state)
     return;
   if (!circuits_pending_or_conns)
-    circuits_pending_or_conns = smartlist_create();
+    circuits_pending_or_conns = smartlist_new();
   if (circ->state == CIRCUIT_STATE_OR_WAIT) {
     /* remove from waiting-circuit list. */
     smartlist_remove(circuits_pending_or_conns, circ);
@@ -268,7 +269,7 @@ int
 circuit_count_pending_on_or_conn(or_connection_t *or_conn)
 {
   int cnt;
-  smartlist_t *sl = smartlist_create();
+  smartlist_t *sl = smartlist_new();
   circuit_get_all_pending_on_or_conn(sl, or_conn);
   cnt = smartlist_len(sl);
   smartlist_free(sl);
@@ -376,6 +377,63 @@ circuit_purpose_to_controller_string(uint8_t purpose)
       tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
       return buf;
   }
+}
+
+/** Return a string specifying the state of the hidden-service circuit
+ * purpose <b>purpose</b>, or NULL if <b>purpose</b> is not a
+ * hidden-service-related circuit purpose. */
+const char *
+circuit_purpose_to_controller_hs_state_string(uint8_t purpose)
+{
+  switch (purpose)
+    {
+    default:
+      log_fn(LOG_WARN, LD_BUG,
+             "Unrecognized circuit purpose: %d",
+             (int)purpose);
+      tor_fragile_assert();
+      /* fall through */
+
+    case CIRCUIT_PURPOSE_OR:
+    case CIRCUIT_PURPOSE_C_GENERAL:
+    case CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT:
+    case CIRCUIT_PURPOSE_TESTING:
+    case CIRCUIT_PURPOSE_CONTROLLER:
+      return NULL;
+
+    case CIRCUIT_PURPOSE_INTRO_POINT:
+      return "OR_HSSI_ESTABLISHED";
+    case CIRCUIT_PURPOSE_REND_POINT_WAITING:
+      return "OR_HSCR_ESTABLISHED";
+    case CIRCUIT_PURPOSE_REND_ESTABLISHED:
+      return "OR_HS_R_JOINED";
+
+    case CIRCUIT_PURPOSE_C_INTRODUCING:
+      return "HSCI_CONNECTING";
+    case CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT:
+      return "HSCI_INTRO_SENT";
+    case CIRCUIT_PURPOSE_C_INTRODUCE_ACKED:
+      return "HSCI_DONE";
+
+    case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
+      return "HSCR_CONNECTING";
+    case CIRCUIT_PURPOSE_C_REND_READY:
+      return "HSCR_ESTABLISHED_IDLE";
+    case CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED:
+      return "HSCR_ESTABLISHED_WAITING";
+    case CIRCUIT_PURPOSE_C_REND_JOINED:
+      return "HSCR_JOINED";
+
+    case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
+      return "HSSI_CONNECTING";
+    case CIRCUIT_PURPOSE_S_INTRO:
+      return "HSSI_ESTABLISHED";
+
+    case CIRCUIT_PURPOSE_S_CONNECT_REND:
+      return "HSSR_CONNECTING";
+    case CIRCUIT_PURPOSE_S_REND_JOINED:
+      return "HSSR_JOINED";
+    }
 }
 
 /** Return a human-readable string for the circuit purpose <b>purpose</b>. */
@@ -543,12 +601,13 @@ circuit_free(circuit_t *circ)
     if (ocirc->build_state) {
         extend_info_free(ocirc->build_state->chosen_exit);
         circuit_free_cpath_node(ocirc->build_state->pending_final_cpath);
+        cpath_ref_decref(ocirc->build_state->service_pending_final_cpath_ref);
     }
     tor_free(ocirc->build_state);
 
     circuit_free_cpath(ocirc->cpath);
 
-    crypto_free_pk_env(ocirc->intro_key);
+    crypto_pk_free(ocirc->intro_key);
     rend_data_free(ocirc->rend_data);
 
     tor_free(ocirc->dest_address);
@@ -569,10 +628,10 @@ circuit_free(circuit_t *circ)
     memlen = sizeof(or_circuit_t);
     tor_assert(circ->magic == OR_CIRCUIT_MAGIC);
 
-    crypto_free_cipher_env(ocirc->p_crypto);
-    crypto_free_digest_env(ocirc->p_digest);
-    crypto_free_cipher_env(ocirc->n_crypto);
-    crypto_free_digest_env(ocirc->n_digest);
+    crypto_cipher_free(ocirc->p_crypto);
+    crypto_digest_free(ocirc->p_digest);
+    crypto_cipher_free(ocirc->n_crypto);
+    crypto_digest_free(ocirc->n_digest);
 
     if (ocirc->rend_splice) {
       or_circuit_t *other = ocirc->rend_splice;
@@ -655,15 +714,27 @@ circuit_free_cpath_node(crypt_path_t *victim)
   if (!victim)
     return;
 
-  crypto_free_cipher_env(victim->f_crypto);
-  crypto_free_cipher_env(victim->b_crypto);
-  crypto_free_digest_env(victim->f_digest);
-  crypto_free_digest_env(victim->b_digest);
+  crypto_cipher_free(victim->f_crypto);
+  crypto_cipher_free(victim->b_crypto);
+  crypto_digest_free(victim->f_digest);
+  crypto_digest_free(victim->b_digest);
   crypto_dh_free(victim->dh_handshake_state);
   extend_info_free(victim->extend_info);
 
   memset(victim, 0xBB, sizeof(crypt_path_t)); /* poison memory */
   tor_free(victim);
+}
+
+/** Release a crypt_path_reference_t*, which may be NULL. */
+static void
+cpath_ref_decref(crypt_path_reference_t *cpath_ref)
+{
+  if (cpath_ref != NULL) {
+    if (--(cpath_ref->refcount) == 0) {
+      circuit_free_cpath_node(cpath_ref->cpath);
+      tor_free(cpath_ref);
+    }
+  }
 }
 
 /** A helper function for circuit_dump_by_conn() below. Log a bunch
@@ -873,26 +944,30 @@ circuit_unlink_all_from_or_conn(or_connection_t *conn, int reason)
   }
 }
 
-/** Return a circ such that:
- *  - circ-\>rend_data-\>onion_address is equal to <b>rend_query</b>, and
- *  - circ-\>purpose is equal to <b>purpose</b>.
+/** Return a circ such that
+ *  - circ-\>rend_data-\>onion_address is equal to
+ *    <b>rend_data</b>-\>onion_address,
+ *  - circ-\>rend_data-\>rend_cookie is equal to
+ *    <b>rend_data</b>-\>rend_cookie, and
+ *  - circ-\>purpose is equal to CIRCUIT_PURPOSE_C_REND_READY.
  *
  * Return NULL if no such circuit exists.
  */
 origin_circuit_t *
-circuit_get_by_rend_query_and_purpose(const char *rend_query, uint8_t purpose)
+circuit_get_ready_rend_circ_by_rend_data(const rend_data_t *rend_data)
 {
   circuit_t *circ;
 
-  tor_assert(CIRCUIT_PURPOSE_IS_ORIGIN(purpose));
-
   for (circ = global_circuitlist; circ; circ = circ->next) {
     if (!circ->marked_for_close &&
-        circ->purpose == purpose) {
+        circ->purpose == CIRCUIT_PURPOSE_C_REND_READY) {
       origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
       if (ocirc->rend_data &&
-          !rend_cmp_service_ids(rend_query,
-                                ocirc->rend_data->onion_address))
+          !rend_cmp_service_ids(rend_data->onion_address,
+                                ocirc->rend_data->onion_address) &&
+          tor_memeq(ocirc->rend_data->rend_cookie,
+                    rend_data->rend_cookie,
+                    REND_COOKIE_LEN))
         return ocirc;
     }
   }
@@ -1011,6 +1086,7 @@ circuit_find_to_cannibalize(uint8_t purpose, extend_info_t *info,
           (!need_capacity || circ->build_state->need_capacity) &&
           (internal == circ->build_state->is_internal) &&
           circ->remaining_relay_early_cells &&
+          circ->build_state->desired_path_len == DEFAULT_ROUTE_LEN &&
           !circ->build_state->onehop_tunnel &&
           !circ->isolation_values_set) {
         if (info) {
@@ -1104,7 +1180,7 @@ circuit_mark_all_unused_circs(void)
  * This is useful for letting the user change pseudonyms, so new
  * streams will not be linkable to old streams.
  */
-/* XXX023 this is a bad name for what this function does */
+/* XXX024 this is a bad name for what this function does */
 void
 circuit_expire_all_dirty_circs(void)
 {
@@ -1115,7 +1191,7 @@ circuit_expire_all_dirty_circs(void)
     if (CIRCUIT_IS_ORIGIN(circ) &&
         !circ->marked_for_close &&
         circ->timestamp_dirty)
-      /* XXXX023 This is a screwed-up way to say "This is too dirty
+      /* XXXX024 This is a screwed-up way to say "This is too dirty
        * for new circuits. */
       circ->timestamp_dirty -= options->MaxCircuitDirtiness;
   }
@@ -1218,16 +1294,16 @@ _circuit_mark_for_close(circuit_t *circ, int reason, int line,
   } else if (circ->purpose == CIRCUIT_PURPOSE_C_INTRODUCING &&
              reason != END_CIRC_REASON_TIMEOUT) {
     origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
-    tor_assert(ocirc->build_state->chosen_exit);
-    tor_assert(ocirc->rend_data);
-    log_info(LD_REND, "Failed intro circ %s to %s "
-             "(building circuit to intro point). "
-             "Marking intro point as possibly unreachable.",
-             safe_str_client(ocirc->rend_data->onion_address),
+    if (ocirc->build_state->chosen_exit && ocirc->rend_data) {
+      log_info(LD_REND, "Failed intro circ %s to %s "
+               "(building circuit to intro point). "
+               "Marking intro point as possibly unreachable.",
+               safe_str_client(ocirc->rend_data->onion_address),
            safe_str_client(build_state_get_exit_nickname(ocirc->build_state)));
-    rend_client_report_intro_point_failure(ocirc->build_state->chosen_exit,
-                                           ocirc->rend_data,
-                                           INTRO_POINT_FAILURE_UNREACHABLE);
+      rend_client_report_intro_point_failure(ocirc->build_state->chosen_exit,
+                                             ocirc->rend_data,
+                                             INTRO_POINT_FAILURE_UNREACHABLE);
+    }
   }
   if (circ->n_conn) {
     circuit_clear_cell_queue(circ, circ->n_conn);

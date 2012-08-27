@@ -1,7 +1,8 @@
-/* Copyright (c) 2009-2011, The Tor Project, Inc. */
+/* Copyright (c) 2009-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "or.h"
+#include "circuitbuild.h"
 #include "config.h"
 #include "directory.h"
 #include "dirserv.h"
@@ -79,7 +80,12 @@ dump_microdescriptor(FILE *f, microdesc_t *md, size_t *annotation_len_out)
     char annotation[ISO_TIME_LEN+32];
     format_iso_time(buf, md->last_listed);
     tor_snprintf(annotation, sizeof(annotation), "@last-listed %s\n", buf);
-    fputs(annotation, f);
+    if (fputs(annotation, f) < 0) {
+      log_warn(LD_DIR,
+               "Couldn't write microdescriptor annotation: %s",
+               strerror(ferror(f)));
+      return -1;
+    }
     r += strlen(annotation);
     *annotation_len_out = r;
   } else {
@@ -181,7 +187,7 @@ microdescs_add_to_cache(microdesc_cache_t *cache,
   return added;
 }
 
-/* As microdescs_add_to_cache, but takes a list of micrdescriptors instead of
+/** As microdescs_add_to_cache, but takes a list of micrdescriptors instead of
  * a string to decode.  Frees any members of <b>descriptors</b> that it does
  * not add. */
 smartlist_t *
@@ -206,7 +212,7 @@ microdescs_add_list_to_cache(microdesc_cache_t *cache,
     }
   }
 
-  added = smartlist_create();
+  added = smartlist_new();
   SMARTLIST_FOREACH_BEGIN(descriptors, microdesc_t *, md) {
     microdesc_t *md2;
     md2 = HT_FIND(microdesc_map, &cache->map, md);
@@ -225,9 +231,10 @@ microdescs_add_list_to_cache(microdesc_cache_t *cache,
       size_t annotation_len;
       size = dump_microdescriptor(f, md, &annotation_len);
       if (size < 0) {
-        /* XXX handle errors from dump_microdescriptor() */
-        /* log?  return -1?  die?  coredump the universe? */
-        continue;
+        /* we already warned in dump_microdescriptor; */
+        abort_writing_to_file(open_file);
+        smartlist_clear(added);
+        return added;
       }
       md->saved_location = SAVED_IN_JOURNAL;
       cache->journal_len += size;
@@ -366,8 +373,8 @@ microdesc_cache_clean(microdesc_cache_t *cache, time_t cutoff, int force)
   }
 
   if (dropped) {
-    log_notice(LD_DIR, "Removed %d/%d microdescriptors as old.",
-               dropped,dropped+kept);
+    log_info(LD_DIR, "Removed %d/%d microdescriptors as old.",
+             dropped,dropped+kept);
     cache->bytes_dropped += bytes_dropped;
   }
 }
@@ -428,7 +435,7 @@ microdesc_cache_rebuild(microdesc_cache_t *cache, int force)
   if (!f)
     return -1;
 
-  wrote = smartlist_create();
+  wrote = smartlist_new();
 
   HT_FOREACH(mdp, microdesc_map, &cache->map) {
     microdesc_t *md = *mdp;
@@ -470,7 +477,7 @@ microdesc_cache_rebuild(microdesc_cache_t *cache, int force)
     md->body = (char*)cache->cache_content->data + md->off;
     if (PREDICT_UNLIKELY(
              md->bodylen < 9 || fast_memneq(md->body, "onion-key", 9) != 0)) {
-      /* XXXX023 once bug 2022 is solved, we can kill this block and turn it
+      /* XXXX once bug 2022 is solved, we can kill this block and turn it
        * into just the tor_assert(!memcmp) */
       off_t avail = cache->cache_content->size - md->off;
       char *bad_str;
@@ -566,7 +573,7 @@ microdesc_free(microdesc_t *md)
   //tor_assert(md->held_by_nodes == 0);
 
   if (md->onion_pkey)
-    crypto_free_pk_env(md->onion_pkey);
+    crypto_pk_free(md->onion_pkey);
   if (md->body && md->saved_location != SAVED_IN_CACHE)
     tor_free(md->body);
 
@@ -624,7 +631,7 @@ smartlist_t *
 microdesc_list_missing_digest256(networkstatus_t *ns, microdesc_cache_t *cache,
                                  int downloadable_only, digestmap_t *skip)
 {
-  smartlist_t *result = smartlist_create();
+  smartlist_t *result = smartlist_new();
   time_t now = time(NULL);
   tor_assert(ns->flavor == FLAV_MICRODESC);
   SMARTLIST_FOREACH_BEGIN(ns->routerstatus_list, routerstatus_t *, rs) {
@@ -636,8 +643,13 @@ microdesc_list_missing_digest256(networkstatus_t *ns, microdesc_cache_t *cache,
       continue;
     if (skip && digestmap_get(skip, rs->descriptor_digest))
       continue;
-    if (tor_mem_is_zero(rs->descriptor_digest, DIGEST256_LEN))
-      continue; /* This indicates a bug somewhere XXXX023*/
+    if (tor_mem_is_zero(rs->descriptor_digest, DIGEST256_LEN)) {
+      log_info(LD_BUG, "Found an entry in networkstatus with no "
+               "microdescriptor digest. (Router %s=%s at %s:%d.)",
+               rs->nickname, hex_str(rs->identity_digest, DIGEST_LEN),
+               fmt_addr32(rs->addr), rs->or_port);
+      continue;
+    }
     /* XXXX Also skip if we're a noncache and wouldn't use this router.
      * XXXX NM Microdesc
      */
@@ -720,8 +732,14 @@ we_use_microdescriptors_for_circuits(const or_options_t *options)
   int ret = options->UseMicrodescriptors;
   if (ret == -1) {
     /* UseMicrodescriptors is "auto"; we need to decide: */
-    /* So we decide that we'll use microdescriptors iff we are not a server,
-     * and we're not autofetching everything. */
+    /* If we are configured to use bridges and one of our bridges doesn't
+     * know what a microdescriptor is, the answer is no. */
+    if (options->UseBridges && any_bridges_dont_support_microdescriptors())
+      return 0;
+    /* Otherwise, we decide that we'll use microdescriptors iff we are
+     * not a server, and we're not autofetching everything. */
+    /* XXX023 what does not being a server have to do with it? also there's
+     * a partitioning issue here where bridges differ from clients. */
     ret = !server_mode(options) && !options->FetchUselessDescriptors;
   }
   return ret;

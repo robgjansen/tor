@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -108,7 +108,7 @@ chunk_repack(chunk_t *chunk)
   chunk->data = &chunk->mem[0];
 }
 
-#ifdef ENABLE_BUF_FREELISTS
+#if defined(ENABLE_BUF_FREELISTS) || defined(RUNNING_DOXYGEN)
 /** A freelist of chunks. */
 typedef struct chunk_freelist_t {
   size_t alloc_size; /**< What size chunks does this freelist hold? */
@@ -401,9 +401,10 @@ buf_pullup(buf_t *buf, size_t bytes, int nulterminate)
 
   if (buf->head->memlen >= capacity) {
     /* We don't need to grow the first chunk, but we might need to repack it.*/
-    if (CHUNK_REMAINING_CAPACITY(buf->head) < capacity-buf->datalen)
+    size_t needed = capacity - buf->head->datalen;
+    if (CHUNK_REMAINING_CAPACITY(buf->head) < needed)
       chunk_repack(buf->head);
-    tor_assert(CHUNK_REMAINING_CAPACITY(buf->head) >= capacity-buf->datalen);
+    tor_assert(CHUNK_REMAINING_CAPACITY(buf->head) >= needed);
   } else {
     chunk_t *newhead;
     size_t newsize;
@@ -632,7 +633,7 @@ read_to_chunk(buf_t *buf, chunk_t *chunk, tor_socket_t fd, size_t at_most,
   if (read_result < 0) {
     int e = tor_socket_errno(fd);
     if (!ERRNO_IS_EAGAIN(e)) { /* it's a real error */
-#ifdef MS_WINDOWS
+#ifdef _WIN32
       if (e == WSAENOBUFS)
         log_warn(LD_NET,"recv() failed: WSAENOBUFS. Not enough ram?");
 #endif
@@ -676,12 +677,12 @@ read_to_chunk_tls(buf_t *buf, chunk_t *chunk, tor_tls_t *tls,
  * (because of EOF), set *<b>reached_eof</b> to 1 and return 0. Return -1 on
  * error; else return the number of bytes read.
  */
-/* XXXX023 indicate "read blocked" somehow? */
+/* XXXX024 indicate "read blocked" somehow? */
 int
 read_to_buf(tor_socket_t s, size_t at_most, buf_t *buf, int *reached_eof,
             int *socket_error)
 {
-  /* XXXX023 It's stupid to overload the return values for these functions:
+  /* XXXX024 It's stupid to overload the return values for these functions:
    * "error status" and "number of bytes read" are not mutually exclusive.
    */
   int r = 0;
@@ -689,7 +690,7 @@ read_to_buf(tor_socket_t s, size_t at_most, buf_t *buf, int *reached_eof,
 
   check();
   tor_assert(reached_eof);
-  tor_assert(s >= 0);
+  tor_assert(SOCKET_OK(s));
 
   while (at_most > total_read) {
     size_t readlen = at_most - total_read;
@@ -743,6 +744,9 @@ read_to_buf_tls(tor_tls_t *tls, size_t at_most, buf_t *buf)
 {
   int r = 0;
   size_t total_read = 0;
+
+  check_no_tls_errors();
+
   check();
 
   while (at_most > total_read) {
@@ -789,7 +793,7 @@ flush_chunk(tor_socket_t s, buf_t *buf, chunk_t *chunk, size_t sz,
   if (write_result < 0) {
     int e = tor_socket_errno(s);
     if (!ERRNO_IS_EAGAIN(e)) { /* it's a real error */
-#ifdef MS_WINDOWS
+#ifdef _WIN32
       if (e == WSAENOBUFS)
         log_warn(LD_NET,"write() failed: WSAENOBUFS. Not enough ram?");
 #endif
@@ -851,13 +855,13 @@ flush_chunk_tls(tor_tls_t *tls, buf_t *buf, chunk_t *chunk,
 int
 flush_buf(tor_socket_t s, buf_t *buf, size_t sz, size_t *buf_flushlen)
 {
-  /* XXXX023 It's stupid to overload the return values for these functions:
+  /* XXXX024 It's stupid to overload the return values for these functions:
    * "error status" and "number of bytes flushed" are not mutually exclusive.
    */
   int r;
   size_t flushed = 0;
   tor_assert(buf_flushlen);
-  tor_assert(s >= 0);
+  tor_assert(SOCKET_OK(s));
   tor_assert(*buf_flushlen <= buf->datalen);
   tor_assert(sz <= *buf_flushlen);
 
@@ -1007,7 +1011,7 @@ fetch_from_buf(char *string, size_t string_len, buf_t *buf)
 
 /** True iff the cell command <b>command</b> is one that implies a
  * variable-length cell in Tor link protocol <b>linkproto</b>. */
-static inline int
+static INLINE int
 cell_command_is_var_length(uint8_t command, int linkproto)
 {
   /* If linkproto is v2 (2), CELL_VERSIONS is the only variable-length cells

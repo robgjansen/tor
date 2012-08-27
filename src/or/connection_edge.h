@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -74,11 +74,14 @@ void addressmap_clean(time_t now);
 void addressmap_clear_configured(void);
 void addressmap_clear_transient(void);
 void addressmap_free_all(void);
-int addressmap_rewrite(char *address, size_t maxlen, time_t *expires_out);
+int addressmap_rewrite(char *address, size_t maxlen, time_t *expires_out,
+                       addressmap_entry_source_t *exit_source_out);
 int addressmap_have_mapping(const char *address, int update_timeout);
 
 void addressmap_register(const char *address, char *new_address,
-                         time_t expires, addressmap_entry_source_t source);
+                         time_t expires, addressmap_entry_source_t source,
+                         const int address_wildcard,
+                         const int new_address_wildcard);
 int parse_virtual_addr_network(const char *val, int validate_only,
                                char **msg);
 int client_dns_incr_failures(const char *address);
@@ -99,7 +102,7 @@ int connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
 typedef enum hostname_type_t {
   NORMAL_HOSTNAME, ONION_HOSTNAME, EXIT_HOSTNAME, BAD_HOSTNAME
 } hostname_type_t;
-hostname_type_t parse_extended_hostname(char *address, int allowdotexit);
+hostname_type_t parse_extended_hostname(char *address);
 
 #if defined(HAVE_NET_IF_H) && defined(HAVE_NET_PFVAR_H)
 int get_pf_socket(void);

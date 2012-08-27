@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #define DIRVOTE_PRIVATE
@@ -33,12 +33,16 @@ typedef struct pending_consensus_t {
   networkstatus_t *consensus;
 } pending_consensus_t;
 
+/* DOCDOC dirvote_add_signatures_to_all_pending_consensuses */
 static int dirvote_add_signatures_to_all_pending_consensuses(
                        const char *detached_signatures_body,
+                       const char *source,
                        const char **msg_out);
 static int dirvote_add_signatures_to_pending_consensus(
                        pending_consensus_t *pc,
                        ns_detached_signatures_t *sigs,
+                       const char *source,
+                       int severity,
                        const char **msg_out);
 static char *list_v3_auth_ids(void);
 static void dirvote_fetch_missing_votes(void);
@@ -50,7 +54,7 @@ static int dirvote_publish_consensus(void);
 static char *make_consensus_method_list(int low, int high, const char *sep);
 
 /** The highest consensus method that we currently support. */
-#define MAX_SUPPORTED_CONSENSUS_METHOD 11
+#define MAX_SUPPORTED_CONSENSUS_METHOD 12
 
 /** Lowest consensus method that contains a 'directory-footer' marker */
 #define MIN_METHOD_FOR_FOOTER 9
@@ -64,6 +68,10 @@ static char *make_consensus_method_list(int low, int high, const char *sep);
 /** Lowest consensus method that generates microdescriptors */
 #define MIN_METHOD_FOR_MICRODESC 8
 
+/** Lowest consensus method that ensures a majority of authorities voted
+  * for a param. */
+#define MIN_METHOD_FOR_MAJORITY_PARAMS 12
+
 /* =====
  * Voting
  * =====*/
@@ -75,7 +83,7 @@ static char *make_consensus_method_list(int low, int high, const char *sep);
  * <b>v3_ns</b>, signed with our v3 signing key <b>private_signing_key</b>.
  * For v3 authorities. */
 char *
-format_networkstatus_vote(crypto_pk_env_t *private_signing_key,
+format_networkstatus_vote(crypto_pk_t *private_signing_key,
                           networkstatus_t *v3_ns)
 {
   size_t len;
@@ -364,8 +372,7 @@ get_frequent_members(smartlist_t *out, smartlist_t *in, int min)
 {
   char *cur = NULL;
   int count = 0;
-  SMARTLIST_FOREACH(in, char *, cp,
-  {
+  SMARTLIST_FOREACH_BEGIN(in, char *, cp) {
     if (cur && !strcmp(cp, cur)) {
       ++count;
     } else {
@@ -374,7 +381,7 @@ get_frequent_members(smartlist_t *out, smartlist_t *in, int min)
       cur = cp;
       count = 1;
     }
-  });
+  } SMARTLIST_FOREACH_END(cp);
   if (count > min)
     smartlist_add(out, cur);
 }
@@ -437,8 +444,7 @@ compute_routerstatus_consensus(smartlist_t *votes, int consensus_method,
    * date cannot tie, we use the descriptor with the smaller digest.
    */
   smartlist_sort(votes, _compare_vote_rs);
-  SMARTLIST_FOREACH(votes, vote_routerstatus_t *, rs,
-  {
+  SMARTLIST_FOREACH_BEGIN(votes, vote_routerstatus_t *, rs) {
     if (cur && !compare_vote_rs(cur, rs)) {
       ++cur_n;
     } else {
@@ -452,7 +458,7 @@ compute_routerstatus_consensus(smartlist_t *votes, int consensus_method,
       cur_n = 1;
       cur = rs;
     }
-  });
+  } SMARTLIST_FOREACH_END(rs);
 
   if (cur_n > most_n ||
       (cur && cur_n == most_n && cur->status.published_on > most_published)) {
@@ -465,7 +471,7 @@ compute_routerstatus_consensus(smartlist_t *votes, int consensus_method,
 
   if (consensus_method >= MIN_METHOD_FOR_MICRODESC &&
       microdesc_digest256_out) {
-    smartlist_t *digests = smartlist_create();
+    smartlist_t *digests = smartlist_new();
     const char *best_microdesc_digest;
     SMARTLIST_FOREACH_BEGIN(votes, vote_routerstatus_t *, rs) {
         char d[DIGEST256_LEN];
@@ -493,15 +499,15 @@ static void
 hash_list_members(char *digest_out, size_t len_out,
                   smartlist_t *lst, digest_algorithm_t alg)
 {
-  crypto_digest_env_t *d;
+  crypto_digest_t *d;
   if (alg == DIGEST_SHA1)
-    d = crypto_new_digest_env();
+    d = crypto_digest_new();
   else
-    d = crypto_new_digest256_env(alg);
+    d = crypto_digest256_new(alg);
   SMARTLIST_FOREACH(lst, const char *, cp,
                     crypto_digest_add_bytes(d, cp, strlen(cp)));
   crypto_digest_get_digest(d, digest_out, len_out);
-  crypto_free_digest_env(d);
+  crypto_digest_free(d);
 }
 
 /** Sorting helper: compare two strings based on their values as base-ten
@@ -529,9 +535,9 @@ _cmp_int_strings(const void **_a, const void **_b)
 static int
 compute_consensus_method(smartlist_t *votes)
 {
-  smartlist_t *all_methods = smartlist_create();
-  smartlist_t *acceptable_methods = smartlist_create();
-  smartlist_t *tmp = smartlist_create();
+  smartlist_t *all_methods = smartlist_new();
+  smartlist_t *acceptable_methods = smartlist_new();
+  smartlist_t *tmp = smartlist_new();
   int min = (smartlist_len(votes) * 2) / 3;
   int n_ok;
   int result;
@@ -574,15 +580,13 @@ make_consensus_method_list(int low, int high, const char *separator)
 {
   char *list;
 
-  char b[32];
   int i;
   smartlist_t *lst;
-  lst = smartlist_create();
+  lst = smartlist_new();
   for (i = low; i <= high; ++i) {
     if (!consensus_method_is_supported(i))
       continue;
-    tor_snprintf(b, sizeof(b), "%d", i);
-    smartlist_add(lst, tor_strdup(b));
+    smartlist_add_asprintf(lst, "%d", i);
   }
   list = smartlist_join_strings(lst, separator, 0, NULL);
   tor_assert(list);
@@ -599,7 +603,7 @@ static char *
 compute_consensus_versions_list(smartlist_t *lst, int n_versioning)
 {
   int min = n_versioning / 2;
-  smartlist_t *good = smartlist_create();
+  smartlist_t *good = smartlist_new();
   char *result;
   sort_version_list(lst, 0);
   get_frequent_members(good, lst, min);
@@ -608,11 +612,16 @@ compute_consensus_versions_list(smartlist_t *lst, int n_versioning)
   return result;
 }
 
+/** Minimum number of directory authorities voting for a parameter to
+ * include it in the consensus, if consensus method 12 or later is to be
+ * used. See proposal 178 for details. */
+#define MIN_VOTES_FOR_PARAM 3
+
 /** Helper: given a list of valid networkstatus_t, return a new string
  * containing the contents of the consensus network parameter set.
  */
 /* private */ char *
-dirvote_compute_params(smartlist_t *votes)
+dirvote_compute_params(smartlist_t *votes, int method, int total_authorities)
 {
   int i;
   int32_t *vals;
@@ -624,7 +633,7 @@ dirvote_compute_params(smartlist_t *votes)
 
   const int n_votes = smartlist_len(votes);
   smartlist_t *output;
-  smartlist_t *param_list = smartlist_create();
+  smartlist_t *param_list = smartlist_new();
 
   /* We require that the parameter lists in the votes are well-formed: that
      is, that their keywords are unique and sorted, and that their values are
@@ -652,16 +661,16 @@ dirvote_compute_params(smartlist_t *votes)
   tor_assert(eq);
   cur_param_len = (int)(eq+1 - cur_param);
 
-  output = smartlist_create();
+  output = smartlist_new();
 
   SMARTLIST_FOREACH_BEGIN(param_list, const char *, param) {
     const char *next_param;
     int ok=0;
     eq = strchr(param, '=');
-    tor_assert(i<n_votes);
+    tor_assert(i<n_votes); /* Make sure we prevented vote-stuffing. */
     vals[i++] = (int32_t)
       tor_parse_long(eq+1, 10, INT32_MIN, INT32_MAX, &ok, NULL);
-    tor_assert(ok);
+    tor_assert(ok); /* Already checked these when parsing. */
 
     if (param_sl_idx+1 == smartlist_len(param_list))
       next_param = NULL;
@@ -669,11 +678,17 @@ dirvote_compute_params(smartlist_t *votes)
       next_param = smartlist_get(param_list, param_sl_idx+1);
     if (!next_param || strncmp(next_param, param, cur_param_len)) {
       /* We've reached the end of a series. */
-      int32_t median = median_int32(vals, i);
-      char *out_string = tor_malloc(64+cur_param_len);
-      memcpy(out_string, param, cur_param_len);
-      tor_snprintf(out_string+cur_param_len,64, "%ld", (long)median);
-      smartlist_add(output, out_string);
+      /* Make sure enough authorities voted on this param, unless the
+       * the consensus method we use is too old for that. */
+      if (method < MIN_METHOD_FOR_MAJORITY_PARAMS ||
+          i > total_authorities/2 ||
+          i >= MIN_VOTES_FOR_PARAM) {
+        int32_t median = median_int32(vals, i);
+        char *out_string = tor_malloc(64+cur_param_len);
+        memcpy(out_string, param, cur_param_len);
+        tor_snprintf(out_string+cur_param_len,64, "%ld", (long)median);
+        smartlist_add(output, out_string);
+      }
 
       i = 0;
       if (next_param) {
@@ -792,8 +807,6 @@ networkstatus_compute_bw_weights_v10(smartlist_t *chunks, int64_t G,
   int64_t Wmg = -1, Wme = -1, Wmd = -1;
   int64_t Wed = -1, Wee = -1;
   const char *casename;
-  char buf[512];
-  int r;
 
   if (G <= 0 || M <= 0 || E <= 0 || D <= 0) {
     log_warn(LD_DIR, "Consensus with empty bandwidth: "
@@ -991,7 +1004,7 @@ networkstatus_compute_bw_weights_v10(smartlist_t *chunks, int64_t G,
   /* We cast down the weights to 32 bit ints on the assumption that
    * weight_scale is ~= 10000. We need to ensure a rogue authority
    * doesn't break this assumption to rig our weights */
-  tor_assert(0 < weight_scale && weight_scale < INT32_MAX);
+  tor_assert(0 < weight_scale && weight_scale <= INT32_MAX);
 
   /*
    * Provide Wgm=Wgg, Wmm=1, Wem=Wee, Weg=Wed. May later determine
@@ -1001,7 +1014,7 @@ networkstatus_compute_bw_weights_v10(smartlist_t *chunks, int64_t G,
    *
    * NOTE: This list is sorted.
    */
-  r = tor_snprintf(buf, sizeof(buf),
+  smartlist_add_asprintf(chunks,
      "bandwidth-weights Wbd=%d Wbe=%d Wbg=%d Wbm=%d "
      "Wdb=%d "
      "Web=%d Wed=%d Wee=%d Weg=%d Wem=%d "
@@ -1012,13 +1025,6 @@ networkstatus_compute_bw_weights_v10(smartlist_t *chunks, int64_t G,
      (int)weight_scale, (int)Wed, (int)Wee, (int)Wed, (int)Wee,
      (int)weight_scale, (int)Wgd, (int)Wgg, (int)Wgg,
      (int)weight_scale, (int)Wmd, (int)Wme, (int)Wmg, (int)weight_scale);
-  if (r<0) {
-    log_warn(LD_BUG,
-             "Not enough space in buffer for bandwidth-weights line.");
-    *buf = '\0';
-    return 0;
-  }
-  smartlist_add(chunks, tor_strdup(buf));
 
   log_notice(LD_CIRC, "Computed bandwidth weights for %s with v10: "
              "G="I64_FORMAT" M="I64_FORMAT" E="I64_FORMAT" D="I64_FORMAT
@@ -1042,8 +1048,6 @@ networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
   int64_t Wmg = -1, Wme = -1, Wmd = -1;
   int64_t Wed = -1, Wee = -1;
   const char *casename;
-  char buf[512];
-  int r;
 
   if (G <= 0 || M <= 0 || E <= 0 || D <= 0) {
     log_warn(LD_DIR, "Consensus with empty bandwidth: "
@@ -1228,7 +1232,7 @@ networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
   /* We cast down the weights to 32 bit ints on the assumption that
    * weight_scale is ~= 10000. We need to ensure a rogue authority
    * doesn't break this assumption to rig our weights */
-  tor_assert(0 < weight_scale && weight_scale < INT32_MAX);
+  tor_assert(0 < weight_scale && weight_scale <= INT32_MAX);
 
   if (Wgg < 0 || Wgg > weight_scale) {
     log_warn(LD_DIR, "Bw %s: Wgg="I64_FORMAT"! G="I64_FORMAT
@@ -1305,7 +1309,7 @@ networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
    *
    * NOTE: This list is sorted.
    */
-  r = tor_snprintf(buf, sizeof(buf),
+  smartlist_add_asprintf(chunks,
      "Wbd=%d Wbe=%d Wbg=%d Wbm=%d "
      "Wdb=%d "
      "Web=%d Wed=%d Wee=%d Weg=%d Wem=%d "
@@ -1316,12 +1320,7 @@ networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
      (int)weight_scale, (int)Wed, (int)Wee, (int)Wed, (int)Wee,
      (int)weight_scale, (int)Wgd, (int)Wgg, (int)Wgg,
      (int)weight_scale, (int)Wmd, (int)Wme, (int)Wmg, (int)weight_scale);
-  if (r<0) {
-    log_warn(LD_BUG,
-             "Not enough space in buffer for bandwidth-weights line.");
-    *buf = '\0';
-  }
-  smartlist_add(chunks, tor_strdup(buf));
+
   log_notice(LD_CIRC, "Computed bandwidth weights for %s with v9: "
              "G="I64_FORMAT" M="I64_FORMAT" E="I64_FORMAT" D="I64_FORMAT
              " T="I64_FORMAT,
@@ -1341,10 +1340,10 @@ networkstatus_compute_bw_weights_v9(smartlist_t *chunks, int64_t G, int64_t M,
 char *
 networkstatus_compute_consensus(smartlist_t *votes,
                                 int total_authorities,
-                                crypto_pk_env_t *identity_key,
-                                crypto_pk_env_t *signing_key,
+                                crypto_pk_t *identity_key,
+                                crypto_pk_t *signing_key,
                                 const char *legacy_id_key_digest,
-                                crypto_pk_env_t *legacy_signing_key,
+                                crypto_pk_t *legacy_signing_key,
                                 consensus_flavor_t flavor)
 {
   smartlist_t *chunks;
@@ -1369,7 +1368,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
     log_warn(LD_DIR, "Can't compute a consensus from no votes.");
     return NULL;
   }
-  flags = smartlist_create();
+  flags = smartlist_new();
 
   consensus_method = compute_consensus_method(votes);
   if (consensus_method_is_supported(consensus_method)) {
@@ -1392,8 +1391,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
     int *votesec_list = tor_malloc(n_votes * sizeof(int));
     int *distsec_list = tor_malloc(n_votes * sizeof(int));
     int n_versioning_clients = 0, n_versioning_servers = 0;
-    smartlist_t *combined_client_versions = smartlist_create();
-    smartlist_t *combined_server_versions = smartlist_create();
+    smartlist_t *combined_client_versions = smartlist_new();
+    smartlist_t *combined_server_versions = smartlist_new();
 
     SMARTLIST_FOREACH_BEGIN(votes, networkstatus_t *, v) {
       tor_assert(v->type == NS_TYPE_VOTE);
@@ -1403,7 +1402,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       votesec_list[v_sl_idx] = v->vote_seconds;
       distsec_list[v_sl_idx] = v->dist_seconds;
       if (v->client_versions) {
-        smartlist_t *cv = smartlist_create();
+        smartlist_t *cv = smartlist_new();
         ++n_versioning_clients;
         smartlist_split_string(cv, v->client_versions, ",",
                                SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
@@ -1412,7 +1411,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
         smartlist_free(cv); /* elements get freed later. */
       }
       if (v->server_versions) {
-        smartlist_t *sv = smartlist_create();
+        smartlist_t *sv = smartlist_new();
         ++n_versioning_servers;
         smartlist_split_string(sv, v->server_versions, ",",
                                SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
@@ -1454,10 +1453,9 @@ networkstatus_compute_consensus(smartlist_t *votes,
     tor_free(distsec_list);
   }
 
-  chunks = smartlist_create();
+  chunks = smartlist_new();
 
   {
-    char *buf=NULL;
     char va_buf[ISO_TIME_LEN+1], fu_buf[ISO_TIME_LEN+1],
       vu_buf[ISO_TIME_LEN+1];
     char *flaglist;
@@ -1466,20 +1464,17 @@ networkstatus_compute_consensus(smartlist_t *votes,
     format_iso_time(vu_buf, valid_until);
     flaglist = smartlist_join_strings(flags, " ", 0, NULL);
 
-    tor_asprintf(&buf, "network-status-version 3%s%s\n"
+    smartlist_add_asprintf(chunks, "network-status-version 3%s%s\n"
                  "vote-status consensus\n",
                  flavor == FLAV_NS ? "" : " ",
                  flavor == FLAV_NS ? "" : flavor_name);
 
-    smartlist_add(chunks, buf);
-
     if (consensus_method >= 2) {
-      tor_asprintf(&buf, "consensus-method %d\n",
+      smartlist_add_asprintf(chunks, "consensus-method %d\n",
                    consensus_method);
-      smartlist_add(chunks, buf);
     }
 
-    tor_asprintf(&buf,
+    smartlist_add_asprintf(chunks,
                  "valid-after %s\n"
                  "fresh-until %s\n"
                  "valid-until %s\n"
@@ -1490,13 +1485,13 @@ networkstatus_compute_consensus(smartlist_t *votes,
                  va_buf, fu_buf, vu_buf,
                  vote_seconds, dist_seconds,
                  client_versions, server_versions, flaglist);
-    smartlist_add(chunks, buf);
 
     tor_free(flaglist);
   }
 
   if (consensus_method >= MIN_METHOD_FOR_PARAMS) {
-    params = dirvote_compute_params(votes);
+    params = dirvote_compute_params(votes, consensus_method,
+                                    total_authorities);
     if (params) {
       smartlist_add(chunks, tor_strdup("params "));
       smartlist_add(chunks, params);
@@ -1508,7 +1503,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
   smartlist_sort(votes, _compare_votes_by_authority_id);
   /* Add the authority sections. */
   {
-    smartlist_t *dir_sources = smartlist_create();
+    smartlist_t *dir_sources = smartlist_new();
     SMARTLIST_FOREACH_BEGIN(votes, networkstatus_t *, v) {
       dir_src_ent_t *e = tor_malloc_zero(sizeof(dir_src_ent_t));
       e->v = v;
@@ -1531,7 +1526,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
       char votedigest[HEX_DIGEST_LEN+1];
       networkstatus_t *v = e->v;
       networkstatus_voter_info_t *voter = get_voter(v);
-      char *buf = NULL;
 
       if (e->is_legacy)
         tor_assert(consensus_method >= 2);
@@ -1540,20 +1534,18 @@ networkstatus_compute_consensus(smartlist_t *votes,
       base16_encode(votedigest, sizeof(votedigest), voter->vote_digest,
                     DIGEST_LEN);
 
-      tor_asprintf(&buf,
+      smartlist_add_asprintf(chunks,
                    "dir-source %s%s %s %s %s %d %d\n",
                    voter->nickname, e->is_legacy ? "-legacy" : "",
                    fingerprint, voter->address, fmt_addr32(voter->addr),
                    voter->dir_port,
                    voter->or_port);
-      smartlist_add(chunks, buf);
       if (! e->is_legacy) {
-        tor_asprintf(&buf,
+        smartlist_add_asprintf(chunks,
                      "contact %s\n"
                      "vote-digest %s\n",
                      voter->contact,
                      votedigest);
-        smartlist_add(chunks, buf);
       }
     } SMARTLIST_FOREACH_END(e);
     SMARTLIST_FOREACH(dir_sources, dir_src_ent_t *, e, tor_free(e));
@@ -1567,10 +1559,10 @@ networkstatus_compute_consensus(smartlist_t *votes,
     int *flag_counts; /* The number of voters that list flag[j] for the
                        * currently considered router. */
     int i;
-    smartlist_t *matching_descs = smartlist_create();
-    smartlist_t *chosen_flags = smartlist_create();
-    smartlist_t *versions = smartlist_create();
-    smartlist_t *exitsummaries = smartlist_create();
+    smartlist_t *matching_descs = smartlist_new();
+    smartlist_t *chosen_flags = smartlist_new();
+    smartlist_t *versions = smartlist_new();
+    smartlist_t *exitsummaries = smartlist_new();
     uint32_t *bandwidths = tor_malloc(sizeof(uint32_t) * smartlist_len(votes));
     uint32_t *measured_bws = tor_malloc(sizeof(uint32_t) *
                                         smartlist_len(votes));
@@ -1605,12 +1597,10 @@ networkstatus_compute_consensus(smartlist_t *votes,
     chosen_named_idx = smartlist_string_pos(flags, "Named");
 
     /* Build the flag index. */
-    SMARTLIST_FOREACH(votes, networkstatus_t *, v,
-    {
+    SMARTLIST_FOREACH_BEGIN(votes, networkstatus_t *, v) {
       flag_map[v_sl_idx] = tor_malloc_zero(
                            sizeof(int)*smartlist_len(v->known_flags));
-      SMARTLIST_FOREACH(v->known_flags, const char *, fl,
-      {
+      SMARTLIST_FOREACH_BEGIN(v->known_flags, const char *, fl) {
         int p = smartlist_string_pos(flags, fl);
         tor_assert(p >= 0);
         flag_map[v_sl_idx][fl_sl_idx] = p;
@@ -1619,21 +1609,21 @@ networkstatus_compute_consensus(smartlist_t *votes,
           named_flag[v_sl_idx] = fl_sl_idx;
         if (!strcmp(fl, "Unnamed"))
           unnamed_flag[v_sl_idx] = fl_sl_idx;
-      });
+      } SMARTLIST_FOREACH_END(fl);
       n_voter_flags[v_sl_idx] = smartlist_len(v->known_flags);
       size[v_sl_idx] = smartlist_len(v->routerstatus_list);
-    });
+    } SMARTLIST_FOREACH_END(v);
 
     /* Named and Unnamed get treated specially */
     if (consensus_method >= 2) {
-      SMARTLIST_FOREACH(votes, networkstatus_t *, v,
-      {
+      SMARTLIST_FOREACH_BEGIN(votes, networkstatus_t *, v) {
         uint64_t nf;
         if (named_flag[v_sl_idx]<0)
           continue;
         nf = U64_LITERAL(1) << named_flag[v_sl_idx];
-        SMARTLIST_FOREACH(v->routerstatus_list, vote_routerstatus_t *, rs,
-        {
+        SMARTLIST_FOREACH_BEGIN(v->routerstatus_list,
+                                vote_routerstatus_t *, rs) {
+
           if ((rs->flags & nf) != 0) {
             const char *d = strmap_get_lc(name_to_id_map, rs->status.nickname);
             if (!d) {
@@ -1648,16 +1638,16 @@ networkstatus_compute_consensus(smartlist_t *votes,
               /* It's already a conflict, or it's already this ID. */
             }
           }
-        });
-      });
-      SMARTLIST_FOREACH(votes, networkstatus_t *, v,
-      {
+        } SMARTLIST_FOREACH_END(rs);
+      } SMARTLIST_FOREACH_END(v);
+
+      SMARTLIST_FOREACH_BEGIN(votes, networkstatus_t *, v) {
         uint64_t uf;
         if (unnamed_flag[v_sl_idx]<0)
           continue;
         uf = U64_LITERAL(1) << unnamed_flag[v_sl_idx];
-        SMARTLIST_FOREACH(v->routerstatus_list, vote_routerstatus_t *, rs,
-        {
+        SMARTLIST_FOREACH_BEGIN(v->routerstatus_list,
+                                vote_routerstatus_t *, rs) {
           if ((rs->flags & uf) != 0) {
             const char *d = strmap_get_lc(name_to_id_map, rs->status.nickname);
             if (d == conflict || d == unknown) {
@@ -1672,8 +1662,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
               /* It's mapped to a different name. */
             }
           }
-        });
-      });
+        } SMARTLIST_FOREACH_END(rs);
+      } SMARTLIST_FOREACH_END(v);
     }
 
     /* Now go through all the votes */
@@ -1690,7 +1680,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
       int naming_conflict = 0;
       int n_listing = 0;
       int i;
-      char *buf=NULL;
       char microdesc_digest[DIGEST256_LEN];
 
       /* Of the next-to-be-considered digest in each voter, which is first? */
@@ -1796,8 +1785,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
 
       /* Set the flags. */
       smartlist_add(chosen_flags, (char*)"s"); /* for the start of the line. */
-      SMARTLIST_FOREACH(flags, const char *, fl,
-      {
+      SMARTLIST_FOREACH_BEGIN(flags, const char *, fl) {
         if (!strcmp(fl, "Named")) {
           if (is_named)
             smartlist_add(chosen_flags, (char*)fl);
@@ -1817,7 +1805,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
               is_bad_exit = 1;
           }
         }
-      });
+      } SMARTLIST_FOREACH_END(fl);
 
       /* Starting with consensus method 4 we do not list servers
        * that are not running in a consensus.  See Proposal 138 */
@@ -1882,7 +1870,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
          * that list previously */
         const char *chosen_exitsummary = NULL;
         smartlist_clear(exitsummaries);
-        SMARTLIST_FOREACH(matching_descs, vote_routerstatus_t *, vsr, {
+        SMARTLIST_FOREACH_BEGIN(matching_descs, vote_routerstatus_t *, vsr) {
           /* Check if the vote where this status comes from had the
            * proper descriptor */
           tor_assert(fast_memeq(rs_out.identity_digest,
@@ -1902,7 +1890,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
               exitsummary_disagreement = 1;
             }
           }
-        });
+        } SMARTLIST_FOREACH_END(vsr);
 
         if (exitsummary_disagreement) {
           char id[HEX_DIGEST_LEN+1];
@@ -1958,10 +1946,9 @@ networkstatus_compute_consensus(smartlist_t *votes,
       /*     Now an m line, if applicable. */
       if (flavor == FLAV_MICRODESC &&
           !tor_digest256_is_zero(microdesc_digest)) {
-        char m[BASE64_DIGEST256_LEN+1], *cp;
+        char m[BASE64_DIGEST256_LEN+1];
         digest256_to_base64(m, microdesc_digest);
-        tor_asprintf(&cp, "m %s\n", m);
-        smartlist_add(chunks, cp);
+        smartlist_add_asprintf(chunks, "m %s\n", m);
       }
       /*     Next line is all flags.  The "\n" is missing. */
       smartlist_add(chunks,
@@ -1974,15 +1961,12 @@ networkstatus_compute_consensus(smartlist_t *votes,
       smartlist_add(chunks, tor_strdup("\n"));
       /*     Now the weight line. */
       if (rs_out.has_bandwidth) {
-        char *cp=NULL;
-        tor_asprintf(&cp, "w Bandwidth=%d\n", rs_out.bandwidth);
-        smartlist_add(chunks, cp);
+        smartlist_add_asprintf(chunks, "w Bandwidth=%d\n", rs_out.bandwidth);
       }
 
       /*     Now the exitpolicy summary line. */
       if (rs_out.has_exitsummary && flavor == FLAV_NS) {
-        tor_asprintf(&buf, "p %s\n", rs_out.exitsummary);
-        smartlist_add(chunks, buf);
+        smartlist_add_asprintf(chunks, "p %s\n", rs_out.exitsummary);
       }
 
       /* And the loop is over and we move on to the next router */
@@ -2031,7 +2015,7 @@ networkstatus_compute_consensus(smartlist_t *votes,
       int ok=0;
       char *eq = strchr(bw_weight_param, '=');
       if (eq) {
-        weight_scale = tor_parse_long(eq+1, 10, INT32_MIN, INT32_MAX, &ok,
+        weight_scale = tor_parse_long(eq+1, 10, 1, INT32_MAX, &ok,
                                          NULL);
         if (!ok) {
           log_warn(LD_DIR, "Bad element '%s' in bw weight param",
@@ -2064,7 +2048,6 @@ networkstatus_compute_consensus(smartlist_t *votes,
     size_t digest_len =
       flavor == FLAV_NS ? DIGEST_LEN : DIGEST256_LEN;
     const char *algname = crypto_digest_algorithm_get_name(digest_alg);
-    char *buf = NULL;
     char sigbuf[4096];
 
     smartlist_add(chunks, tor_strdup("directory-signature "));
@@ -2078,14 +2061,13 @@ networkstatus_compute_consensus(smartlist_t *votes,
 
     /* add the junk that will go at the end of the line. */
     if (flavor == FLAV_NS) {
-      tor_asprintf(&buf, "%s %s\n", fingerprint,
+      smartlist_add_asprintf(chunks, "%s %s\n", fingerprint,
                    signing_key_fingerprint);
     } else {
-      tor_asprintf(&buf, "%s %s %s\n",
+      smartlist_add_asprintf(chunks, "%s %s %s\n",
                    algname, fingerprint,
                    signing_key_fingerprint);
     }
-    smartlist_add(chunks, buf);
     /* And the signature. */
     sigbuf[0] = '\0';
     if (router_append_dirobj_signature(sigbuf, sizeof(sigbuf),
@@ -2103,14 +2085,13 @@ networkstatus_compute_consensus(smartlist_t *votes,
       crypto_pk_get_fingerprint(legacy_signing_key,
                                 signing_key_fingerprint, 0);
       if (flavor == FLAV_NS) {
-        tor_asprintf(&buf, "%s %s\n", fingerprint,
+        smartlist_add_asprintf(chunks, "%s %s\n", fingerprint,
                      signing_key_fingerprint);
       } else {
-        tor_asprintf(&buf, "%s %s %s\n",
+        smartlist_add_asprintf(chunks, "%s %s %s\n",
                      algname, fingerprint,
                      signing_key_fingerprint);
       }
-      smartlist_add(chunks, buf);
       sigbuf[0] = '\0';
       if (router_append_dirobj_signature(sigbuf, sizeof(sigbuf),
                                          digest, digest_len,
@@ -2161,6 +2142,8 @@ networkstatus_compute_consensus(smartlist_t *votes,
 int
 networkstatus_add_detached_signatures(networkstatus_t *target,
                                       ns_detached_signatures_t *sigs,
+                                      const char *source,
+                                      int severity,
                                       const char **msg_out)
 {
   int r = 0;
@@ -2263,6 +2246,8 @@ networkstatus_add_detached_signatures(networkstatus_t *target,
     if (sig->good_signature || !old_sig || old_sig->bad_signature) {
       log_info(LD_DIR, "Adding signature from %s with %s", voter_identity,
                algorithm);
+      log(severity, LD_DIR, "Added a signature for %s from %s.",
+          target_voter->nickname, source);
       ++r;
       if (old_sig) {
         smartlist_remove(target_voter->sigs, old_sig);
@@ -2299,7 +2284,7 @@ networkstatus_format_signatures(networkstatus_t *consensus,
   else
     keyword = "directory-signature";
 
-  elements = smartlist_create();
+  elements = smartlist_new();
 
   SMARTLIST_FOREACH_BEGIN(consensus->voters, networkstatus_voter_info_t *, v) {
     SMARTLIST_FOREACH_BEGIN(v->sigs, document_signature_t *, sig) {
@@ -2311,20 +2296,19 @@ networkstatus_format_signatures(networkstatus_t *consensus,
       base16_encode(sk, sizeof(sk), sig->signing_key_digest, DIGEST_LEN);
       base16_encode(id, sizeof(id), sig->identity_digest, DIGEST_LEN);
       if (flavor == FLAV_NS) {
-        tor_snprintf(buf, sizeof(buf),
+        smartlist_add_asprintf(elements,
                      "%s %s %s\n-----BEGIN SIGNATURE-----\n",
                      keyword, id, sk);
       } else {
         const char *digest_name =
           crypto_digest_algorithm_get_name(sig->alg);
-        tor_snprintf(buf, sizeof(buf),
+        smartlist_add_asprintf(elements,
                      "%s%s%s %s %s %s\n-----BEGIN SIGNATURE-----\n",
                      keyword,
                      for_detached_signatures ? " " : "",
                      for_detached_signatures ? flavor_name : "",
                      digest_name, id, sk);
       }
-      smartlist_add(elements, tor_strdup(buf));
       base64_encode(buf, sizeof(buf), sig->signature, sig->signature_len);
       strlcat(buf, "-----END SIGNATURE-----\n", sizeof(buf));
       smartlist_add(elements, tor_strdup(buf));
@@ -2347,7 +2331,6 @@ char *
 networkstatus_get_detached_signatures(smartlist_t *consensuses)
 {
   smartlist_t *elements;
-  char buf[4096];
   char *result = NULL, *sigs = NULL;
   networkstatus_t *consensus_ns = NULL;
   tor_assert(consensuses);
@@ -2363,7 +2346,7 @@ networkstatus_get_detached_signatures(smartlist_t *consensuses)
     return NULL;
   }
 
-  elements = smartlist_create();
+  elements = smartlist_new();
 
   {
     char va_buf[ISO_TIME_LEN+1], fu_buf[ISO_TIME_LEN+1],
@@ -2376,12 +2359,11 @@ networkstatus_get_detached_signatures(smartlist_t *consensuses)
     format_iso_time(fu_buf, consensus_ns->fresh_until);
     format_iso_time(vu_buf, consensus_ns->valid_until);
 
-    tor_snprintf(buf, sizeof(buf),
+    smartlist_add_asprintf(elements,
                  "consensus-digest %s\n"
                  "valid-after %s\n"
                  "fresh-until %s\n"
                  "valid-until %s\n", d, va_buf, fu_buf, vu_buf);
-    smartlist_add(elements, tor_strdup(buf));
   }
 
   /* Get all the digests for the non-FLAV_NS consensuses */
@@ -2400,9 +2382,8 @@ networkstatus_get_detached_signatures(smartlist_t *consensuses)
       if (tor_mem_is_zero(ns->digests.d[alg], DIGEST256_LEN))
         continue;
       base16_encode(d, sizeof(d), ns->digests.d[alg], DIGEST256_LEN);
-      tor_snprintf(buf, sizeof(buf), "additional-digest %s %s %s\n",
+      smartlist_add_asprintf(elements, "additional-digest %s %s %s\n",
                    flavor_name, alg_name, d);
-      smartlist_add(elements, tor_strdup(buf));
     }
   } SMARTLIST_FOREACH_END(ns);
 
@@ -2441,7 +2422,7 @@ get_detached_signatures_from_pending_consensuses(pending_consensus_t *pending,
 {
   int flav;
   char *signatures;
-  smartlist_t *c = smartlist_create();
+  smartlist_t *c = smartlist_new();
   for (flav = 0; flav < n_flavors; ++flav) {
     if (pending[flav].consensus)
       smartlist_add(c, pending[flav].consensus);
@@ -2694,6 +2675,7 @@ static smartlist_t *pending_vote_list = NULL;
  * build a consensus, the votes go here for the next period. */
 static smartlist_t *previous_vote_list = NULL;
 
+/* DOCDOC pending_consensuses */
 static pending_consensus_t pending_consensuses[N_CONSENSUS_FLAVORS];
 
 /** The detached signatures for the consensus that we're currently
@@ -2709,7 +2691,7 @@ static smartlist_t *pending_consensus_signature_list = NULL;
 static int
 dirvote_perform_vote(void)
 {
-  crypto_pk_env_t *key = get_my_v3_authority_signing_key();
+  crypto_pk_t *key = get_my_v3_authority_signing_key();
   authority_cert_t *cert = get_my_v3_authority_cert();
   networkstatus_t *ns;
   char *contents;
@@ -2757,12 +2739,11 @@ dirvote_perform_vote(void)
 static void
 dirvote_fetch_missing_votes(void)
 {
-  smartlist_t *missing_fps = smartlist_create();
+  smartlist_t *missing_fps = smartlist_new();
   char *resource;
 
-  SMARTLIST_FOREACH(router_get_trusted_dir_servers(),
-                    trusted_dir_server_t *, ds,
-    {
+  SMARTLIST_FOREACH_BEGIN(router_get_trusted_dir_servers(),
+                          trusted_dir_server_t *, ds) {
       if (!(ds->type & V3_DIRINFO))
         continue;
       if (!dirvote_get_vote(ds->v3_identity_digest,
@@ -2772,14 +2753,19 @@ dirvote_fetch_missing_votes(void)
                       DIGEST_LEN);
         smartlist_add(missing_fps, cp);
       }
-    });
+  } SMARTLIST_FOREACH_END(ds);
 
   if (!smartlist_len(missing_fps)) {
     smartlist_free(missing_fps);
     return;
   }
-  log_notice(LOG_NOTICE, "We're missing votes from %d authorities. Asking "
-             "every other authority for a copy.", smartlist_len(missing_fps));
+  {
+    char *tmp = smartlist_join_strings(missing_fps, " ", 0, NULL);
+    log_notice(LOG_NOTICE, "We're missing votes from %d authorities (%s). "
+               "Asking every other authority for a copy.",
+               smartlist_len(missing_fps), tmp);
+    tor_free(tmp);
+  }
   resource = smartlist_join_strings(missing_fps, "+", 0, NULL);
   directory_get_from_all_authorities(DIR_PURPOSE_FETCH_STATUS_VOTE,
                                      0, resource);
@@ -2831,9 +2817,9 @@ static void
 dirvote_clear_votes(int all_votes)
 {
   if (!previous_vote_list)
-    previous_vote_list = smartlist_create();
+    previous_vote_list = smartlist_new();
   if (!pending_vote_list)
-    pending_vote_list = smartlist_create();
+    pending_vote_list = smartlist_new();
 
   /* All "previous" votes are now junk. */
   SMARTLIST_FOREACH(previous_vote_list, pending_vote_t *, v, {
@@ -2872,7 +2858,7 @@ dirvote_clear_votes(int all_votes)
 static char *
 list_v3_auth_ids(void)
 {
-  smartlist_t *known_v3_keys = smartlist_create();
+  smartlist_t *known_v3_keys = smartlist_new();
   char *keys;
   SMARTLIST_FOREACH(router_get_trusted_dir_servers(),
                     trusted_dir_server_t *, ds,
@@ -2905,7 +2891,7 @@ dirvote_add_vote(const char *vote_body, const char **msg_out, int *status_out)
   tor_assert(status_out);
 
   if (!pending_vote_list)
-    pending_vote_list = smartlist_create();
+    pending_vote_list = smartlist_new();
   *status_out = 0;
   *msg_out = NULL;
 
@@ -2969,7 +2955,7 @@ dirvote_add_vote(const char *vote_body, const char **msg_out, int *status_out)
   update_consensus_router_descriptor_downloads(time(NULL), 1, vote);
 
   /* Now see whether we already have a vote from this authority. */
-  SMARTLIST_FOREACH(pending_vote_list, pending_vote_t *, v, {
+  SMARTLIST_FOREACH_BEGIN(pending_vote_list, pending_vote_t *, v) {
       if (fast_memeq(v->vote->cert->cache_info.identity_digest,
                    vote->cert->cache_info.identity_digest,
                    DIGEST_LEN)) {
@@ -3004,7 +2990,7 @@ dirvote_add_vote(const char *vote_body, const char **msg_out, int *status_out)
           goto err;
         }
       }
-  });
+  } SMARTLIST_FOREACH_END(v);
 
   pending_vote = tor_malloc_zero(sizeof(pending_vote_t));
   pending_vote->vote_body = new_cached_dir(tor_strndup(vote_body,
@@ -3069,7 +3055,7 @@ dirvote_compute_consensuses(void)
   memset(pending, 0, sizeof(pending));
 
   if (!pending_vote_list)
-    pending_vote_list = smartlist_create();
+    pending_vote_list = smartlist_new();
 
   n_voters = get_n_authorities(V3_DIRINFO);
   n_votes = smartlist_len(pending_vote_list);
@@ -3097,8 +3083,8 @@ dirvote_compute_consensuses(void)
     goto err;
   }
 
-  votes = smartlist_create();
-  votestrings = smartlist_create();
+  votes = smartlist_new();
+  votestrings = smartlist_new();
   SMARTLIST_FOREACH(pending_vote_list, pending_vote_t *, v,
     {
       sized_chunk_t *c = tor_malloc(sizeof(sized_chunk_t));
@@ -3117,7 +3103,7 @@ dirvote_compute_consensuses(void)
 
   {
     char legacy_dbuf[DIGEST_LEN];
-    crypto_pk_env_t *legacy_sign=NULL;
+    crypto_pk_t *legacy_sign=NULL;
     char *legacy_id_digest = NULL;
     int n_generated = 0;
     if (get_options()->V3AuthUseLegacyKey) {
@@ -3188,10 +3174,10 @@ dirvote_compute_consensuses(void)
     int n_sigs = 0;
     /* we may have gotten signatures for this consensus before we built
      * it ourself.  Add them now. */
-    SMARTLIST_FOREACH(pending_consensus_signature_list, char *, sig,
-      {
+    SMARTLIST_FOREACH_BEGIN(pending_consensus_signature_list, char *, sig) {
         const char *msg = NULL;
-        int r = dirvote_add_signatures_to_all_pending_consensuses(sig, &msg);
+        int r = dirvote_add_signatures_to_all_pending_consensuses(sig,
+                                                     "pending", &msg);
         if (r >= 0)
           n_sigs += r;
         else
@@ -3199,7 +3185,7 @@ dirvote_compute_consensuses(void)
                    "Could not add queued signature to new consensus: %s",
                    msg);
         tor_free(sig);
-      });
+    } SMARTLIST_FOREACH_END(sig);
     if (n_sigs)
       log_notice(LD_DIR, "Added %d pending signatures while building "
                  "consensus.", n_sigs);
@@ -3233,6 +3219,8 @@ static int
 dirvote_add_signatures_to_pending_consensus(
                        pending_consensus_t *pc,
                        ns_detached_signatures_t *sigs,
+                       const char *source,
+                       int severity,
                        const char **msg_out)
 {
   const char *flavor_name;
@@ -3251,7 +3239,8 @@ dirvote_add_signatures_to_pending_consensus(
     log_info(LD_DIR, "Have %d signatures for adding to %s consensus.",
              sig_list ? smartlist_len(sig_list) : 0, flavor_name);
   }
-  r = networkstatus_add_detached_signatures(pc->consensus, sigs, msg_out);
+  r = networkstatus_add_detached_signatures(pc->consensus, sigs,
+                                            source, severity, msg_out);
   log_info(LD_DIR,"Added %d signatures to consensus.", r);
 
   if (r >= 1) {
@@ -3300,6 +3289,7 @@ dirvote_add_signatures_to_pending_consensus(
 static int
 dirvote_add_signatures_to_all_pending_consensuses(
                        const char *detached_signatures_body,
+                       const char *source,
                        const char **msg_out)
 {
   int r=0, i, n_added = 0, errors = 0;
@@ -3316,10 +3306,12 @@ dirvote_add_signatures_to_all_pending_consensuses(
 
   for (i = 0; i < N_CONSENSUS_FLAVORS; ++i) {
     int res;
+    int severity = i == FLAV_NS ? LOG_NOTICE : LOG_INFO;
     pending_consensus_t *pc = &pending_consensuses[i];
     if (!pc->consensus)
       continue;
-    res = dirvote_add_signatures_to_pending_consensus(pc, sigs, msg_out);
+    res = dirvote_add_signatures_to_pending_consensus(pc, sigs, source,
+                                                      severity, msg_out);
     if (res < 0)
       errors++;
     else
@@ -3366,12 +3358,12 @@ dirvote_add_signatures(const char *detached_signatures_body,
     log_notice(LD_DIR, "Got a signature from %s. "
                        "Adding it to the pending consensus.", source);
     return dirvote_add_signatures_to_all_pending_consensuses(
-                                     detached_signatures_body, msg);
+                                     detached_signatures_body, source, msg);
   } else {
     log_notice(LD_DIR, "Got a signature from %s. "
                        "Queuing it for the next consensus.", source);
     if (!pending_consensus_signature_list)
-      pending_consensus_signature_list = smartlist_create();
+      pending_consensus_signature_list = smartlist_new();
     smartlist_add(pending_consensus_signature_list,
                   tor_strdup(detached_signatures_body));
     *msg = "Signature queued";

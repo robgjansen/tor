@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -54,6 +54,8 @@ uint64_t stats_n_certs_cells_processed = 0;
 uint64_t stats_n_auth_challenge_cells_processed = 0;
 /** How many CELL_AUTHENTICATE cells have we received, ever? */
 uint64_t stats_n_authenticate_cells_processed = 0;
+/** How many CELL_AUTHORIZE cells have we received, ever? */
+uint64_t stats_n_authorize_cells_processed = 0;
 
 /* These are the main functions for processing cells */
 static void command_process_create_cell(cell_t *cell, or_connection_t *conn);
@@ -69,6 +71,8 @@ static void command_process_auth_challenge_cell(var_cell_t *cell,
                                           or_connection_t *conn);
 static void command_process_authenticate_cell(var_cell_t *cell,
                                           or_connection_t *conn);
+static int enter_v3_handshake_with_cell(var_cell_t *cell,
+                                        or_connection_t *conn);
 
 #ifdef KEEP_TIMING_STATS
 /** This is a wrapper function around the actual function that processes the
@@ -156,9 +160,11 @@ command_process_cell(cell_t *cell, or_connection_t *conn)
   if (handshaking && cell->command != CELL_VERSIONS &&
       cell->command != CELL_NETINFO) {
     log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
-           "Received unexpected cell command %d in state %s; ignoring it.",
+           "Received unexpected cell command %d in state %s; closing the "
+           "connection.",
            (int)cell->command,
            conn_state_to_string(CONN_TYPE_OR,conn->_base.state));
+    connection_mark_for_close(TO_CONN(conn));
     return;
   }
 
@@ -203,6 +209,21 @@ command_process_cell(cell_t *cell, or_connection_t *conn)
   }
 }
 
+/** Return true if <b>command</b> is a cell command that's allowed to start a
+ * V3 handshake. */
+static int
+command_allowed_before_handshake(uint8_t command)
+{
+  switch (command) {
+    case CELL_VERSIONS:
+    case CELL_VPADDING:
+    case CELL_AUTHORIZE:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 /** Process a <b>cell</b> that was just received on <b>conn</b>. Keep internal
  * statistics about how many of each cell we've processed so far
  * this second, and the total number of microseconds it took to
@@ -239,8 +260,15 @@ command_process_var_cell(var_cell_t *cell, or_connection_t *conn)
   switch (conn->_base.state)
   {
     case OR_CONN_STATE_OR_HANDSHAKING_V2:
-      if (cell->command != CELL_VERSIONS)
+      if (cell->command != CELL_VERSIONS) {
+        log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
+               "Received a cell with command %d in state %s; "
+               "closing the connection.",
+               (int)cell->command,
+               conn_state_to_string(CONN_TYPE_OR,conn->_base.state));
+        connection_mark_for_close(TO_CONN(conn));
         return;
+      }
       break;
     case OR_CONN_STATE_TLS_HANDSHAKING:
       /* If we're using bufferevents, it's entirely possible for us to
@@ -250,13 +278,17 @@ command_process_var_cell(var_cell_t *cell, or_connection_t *conn)
 
       /* fall through */
     case OR_CONN_STATE_TLS_SERVER_RENEGOTIATING:
-      if (cell->command != CELL_VERSIONS) {
+      if (! command_allowed_before_handshake(cell->command)) {
         log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
-               "Received a non-VERSIONS cell with command %d in state %s; "
-               "ignoring it.",
+               "Received a cell with command %d in state %s; "
+               "closing the connection.",
                (int)cell->command,
                conn_state_to_string(CONN_TYPE_OR,conn->_base.state));
+        connection_mark_for_close(TO_CONN(conn));
         return;
+      } else {
+        if (enter_v3_handshake_with_cell(cell, conn)<0)
+          return;
       }
       break;
     case OR_CONN_STATE_OR_HANDSHAKING_V3:
@@ -304,6 +336,10 @@ command_process_var_cell(var_cell_t *cell, or_connection_t *conn)
     case CELL_AUTHENTICATE:
       ++stats_n_authenticate_cells_processed;
       PROCESS_CELL(authenticate, cell, conn);
+      break;
+    case CELL_AUTHORIZE:
+      ++stats_n_authorize_cells_processed;
+      /* Ignored so far. */
       break;
     default:
       log_fn(LOG_INFO, LD_PROTOCOL,
@@ -565,13 +601,14 @@ command_process_destroy_cell(cell_t *cell, or_connection_t *conn)
   int reason;
 
   circ = circuit_get_by_circid_orconn(cell->circ_id, conn);
-  reason = (uint8_t)cell->payload[0];
   if (!circ) {
     log_info(LD_OR,"unknown circuit %d on connection from %s:%d. Dropping.",
              cell->circ_id, conn->_base.address, conn->_base.port);
     return;
   }
   log_debug(LD_OR,"Received for circID %d.",cell->circ_id);
+
+  reason = (uint8_t)cell->payload[0];
 
   if (!CIRCUIT_IS_ORIGIN(circ) &&
       cell->circ_id == TO_OR_CIRCUIT(circ)->p_circ_id) {
@@ -590,6 +627,35 @@ command_process_destroy_cell(cell_t *cell, or_connection_t *conn)
                                    payload, sizeof(payload), NULL);
     }
   }
+}
+
+/** Called when we as a server receive an appropriate cell while waiting
+ * either for a cell or a TLS handshake.  Set the connection's state to
+ * "handshaking_v3', initializes the or_handshake_state field as needed,
+ * and add the cell to the hash of incoming cells.)
+ *
+ * Return 0 on success; return -1 and mark the connection on failure.
+ */
+static int
+enter_v3_handshake_with_cell(var_cell_t *cell, or_connection_t *conn)
+{
+  const int started_here = connection_or_nonopen_was_started_here(conn);
+
+  tor_assert(conn->_base.state == OR_CONN_STATE_TLS_HANDSHAKING ||
+             conn->_base.state == OR_CONN_STATE_TLS_SERVER_RENEGOTIATING);
+
+  if (started_here) {
+    log_fn(LOG_PROTOCOL_WARN, LD_OR,
+           "Received a cell while TLS-handshaking, not in "
+           "OR_HANDSHAKING_V3, on a connection we originated.");
+  }
+  conn->_base.state = OR_CONN_STATE_OR_HANDSHAKING_V3;
+  if (connection_init_or_handshake_state(conn, started_here) < 0) {
+    connection_mark_for_close(TO_CONN(conn));
+    return -1;
+  }
+  or_handshake_state_record_var_cell(conn->handshake_state, cell, 1);
+  return 0;
 }
 
 /** Process a 'versions' cell.  The current link protocol version must be 0
@@ -614,23 +680,10 @@ command_process_versions_cell(var_cell_t *cell, or_connection_t *conn)
   switch (conn->_base.state)
     {
     case OR_CONN_STATE_OR_HANDSHAKING_V2:
+    case OR_CONN_STATE_OR_HANDSHAKING_V3:
       break;
     case OR_CONN_STATE_TLS_HANDSHAKING:
     case OR_CONN_STATE_TLS_SERVER_RENEGOTIATING:
-      if (started_here) {
-        log_fn(LOG_PROTOCOL_WARN, LD_OR,
-               "Received a versions cell while TLS-handshaking not in "
-               "OR_HANDSHAKING_V3 on a connection we originated.");
-      }
-      conn->_base.state = OR_CONN_STATE_OR_HANDSHAKING_V3;
-      if (connection_init_or_handshake_state(conn, started_here) < 0) {
-        connection_mark_for_close(TO_CONN(conn));
-        return;
-      }
-      or_handshake_state_record_var_cell(conn->handshake_state, cell, 1);
-      break;
-    case OR_CONN_STATE_OR_HANDSHAKING_V3:
-      break;
     default:
       log_fn(LOG_PROTOCOL_WARN, LD_OR,
              "VERSIONS cell while in unexpected state");
@@ -686,10 +739,9 @@ command_process_versions_cell(var_cell_t *cell, or_connection_t *conn)
     const int send_certs = !started_here || public_server_mode(get_options());
     /* If we're a relay that got a connection, ask for authentication. */
     const int send_chall = !started_here && public_server_mode(get_options());
-    /* If our certs cell will authenticate us, or if we have no intention of
-     * authenticating, send a netinfo cell right now. */
-    const int send_netinfo =
-      !(started_here && public_server_mode(get_options()));
+    /* If our certs cell will authenticate us, we can send a netinfo cell
+     * right now. */
+    const int send_netinfo = !started_here;
     const int send_any =
       send_versions || send_certs || send_chall || send_netinfo;
     tor_assert(conn->link_proto >= 3);
@@ -916,6 +968,7 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
 
   uint8_t *ptr;
   int n_certs, i;
+  int send_netinfo = 0;
 
   if (conn->_base.state != OR_CONN_STATE_OR_HANDSHAKING_V3)
     ERR("We're not doing a v3 handshake!");
@@ -1008,7 +1061,7 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
     conn->handshake_state->authenticated = 1;
     {
       const digests_t *id_digests = tor_cert_get_id_digests(id_cert);
-      crypto_pk_env_t *identity_rcvd;
+      crypto_pk_t *identity_rcvd;
       if (!id_digests)
         ERR("Couldn't compute digests for key in ID cert");
 
@@ -1018,7 +1071,7 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
       memcpy(conn->handshake_state->authenticated_peer_id,
              id_digests->d[DIGEST_SHA1], DIGEST_LEN);
       connection_or_set_circid_type(conn, identity_rcvd);
-      crypto_free_pk_env(identity_rcvd);
+      crypto_pk_free(identity_rcvd);
     }
 
     if (connection_or_client_learned_peer_id(conn,
@@ -1030,6 +1083,13 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
 
     conn->handshake_state->id_cert = id_cert;
     id_cert = NULL;
+
+    if (!public_server_mode(get_options())) {
+      /* If we initiated the connection and we are not a public server, we
+       * aren't planning to authenticate at all.  At this point we know who we
+       * are talking to, so we can just send a netinfo now. */
+      send_netinfo = 1;
+    }
   } else {
     if (! (id_cert && auth_cert))
       ERR("The certs we wanted were missing");
@@ -1051,6 +1111,15 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
   }
 
   conn->handshake_state->received_certs_cell = 1;
+
+  if (send_netinfo) {
+    if (connection_or_send_netinfo(conn) < 0) {
+      log_warn(LD_OR, "Couldn't send netinfo cell");
+      connection_mark_for_close(TO_CONN(conn));
+      goto err;
+    }
+  }
+
  err:
   tor_cert_free(id_cert);
   tor_cert_free(link_cert);
@@ -1211,7 +1280,7 @@ command_process_authenticate_cell(var_cell_t *cell, or_connection_t *conn)
     ERR("Some field in the AUTHENTICATE cell body was not as expected");
 
   {
-    crypto_pk_env_t *pk = tor_tls_cert_get_key(
+    crypto_pk_t *pk = tor_tls_cert_get_key(
                                    conn->handshake_state->auth_cert);
     char d[DIGEST256_LEN];
     char *signed_data;
@@ -1227,7 +1296,7 @@ command_process_authenticate_cell(var_cell_t *cell, or_connection_t *conn)
     signed_len = crypto_pk_public_checksig(pk, signed_data, keysize,
                                            (char*)auth + V3_AUTH_BODY_LEN,
                                            authlen - V3_AUTH_BODY_LEN);
-    crypto_free_pk_env(pk);
+    crypto_pk_free(pk);
     if (signed_len < 0) {
       tor_free(signed_data);
       ERR("Signature wasn't valid");
@@ -1250,7 +1319,7 @@ command_process_authenticate_cell(var_cell_t *cell, or_connection_t *conn)
   conn->handshake_state->authenticated = 1;
   conn->handshake_state->digest_received_data = 0;
   {
-    crypto_pk_env_t *identity_rcvd =
+    crypto_pk_t *identity_rcvd =
       tor_tls_cert_get_key(conn->handshake_state->id_cert);
     const digests_t *id_digests =
       tor_cert_get_id_digests(conn->handshake_state->id_cert);
@@ -1262,7 +1331,7 @@ command_process_authenticate_cell(var_cell_t *cell, or_connection_t *conn)
            id_digests->d[DIGEST_SHA1], DIGEST_LEN);
 
     connection_or_set_circid_type(conn, identity_rcvd);
-    crypto_free_pk_env(identity_rcvd);
+    crypto_pk_free(identity_rcvd);
 
     connection_or_init_conn_from_address(conn,
                   &conn->_base.addr,
