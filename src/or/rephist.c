@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -588,7 +588,7 @@ rep_hist_get_weighted_time_known(const char *id, time_t when)
 int
 rep_hist_have_measured_enough_stability(void)
 {
-  /* XXXX022 This doesn't do so well when we change our opinion
+  /* XXXX023 This doesn't do so well when we change our opinion
    * as to whether we're tracking router stability. */
   return started_tracking_stability < time(NULL) - 4*60*60;
 }
@@ -839,7 +839,7 @@ rep_hist_record_mtbf_data(time_t now, int missing_means_down)
       format_iso_time(time_buf, hist->start_of_run);
       t = time_buf;
     }
-    PRINTF((f, "+MTBF %lu %.5lf%s%s\n",
+    PRINTF((f, "+MTBF %lu %.5f%s%s\n",
             hist->weighted_run_length, hist->total_run_weights,
             t ? " S=" : "", t ? t : ""));
     t = NULL;
@@ -889,10 +889,10 @@ rep_hist_format_router_status(or_history_t *hist, time_t now)
   tor_asprintf(&cp,
                "%s%s%s"
                "%s%s%s"
-               "wfu %0.3lf\n"
+               "wfu %0.3f\n"
                " weighted-time %lu\n"
                " weighted-uptime %lu\n"
-               "mtbf %0.1lf\n"
+               "mtbf %0.1f\n"
                " weighted-run-length %lu\n"
                " total-run-weights %f\n",
                up?"uptime-started ":"", up?sor_buf:"", up?" UTC\n":"",
@@ -930,7 +930,7 @@ rep_hist_get_router_stability_doc(time_t now)
     return NULL;
 
   tor_free(last_stability_doc);
-  chunks = smartlist_create();
+  chunks = smartlist_new();
 
   if (rep_hist_have_measured_enough_stability()) {
     smartlist_add(chunks, tor_strdup("we-have-enough-measurements\n"));
@@ -941,7 +941,6 @@ rep_hist_get_router_stability_doc(time_t now)
   DIGESTMAP_FOREACH(history_map, id, or_history_t *, hist) {
     const node_t *node;
     char dbuf[BASE64_DIGEST_LEN+1];
-    char header_buf[512];
     char *info;
     digest_to_base64(dbuf, id);
     node = node_get_by_id(id);
@@ -954,7 +953,7 @@ rep_hist_get_router_stability_doc(time_t now)
         format_iso_time(tbuf, published);
       else
         strlcpy(tbuf, "???", sizeof(tbuf));
-      tor_snprintf(header_buf, sizeof(header_buf),
+      smartlist_add_asprintf(chunks,
                    "router %s %s %s\n"
                    "published %s\n"
                    "relevant-flags %s%s%s\n"
@@ -966,10 +965,9 @@ rep_hist_get_router_stability_doc(time_t now)
                    node->ri && node->ri->is_hibernating ? "Hibernating " : "",
                    node_get_declared_uptime(node));
     } else {
-      tor_snprintf(header_buf, sizeof(header_buf),
+      smartlist_add_asprintf(chunks,
                    "router %s {no descriptor}\n", dbuf);
     }
-    smartlist_add(chunks, tor_strdup(header_buf));
     info = rep_hist_format_router_status(hist, now);
     if (info)
       smartlist_add(chunks, info);
@@ -1063,7 +1061,7 @@ rep_hist_load_mtbf_data(time_t now)
     tor_free(filename);
     if (!d)
       return -1;
-    lines = smartlist_create();
+    lines = smartlist_new();
     smartlist_split_string(lines, d, "\n", SPLIT_SKIP_SPACE, 0);
     tor_free(d);
   }
@@ -1588,7 +1586,6 @@ rep_hist_update_bwhist_state_section(or_state_t *state,
                                      time_t *s_begins,
                                      int *s_interval)
 {
-  char *cp;
   int i,j;
   uint64_t maxval;
 
@@ -1612,31 +1609,31 @@ rep_hist_update_bwhist_state_section(or_state_t *state,
     }
     *s_begins = 0;
     *s_interval = 900;
-    *s_values = smartlist_create();
-    *s_maxima = smartlist_create();
+    *s_values = smartlist_new();
+    *s_maxima = smartlist_new();
     return;
   }
   *s_begins = b->next_period;
   *s_interval = NUM_SECS_BW_SUM_INTERVAL;
 
-  *s_values = smartlist_create();
-  *s_maxima = smartlist_create();
+  *s_values = smartlist_new();
+  *s_maxima = smartlist_new();
   /* Set i to first position in circular array */
   i = (b->num_maxes_set <= b->next_max_idx) ? 0 : b->next_max_idx;
   for (j=0; j < b->num_maxes_set; ++j,++i) {
     if (i >= NUM_TOTALS)
       i = 0;
-    tor_asprintf(&cp, U64_FORMAT, U64_PRINTF_ARG(b->totals[i] & ~0x3ff));
-    smartlist_add(*s_values, cp);
+    smartlist_add_asprintf(*s_values, U64_FORMAT,
+                           U64_PRINTF_ARG(b->totals[i] & ~0x3ff));
     maxval = b->maxima[i] / NUM_SECS_ROLLING_MEASURE;
-    tor_asprintf(&cp, U64_FORMAT, U64_PRINTF_ARG(maxval & ~0x3ff));
-    smartlist_add(*s_maxima, cp);
+    smartlist_add_asprintf(*s_maxima, U64_FORMAT,
+                           U64_PRINTF_ARG(maxval & ~0x3ff));
   }
-  tor_asprintf(&cp, U64_FORMAT, U64_PRINTF_ARG(b->total_in_period & ~0x3ff));
-  smartlist_add(*s_values, cp);
+  smartlist_add_asprintf(*s_values, U64_FORMAT,
+                         U64_PRINTF_ARG(b->total_in_period & ~0x3ff));
   maxval = b->max_total / NUM_SECS_ROLLING_MEASURE;
-  tor_asprintf(&cp, U64_FORMAT, U64_PRINTF_ARG(maxval & ~0x3ff));
-  smartlist_add(*s_maxima, cp);
+  smartlist_add_asprintf(*s_maxima, U64_FORMAT,
+                         U64_PRINTF_ARG(maxval & ~0x3ff));
 }
 
 /** Update <b>state</b> with the newest bandwidth history. Done before
@@ -1775,8 +1772,13 @@ rep_hist_load_state(or_state_t *state, char **err)
 
 /*********************************************************************/
 
+/** A single predicted port: used to remember which ports we've made
+ * connections to, so that we can try to keep making circuits that can handle
+ * those ports. */
 typedef struct predicted_port_t {
+  /** The port we connected to */
   uint16_t port;
+  /** The time at which we last used it */
   time_t time;
 } predicted_port_t;
 
@@ -1804,7 +1806,7 @@ add_predicted_port(time_t now, uint16_t port)
 static void
 predicted_ports_init(void)
 {
-  predicted_ports_list = smartlist_create();
+  predicted_ports_list = smartlist_new();
   add_predicted_port(time(NULL), 80); /* add one to kickstart us */
 }
 
@@ -1853,7 +1855,7 @@ rep_hist_note_used_port(time_t now, uint16_t port)
 smartlist_t *
 rep_hist_get_predicted_ports(time_t now)
 {
-  smartlist_t *out = smartlist_create();
+  smartlist_t *out = smartlist_new();
   tor_assert(predicted_ports_list);
 
   /* clean out obsolete entries */
@@ -1869,6 +1871,26 @@ rep_hist_get_predicted_ports(time_t now)
     }
   } SMARTLIST_FOREACH_END(pp);
   return out;
+}
+
+/**
+ * Take a list of uint16_t *, and remove every port in the list from the
+ * current list of predicted ports.
+ */
+void
+rep_hist_remove_predicted_ports(const smartlist_t *rmv_ports)
+{
+  /* Let's do this on O(N), not O(N^2). */
+  bitarray_t *remove_ports = bitarray_init_zero(UINT16_MAX);
+  SMARTLIST_FOREACH(rmv_ports, const uint16_t *, p,
+                    bitarray_set(remove_ports, *p));
+  SMARTLIST_FOREACH_BEGIN(predicted_ports_list, predicted_port_t *, pp) {
+    if (bitarray_is_set(remove_ports, pp->port)) {
+      tor_free(pp);
+      SMARTLIST_DEL_CURRENT(predicted_ports_list, pp);
+    }
+  } SMARTLIST_FOREACH_END(pp);
+  bitarray_free(remove_ports);
 }
 
 /** The user asked us to do a resolve. Rather than keeping track of
@@ -2125,7 +2147,6 @@ rep_hist_format_exit_stats(time_t now)
   uint64_t cur_bytes = 0, other_read = 0, other_written = 0,
            total_read = 0, total_written = 0;
   uint32_t total_streams = 0, other_streams = 0;
-  char *buf;
   smartlist_t *written_strings, *read_strings, *streams_strings;
   char *written_string, *read_string, *streams_string;
   char t[ISO_TIME_LEN+1];
@@ -2188,9 +2209,9 @@ rep_hist_format_exit_stats(time_t now)
   }
 
   /* Add observations of top ports to smartlists. */
-  written_strings = smartlist_create();
-  read_strings = smartlist_create();
-  streams_strings = smartlist_create();
+  written_strings = smartlist_new();
+  read_strings = smartlist_new();
+  streams_strings = smartlist_new();
   other_read = total_read;
   other_written = total_written;
   other_streams = total_streams;
@@ -2204,9 +2225,8 @@ rep_hist_format_exit_stats(time_t now)
                      exit_bytes_written[cur_port],
                      EXIT_STATS_ROUND_UP_BYTES);
       num /= 1024;
-      buf = NULL;
-      tor_asprintf(&buf, "%d="U64_FORMAT, cur_port, U64_PRINTF_ARG(num));
-      smartlist_add(written_strings, buf);
+      smartlist_add_asprintf(written_strings, "%d="U64_FORMAT,
+                             cur_port, U64_PRINTF_ARG(num));
       other_written -= exit_bytes_written[cur_port];
     }
     if (exit_bytes_read[cur_port] > 0) {
@@ -2214,18 +2234,15 @@ rep_hist_format_exit_stats(time_t now)
                      exit_bytes_read[cur_port],
                      EXIT_STATS_ROUND_UP_BYTES);
       num /= 1024;
-      buf = NULL;
-      tor_asprintf(&buf, "%d="U64_FORMAT, cur_port, U64_PRINTF_ARG(num));
-      smartlist_add(read_strings, buf);
+      smartlist_add_asprintf(read_strings, "%d="U64_FORMAT,
+                             cur_port, U64_PRINTF_ARG(num));
       other_read -= exit_bytes_read[cur_port];
     }
     if (exit_streams[cur_port] > 0) {
       uint32_t num = round_uint32_to_next_multiple_of(
                      exit_streams[cur_port],
                      EXIT_STATS_ROUND_UP_STREAMS);
-      buf = NULL;
-      tor_asprintf(&buf, "%d=%u", cur_port, num);
-      smartlist_add(streams_strings, buf);
+      smartlist_add_asprintf(streams_strings, "%d=%u", cur_port, num);
       other_streams -= exit_streams[cur_port];
     }
   }
@@ -2234,20 +2251,16 @@ rep_hist_format_exit_stats(time_t now)
   other_written = round_uint64_to_next_multiple_of(other_written,
                   EXIT_STATS_ROUND_UP_BYTES);
   other_written /= 1024;
-  buf = NULL;
-  tor_asprintf(&buf, "other="U64_FORMAT, U64_PRINTF_ARG(other_written));
-  smartlist_add(written_strings, buf);
+  smartlist_add_asprintf(written_strings, "other="U64_FORMAT,
+                         U64_PRINTF_ARG(other_written));
   other_read = round_uint64_to_next_multiple_of(other_read,
                EXIT_STATS_ROUND_UP_BYTES);
   other_read /= 1024;
-  buf = NULL;
-  tor_asprintf(&buf, "other="U64_FORMAT, U64_PRINTF_ARG(other_read));
-  smartlist_add(read_strings, buf);
+  smartlist_add_asprintf(read_strings, "other="U64_FORMAT,
+                         U64_PRINTF_ARG(other_read));
   other_streams = round_uint32_to_next_multiple_of(other_streams,
                   EXIT_STATS_ROUND_UP_STREAMS);
-  buf = NULL;
-  tor_asprintf(&buf, "other=%u", other_streams);
-  smartlist_add(streams_strings, buf);
+  smartlist_add_asprintf(streams_strings, "other=%u", other_streams);
 
   /* Join all observations in single strings. */
   written_string = smartlist_join_strings(written_strings, ",", 0, NULL);
@@ -2382,7 +2395,7 @@ rep_hist_add_buffer_stats(double mean_num_cells_in_queue,
   stat->mean_time_cells_in_queue = mean_time_cells_in_queue;
   stat->processed_cells = processed_cells;
   if (!circuits_for_buffer_stats)
-    circuits_for_buffer_stats = smartlist_create();
+    circuits_for_buffer_stats = smartlist_new();
   smartlist_add(circuits_for_buffer_stats, stat);
 }
 
@@ -2451,7 +2464,7 @@ void
 rep_hist_reset_buffer_stats(time_t now)
 {
   if (!circuits_for_buffer_stats)
-    circuits_for_buffer_stats = smartlist_create();
+    circuits_for_buffer_stats = smartlist_new();
   SMARTLIST_FOREACH(circuits_for_buffer_stats, circ_buffer_stats_t *,
       stat, tor_free(stat));
   smartlist_clear(circuits_for_buffer_stats);
@@ -2465,10 +2478,10 @@ char *
 rep_hist_format_buffer_stats(time_t now)
 {
 #define SHARES 10
-  int processed_cells[SHARES], circs_in_share[SHARES],
-      number_of_circuits, i;
+  uint64_t processed_cells[SHARES];
+  uint32_t circs_in_share[SHARES];
+  int number_of_circuits, i;
   double queued_cells[SHARES], time_in_queue[SHARES];
-  char *buf = NULL;
   smartlist_t *processed_cells_strings, *queued_cells_strings,
               *time_in_queue_strings;
   char *processed_cells_string, *queued_cells_string,
@@ -2482,12 +2495,12 @@ rep_hist_format_buffer_stats(time_t now)
   tor_assert(now >= start_of_buffer_stats_interval);
 
   /* Calculate deciles if we saw at least one circuit. */
-  memset(processed_cells, 0, SHARES * sizeof(int));
-  memset(circs_in_share, 0, SHARES * sizeof(int));
+  memset(processed_cells, 0, SHARES * sizeof(uint64_t));
+  memset(circs_in_share, 0, SHARES * sizeof(uint32_t));
   memset(queued_cells, 0, SHARES * sizeof(double));
   memset(time_in_queue, 0, SHARES * sizeof(double));
   if (!circuits_for_buffer_stats)
-    circuits_for_buffer_stats = smartlist_create();
+    circuits_for_buffer_stats = smartlist_new();
   number_of_circuits = smartlist_len(circuits_for_buffer_stats);
   if (number_of_circuits > 0) {
     smartlist_sort(circuits_for_buffer_stats,
@@ -2506,23 +2519,24 @@ rep_hist_format_buffer_stats(time_t now)
   }
 
   /* Write deciles to strings. */
-  processed_cells_strings = smartlist_create();
-  queued_cells_strings = smartlist_create();
-  time_in_queue_strings = smartlist_create();
+  processed_cells_strings = smartlist_new();
+  queued_cells_strings = smartlist_new();
+  time_in_queue_strings = smartlist_new();
   for (i = 0; i < SHARES; i++) {
-    tor_asprintf(&buf,"%d", !circs_in_share[i] ? 0 :
-                 processed_cells[i] / circs_in_share[i]);
-    smartlist_add(processed_cells_strings, buf);
+    smartlist_add_asprintf(processed_cells_strings,
+                           U64_FORMAT, !circs_in_share[i] ? 0 :
+                           U64_PRINTF_ARG(processed_cells[i] /
+                           circs_in_share[i]));
   }
   for (i = 0; i < SHARES; i++) {
-    tor_asprintf(&buf, "%.2f", circs_in_share[i] == 0 ? 0.0 :
-                 queued_cells[i] / (double) circs_in_share[i]);
-    smartlist_add(queued_cells_strings, buf);
+    smartlist_add_asprintf(queued_cells_strings, "%.2f",
+                           circs_in_share[i] == 0 ? 0.0 :
+                             queued_cells[i] / (double) circs_in_share[i]);
   }
   for (i = 0; i < SHARES; i++) {
-    tor_asprintf(&buf, "%.0f", circs_in_share[i] == 0 ? 0.0 :
-                 time_in_queue[i] / (double) circs_in_share[i]);
-    smartlist_add(time_in_queue_strings, buf);
+    smartlist_add_asprintf(time_in_queue_strings, "%.0f",
+                           circs_in_share[i] == 0 ? 0.0 :
+                             time_in_queue[i] / (double) circs_in_share[i]);
   }
 
   /* Join all observations in single strings. */
@@ -2663,22 +2677,30 @@ rep_hist_format_desc_stats(time_t now)
   const char *key;
   void *val;
   unsigned size;
-  int *vals;
+  int *vals, max = 0, q3 = 0, md = 0, q1 = 0, min = 0;
   int n = 0;
 
   if (!start_of_served_descs_stats_interval)
     return NULL;
 
-  size =  digestmap_size(served_descs);
-  vals = tor_malloc(size * sizeof(int));
-
-  for (iter = digestmap_iter_init(served_descs); !digestmap_iter_done(iter);
-      iter = digestmap_iter_next(served_descs, iter) ) {
-    uintptr_t count;
-    digestmap_iter_get(iter, &key, &val);
-    count = (uintptr_t)val;
-    vals[n++] = (int)count;
-    (void)key;
+  size = digestmap_size(served_descs);
+  if (size > 0) {
+    vals = tor_malloc(size * sizeof(int));
+    for (iter = digestmap_iter_init(served_descs);
+         !digestmap_iter_done(iter);
+         iter = digestmap_iter_next(served_descs, iter)) {
+      uintptr_t count;
+      digestmap_iter_get(iter, &key, &val);
+      count = (uintptr_t)val;
+      vals[n++] = (int)count;
+      (void)key;
+    }
+    max = find_nth_int(vals, size, size-1);
+    q3 = find_nth_int(vals, size, (3*size-1)/4);
+    md = find_nth_int(vals, size, (size-1)/2);
+    q1 = find_nth_int(vals, size, (size-1)/4);
+    min = find_nth_int(vals, size, 0);
+    tor_free(vals);
   }
 
   format_iso_time(t, now);
@@ -2689,14 +2711,8 @@ rep_hist_format_desc_stats(time_t now)
                t,
                (unsigned) (now - start_of_served_descs_stats_interval),
                total_descriptor_downloads,
-               size,
-               find_nth_int(vals, size, size-1),
-               find_nth_int(vals, size, (3*size-1)/4),
-               find_nth_int(vals, size, (size-1)/2),
-               find_nth_int(vals, size, (size-1)/4),
-               find_nth_int(vals, size, 0));
+               size, max, q3, md, q1, min);
 
-  tor_free(vals);
   return result;
 }
 
@@ -2716,6 +2732,7 @@ rep_hist_desc_stats_write(time_t now)
     return start_of_served_descs_stats_interval + WRITE_STATS_INTERVAL;
 
   str = rep_hist_format_desc_stats(now);
+  tor_assert(str != NULL);
 
   statsdir = get_datadir_fname("stats");
   if (check_private_dir(statsdir, CPD_CREATE, get_options()->User) < 0) {
@@ -2735,6 +2752,7 @@ rep_hist_desc_stats_write(time_t now)
   return start_of_served_descs_stats_interval + WRITE_STATS_INTERVAL;
 }
 
+/* DOCDOC rep_hist_note_desc_served */
 void
 rep_hist_note_desc_served(const char * desc)
 {
@@ -2776,27 +2794,27 @@ rep_hist_conn_stats_init(time_t now)
  * connection stats. */
 #define BIDI_INTERVAL 10
 
-/* Start of next BIDI_INTERVAL second interval. */
+/** Start of next BIDI_INTERVAL second interval. */
 static time_t bidi_next_interval = 0;
 
-/* Number of connections that we read and wrote less than BIDI_THRESHOLD
+/** Number of connections that we read and wrote less than BIDI_THRESHOLD
  * bytes from/to in BIDI_INTERVAL seconds. */
 static uint32_t below_threshold = 0;
 
-/* Number of connections that we read at least BIDI_FACTOR times more
+/** Number of connections that we read at least BIDI_FACTOR times more
  * bytes from than we wrote to in BIDI_INTERVAL seconds. */
 static uint32_t mostly_read = 0;
 
-/* Number of connections that we wrote at least BIDI_FACTOR times more
+/** Number of connections that we wrote at least BIDI_FACTOR times more
  * bytes to than we read from in BIDI_INTERVAL seconds. */
 static uint32_t mostly_written = 0;
 
-/* Number of connections that we read and wrote at least BIDI_THRESHOLD
+/** Number of connections that we read and wrote at least BIDI_THRESHOLD
  * bytes from/to, but not BIDI_FACTOR times more in either direction in
  * BIDI_INTERVAL seconds. */
 static uint32_t both_read_and_written = 0;
 
-/* Entry in a map from connection ID to the number of read and written
+/** Entry in a map from connection ID to the number of read and written
  * bytes on this connection in a BIDI_INTERVAL second interval. */
 typedef struct bidi_map_entry_t {
   HT_ENTRY(bidi_map_entry_t) node;
@@ -2816,6 +2834,7 @@ bidi_map_ent_eq(const bidi_map_entry_t *a, const bidi_map_entry_t *b)
   return a->conn_id == b->conn_id;
 }
 
+/* DOCDOC bidi_map_ent_hash */
 static unsigned
 bidi_map_ent_hash(const bidi_map_entry_t *entry)
 {
@@ -2827,6 +2846,7 @@ HT_PROTOTYPE(bidimap, bidi_map_entry_t, node, bidi_map_ent_hash,
 HT_GENERATE(bidimap, bidi_map_entry_t, node, bidi_map_ent_hash,
             bidi_map_ent_eq, 0.6, malloc, realloc, free);
 
+/* DOCDOC bidi_map_free */
 static void
 bidi_map_free(void)
 {

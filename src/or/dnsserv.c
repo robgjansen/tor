@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2011, The Tor Project, Inc. */
+/* Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -19,7 +19,7 @@
 #ifdef HAVE_EVENT2_DNS_H
 #include <event2/dns.h>
 #include <event2/dns_compat.h>
-/* XXXX023 this implies we want an improved evdns  */
+/* XXXX this implies we want an improved evdns  */
 #include <event2/dns_struct.h>
 #else
 #include "eventdns.h"

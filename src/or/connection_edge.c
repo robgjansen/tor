@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -76,7 +76,7 @@ _connection_mark_unattached_ap(entry_connection_t *conn, int endreason,
    * being attached to a circuit, assume that an attempt to connect to
    * the destination hidden service has just ended.
    *
-   * XXX023 This condition doesn't limit to only streams failing
+   * XXXX This condition doesn't limit to only streams failing
    * without ever being attached.  That sloppiness should be harmless,
    * but we should fix it someday anyway. */
   if ((edge_conn->on_circuit != NULL || edge_conn->edge_has_sent_end) &&
@@ -457,7 +457,7 @@ connection_edge_about_to_close(edge_connection_t *edge_conn)
   }
 }
 
-/* Called when we're about to finally unlink and free an AP (client)
+/** Called when we're about to finally unlink and free an AP (client)
  * connection: perform necessary accounting and cleanup */
 void
 connection_ap_about_to_close(entry_connection_t *entry_conn)
@@ -492,7 +492,7 @@ connection_ap_about_to_close(entry_connection_t *entry_conn)
     circuit_detach_stream(circ, edge_conn);
 }
 
-/* Called when we're about to finally unlink and free an exit
+/** Called when we're about to finally unlink and free an exit
  * connection: perform necessary accounting and cleanup */
 void
 connection_exit_about_to_close(edge_connection_t *edge_conn)
@@ -622,7 +622,7 @@ connection_ap_expire_beginning(void)
     /* kludge to make us not try this circuit again, yet to allow
      * current streams on it to survive if they can: make it
      * unattractive to use for new streams */
-    /* XXXX023 this is a kludgy way to do this. */
+    /* XXXX024 this is a kludgy way to do this. */
     tor_assert(circ->timestamp_dirty);
     circ->timestamp_dirty -= options->MaxCircuitDirtiness;
     /* give our stream another 'cutoff' seconds to try */
@@ -647,8 +647,7 @@ connection_ap_attach_pending(void)
 {
   entry_connection_t *entry_conn;
   smartlist_t *conns = get_connection_array();
-  SMARTLIST_FOREACH(conns, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(conns, connection_t *, conn) {
     if (conn->marked_for_close ||
         conn->type != CONN_TYPE_AP ||
         conn->state != AP_CONN_STATE_CIRCUIT_WAIT)
@@ -659,12 +658,12 @@ connection_ap_attach_pending(void)
         connection_mark_unattached_ap(entry_conn,
                                       END_STREAM_REASON_CANT_ATTACH);
     }
-  });
+  } SMARTLIST_FOREACH_END(conn);
 }
 
 /** Tell any AP streams that are waiting for a one-hop tunnel to
  * <b>failed_digest</b> that they are going to fail. */
-/* XXX023 We should get rid of this function, and instead attach
+/* XXX024 We should get rid of this function, and instead attach
  * one-hop streams to circ->p_streams so they get marked in
  * circuit_mark_for_close like normal p_streams. */
 void
@@ -803,11 +802,18 @@ connection_ap_detach_retriable(entry_connection_t *conn,
  * the configuration file, "1" for mappings set from the control
  * interface, and other values for DNS and TrackHostExit mappings that can
  * expire.)
+ *
+ * A mapping may be 'wildcarded'.  If "src_wildcard" is true, then
+ * any address that ends with a . followed by the key for this entry will
+ * get remapped by it.  If "dst_wildcard" is also true, then only the
+ * matching suffix of such addresses will get replaced by new_address.
  */
 typedef struct {
   char *new_address;
   time_t expires;
   addressmap_entry_source_t source:3;
+  unsigned src_wildcard:1;
+  unsigned dst_wildcard:1;
   short num_resolve_failures;
 } addressmap_entry_t;
 
@@ -902,13 +908,10 @@ addressmap_ent_remove(const char *address, addressmap_entry_t *ent)
 static void
 clear_trackexithost_mappings(const char *exitname)
 {
-  char *suffix;
-  size_t suffix_len;
+  char *suffix = NULL;
   if (!addressmap || !exitname)
     return;
-  suffix_len = strlen(exitname) + 16;
-  suffix = tor_malloc(suffix_len);
-  tor_snprintf(suffix, suffix_len, ".%s.exit", exitname);
+  tor_asprintf(&suffix, ".%s.exit", exitname);
   tor_strlower(suffix);
 
   STRMAP_FOREACH_MODIFY(addressmap, address, addressmap_entry_t *, ent) {
@@ -1054,45 +1057,118 @@ addressmap_free_all(void)
   virtaddress_reversemap = NULL;
 }
 
+/** Try to find a match for AddressMap expressions that use
+ *  wildcard notation such as '*.c.d *.e.f' (so 'a.c.d' will map to 'a.e.f') or
+ *  '*.c.d a.b.c' (so 'a.c.d' will map to a.b.c).
+ *  Return the matching entry in AddressMap or NULL if no match is found.
+ *  For expressions such as '*.c.d *.e.f', truncate <b>address</b> 'a.c.d'
+ *  to 'a' before we return the matching AddressMap entry.
+ *
+ * This function does not handle the case where a pattern of the form "*.c.d"
+ * matches the address c.d -- that's done by the main addressmap_rewrite
+ * function.
+ */
+static addressmap_entry_t *
+addressmap_match_superdomains(char *address)
+{
+  addressmap_entry_t *val;
+  char *cp;
+
+  cp = address;
+  while ((cp = strchr(cp, '.'))) {
+    /* cp now points to a suffix of address that begins with a . */
+    val = strmap_get_lc(addressmap, cp+1);
+    if (val && val->src_wildcard) {
+      if (val->dst_wildcard)
+        *cp = '\0';
+      return val;
+    }
+    ++cp;
+  }
+  return NULL;
+}
+
 /** Look at address, and rewrite it until it doesn't want any
  * more rewrites; but don't get into an infinite loop.
  * Don't write more than maxlen chars into address.  Return true if the
  * address changed; false otherwise.  Set *<b>expires_out</b> to the
  * expiry time of the result, or to <b>time_max</b> if the result does
  * not expire.
+ *
+ * If <b>exit_source_out</b> is non-null, we set it as follows.  If we the
+ * address starts out as a non-exit address, and we remap it to an .exit
+ * address at any point, then set *<b>exit_source_out</b> to the
+ * address_entry_source_t of the first such rule.  Set *<b>exit_source_out</b>
+ * to ADDRMAPSRC_NONE if there is no such rewrite, or if the original address
+ * was a .exit.
  */
 int
-addressmap_rewrite(char *address, size_t maxlen, time_t *expires_out)
+addressmap_rewrite(char *address, size_t maxlen, time_t *expires_out,
+                   addressmap_entry_source_t *exit_source_out)
 {
   addressmap_entry_t *ent;
   int rewrites;
-  char *cp;
   time_t expires = TIME_MAX;
+  addressmap_entry_source_t exit_source = ADDRMAPSRC_NONE;
+  char *addr_orig = tor_strdup(address);
+  char *log_addr_orig = NULL;
 
   for (rewrites = 0; rewrites < 16; rewrites++) {
+    int exact_match = 0;
+    log_addr_orig = tor_strdup(escaped_safe_str_client(address));
+
     ent = strmap_get(addressmap, address);
 
     if (!ent || !ent->new_address) {
-      if (expires_out)
-        *expires_out = expires;
-      return (rewrites > 0); /* done, no rewrite needed */
+      ent = addressmap_match_superdomains(address);
+    } else {
+      if (ent->src_wildcard && !ent->dst_wildcard &&
+          !strcasecmp(address, ent->new_address)) {
+        /* This is a rule like *.example.com example.com, and we just got
+         * "example.com" */
+        goto done;
+      }
+
+      exact_match = 1;
     }
 
-    cp = tor_strdup(escaped_safe_str_client(ent->new_address));
+    if (!ent || !ent->new_address) {
+      goto done;
+    }
+
+    if (ent->dst_wildcard && !exact_match) {
+      strlcat(address, ".", maxlen);
+      strlcat(address, ent->new_address, maxlen);
+    } else {
+      strlcpy(address, ent->new_address, maxlen);
+    }
+
+    if (!strcmpend(address, ".exit") &&
+        strcmpend(addr_orig, ".exit") &&
+        exit_source == ADDRMAPSRC_NONE) {
+      exit_source = ent->source;
+    }
+
     log_info(LD_APP, "Addressmap: rewriting %s to %s",
-             escaped_safe_str_client(address), cp);
+             log_addr_orig, escaped_safe_str_client(address));
     if (ent->expires > 1 && ent->expires < expires)
       expires = ent->expires;
-    tor_free(cp);
-    strlcpy(address, ent->new_address, maxlen);
+
+    tor_free(log_addr_orig);
   }
   log_warn(LD_CONFIG,
            "Loop detected: we've rewritten %s 16 times! Using it as-is.",
            escaped_safe_str_client(address));
   /* it's fine to rewrite a rewrite, but don't loop forever */
+
+ done:
+  tor_free(addr_orig);
+  tor_free(log_addr_orig);
+  if (exit_source_out)
+    *exit_source_out = exit_source;
   if (expires_out)
     *expires_out = TIME_MAX;
-  return 1;
+  return (rewrites > 0);
 }
 
 /** If we have a cached reverse DNS entry for the address stored in the
@@ -1103,11 +1179,10 @@ addressmap_rewrite(char *address, size_t maxlen, time_t *expires_out)
 static int
 addressmap_rewrite_reverse(char *address, size_t maxlen, time_t *expires_out)
 {
-  size_t len = maxlen + 16;
-  char *s = tor_malloc(len), *cp;
+  char *s, *cp;
   addressmap_entry_t *ent;
   int r = 0;
-  tor_snprintf(s, len, "REVERSE[%s]", address);
+  tor_asprintf(&s, "REVERSE[%s]", address);
   ent = strmap_get(addressmap, s);
   if (ent) {
     cp = tor_strdup(escaped_safe_str_client(ent->new_address));
@@ -1148,17 +1223,34 @@ addressmap_have_mapping(const char *address, int update_expiry)
  * <b>new_address</b> should be a newly dup'ed string, which we'll use or
  * free as appropriate. We will leave address alone.
  *
- * If <b>new_address</b> is NULL, or equal to <b>address</b>, remove
- * any mappings that exist from <b>address</b>.
- */
+ * If <b>wildcard_addr</b> is true, then the mapping will match any address
+ * equal to <b>address</b>, or any address ending with a period followed by
+ * <b>address</b>.  If <b>wildcard_addr</b> and <b>wildcard_new_addr</b> are
+ * both true, the mapping will rewrite addresses that end with
+ * ".<b>address</b>" into ones that end with ".<b>new_address</b>."
+ *
+ * If <b>new_address</b> is NULL, or <b>new_address</b> is equal to
+ * <b>address</b> and <b>wildcard_addr</b> is equal to
+ * <b>wildcard_new_addr</b>, remove any mappings that exist from
+ * <b>address</b>.
+ *
+ *
+ * It is an error to set <b>wildcard_new_addr</b> if <b>wildcard_addr</b> is
+ * not set. */
 void
 addressmap_register(const char *address, char *new_address, time_t expires,
-                    addressmap_entry_source_t source)
+                    addressmap_entry_source_t source,
+                    const int wildcard_addr,
+                    const int wildcard_new_addr)
 {
   addressmap_entry_t *ent;
 
+  if (wildcard_new_addr)
+    tor_assert(wildcard_addr);
+
   ent = strmap_get(addressmap, address);
-  if (!new_address || !strcasecmp(address,new_address)) {
+  if (!new_address || (!strcasecmp(address,new_address) &&
+                       wildcard_addr == wildcard_new_addr)) {
     /* Remove the mapping, if any. */
     tor_free(new_address);
     if (ent) {
@@ -1193,6 +1285,8 @@ addressmap_register(const char *address, char *new_address, time_t expires,
   ent->expires = expires==2 ? 1 : expires;
   ent->num_resolve_failures = 0;
   ent->source = source;
+  ent->src_wildcard = wildcard_addr ? 1 : 0;
+  ent->dst_wildcard = wildcard_new_addr ? 1 : 0;
 
   log_info(LD_CONFIG, "Addressmap: (re)mapped '%s' to '%s'",
            safe_str_client(address),
@@ -1277,7 +1371,7 @@ client_dns_set_addressmap_impl(const char *address, const char *name,
                  "%s", name);
   }
   addressmap_register(extendedaddress, tor_strdup(extendedval),
-                      time(NULL) + ttl, ADDRMAPSRC_DNS);
+                      time(NULL) + ttl, ADDRMAPSRC_DNS, 0, 0);
 }
 
 /** Record the fact that <b>address</b> resolved to <b>val</b>.
@@ -1322,9 +1416,8 @@ client_dns_set_reverse_addressmap(const char *address, const char *v,
                                   const char *exitname,
                                   int ttl)
 {
-  size_t len = strlen(address) + 16;
-  char *s = tor_malloc(len);
-  tor_snprintf(s, len, "REVERSE[%s]", address);
+  char *s = NULL;
+  tor_asprintf(&s, "REVERSE[%s]", address);
   client_dns_set_addressmap_impl(s, v, exitname, ttl);
   tor_free(s);
 }
@@ -1529,7 +1622,7 @@ addressmap_register_virtual_address(int type, char *new_address)
   log_info(LD_APP, "Registering map from %s to %s", *addrp, new_address);
   if (vent_needs_to_be_added)
     strmap_set(virtaddress_reversemap, new_address, vent);
-  addressmap_register(*addrp, new_address, 2, ADDRMAPSRC_AUTOMAP);
+  addressmap_register(*addrp, new_address, 2, ADDRMAPSRC_AUTOMAP, 0, 0);
 
 #if 0
   {
@@ -1608,21 +1701,23 @@ addressmap_get_mappings(smartlist_t *sl, time_t min_expires,
          addressmap_ent_remove(key, val);
          continue;
        } else if (val->new_address) {
-         size_t len = strlen(key)+strlen(val->new_address)+ISO_TIME_LEN+5;
-         char *line = tor_malloc(len);
+         const char *src_wc = val->src_wildcard ? "*." : "";
+         const char *dst_wc = val->dst_wildcard ? "*." : "";
          if (want_expiry) {
            if (val->expires < 3 || val->expires == TIME_MAX)
-             tor_snprintf(line, len, "%s %s NEVER", key, val->new_address);
+             smartlist_add_asprintf(sl, "%s%s %s%s NEVER",
+                                    src_wc, key, dst_wc, val->new_address);
            else {
              char time[ISO_TIME_LEN+1];
              format_iso_time(time, val->expires);
-             tor_snprintf(line, len, "%s %s \"%s\"", key, val->new_address,
-                          time);
+             smartlist_add_asprintf(sl, "%s%s %s%s \"%s\"",
+                                    src_wc, key, dst_wc, val->new_address,
+                                    time);
            }
          } else {
-           tor_snprintf(line, len, "%s %s", key, val->new_address);
+           smartlist_add_asprintf(sl, "%s%s %s%s",
+                                  src_wc, key, dst_wc, val->new_address);
          }
-         smartlist_add(sl, line);
        }
      }
      iter = strmap_iter_next(addressmap,iter);
@@ -1709,17 +1804,25 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
   int automap = 0;
   char orig_address[MAX_SOCKS_ADDR_LEN];
   time_t map_expires = TIME_MAX;
-  /* This will be set to true iff the address starts out as a non-.exit
-     address, and we remap it to one because of an entry in the addressmap. */
-  int remapped_to_exit = 0;
   time_t now = time(NULL);
   connection_t *base_conn = ENTRY_TO_CONN(conn);
+  addressmap_entry_source_t exit_source = ADDRMAPSRC_NONE;
 
   tor_strlower(socks->address); /* normalize it */
   strlcpy(orig_address, socks->address, sizeof(orig_address));
   log_debug(LD_APP,"Client asked for %s:%d",
             safe_str_client(socks->address),
             socks->port);
+
+  if (!strcmpend(socks->address, ".exit") && !options->AllowDotExit) {
+    log_warn(LD_APP, "The  \".exit\" notation is disabled in Tor due to "
+             "security risks. Set AllowDotExit in your torrc to enable "
+             "it (at your own risk).");
+    control_event_client_status(LOG_WARN, "SOCKS_BAD_HOSTNAME HOSTNAME=%s",
+                                escaped(socks->address));
+    connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
+    return -1;
+  }
 
   if (! conn->original_dest_address)
     conn->original_dest_address = tor_strdup(conn->socks_request->address);
@@ -1781,16 +1884,11 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
       }
     }
   } else if (!automap) {
-    int started_without_chosen_exit = strcasecmpend(socks->address, ".exit");
     /* For address map controls, remap the address. */
     if (addressmap_rewrite(socks->address, sizeof(socks->address),
-                           &map_expires)) {
+                           &map_expires, &exit_source)) {
       control_event_stream_status(conn, STREAM_EVENT_REMAP,
                                   REMAP_STREAM_SOURCE_CACHE);
-      if (started_without_chosen_exit &&
-          !strcasecmpend(socks->address, ".exit") &&
-          map_expires < TIME_MAX)
-        remapped_to_exit = 1;
     }
   }
 
@@ -1809,12 +1907,9 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
   /* Parse the address provided by SOCKS.  Modify it in-place if it
    * specifies a hidden-service (.onion) or particular exit node (.exit).
    */
-  addresstype = parse_extended_hostname(socks->address,
-                         remapped_to_exit || options->AllowDotExit);
+  addresstype = parse_extended_hostname(socks->address);
 
   if (addresstype == BAD_HOSTNAME) {
-    log_warn(LD_APP, "Invalid onion hostname %s; rejecting",
-             safe_str_client(socks->address));
     control_event_client_status(LOG_WARN, "SOCKS_BAD_HOSTNAME HOSTNAME=%s",
                                 escaped(socks->address));
     connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
@@ -1831,14 +1926,42 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
       options->_ExcludeExitNodesUnion : options->ExcludeExitNodes;
     const node_t *node;
 
+    if (exit_source == ADDRMAPSRC_AUTOMAP && !options->AllowDotExit) {
+      /* Whoops; this one is stale.  It must have gotten added earlier,
+       * when AllowDotExit was on. */
+      log_warn(LD_APP,"Stale automapped address for '%s.exit', with "
+               "AllowDotExit disabled. Refusing.",
+               safe_str_client(socks->address));
+      control_event_client_status(LOG_WARN, "SOCKS_BAD_HOSTNAME HOSTNAME=%s",
+                                  escaped(socks->address));
+      connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
+      return -1;
+    }
+
+    if (exit_source == ADDRMAPSRC_DNS ||
+        (exit_source == ADDRMAPSRC_NONE && !options->AllowDotExit)) {
+      /* It shouldn't be possible to get a .exit address from any of these
+       * sources. */
+      log_warn(LD_BUG,"Address '%s.exit', with impossible source for the "
+               ".exit part. Refusing.",
+               safe_str_client(socks->address));
+      control_event_client_status(LOG_WARN, "SOCKS_BAD_HOSTNAME HOSTNAME=%s",
+                                  escaped(socks->address));
+      connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
+      return -1;
+    }
+
     tor_assert(!automap);
     if (s) {
       /* The address was of the form "(stuff).(name).exit */
       if (s[1] != '\0') {
         conn->chosen_exit_name = tor_strdup(s+1);
         node = node_get_by_nickname(conn->chosen_exit_name, 1);
-        if (remapped_to_exit) /* 5 tries before it expires the addressmap */
+
+        if (exit_source == ADDRMAPSRC_TRACKEXIT) {
+          /* We 5 tries before it expires the addressmap */
           conn->chosen_exit_retries = TRACKHOSTEXITS_RETRIES;
+        }
         *s = 0;
       } else {
         /* Oops, the address was (stuff)..exit.  That's not okay. */
@@ -1875,7 +1998,7 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
       connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
       return -1;
     }
-    /* XXXX022-1090 Should we also allow foo.bar.exit if ExitNodes is set and
+    /* XXXX024-1090 Should we also allow foo.bar.exit if ExitNodes is set and
        Bar is not listed in it?  I say yes, but our revised manpage branch
        implies no. */
   }
@@ -1889,6 +2012,14 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
                "Destination '%s' seems to be an invalid hostname. Failing.",
                safe_str_client(socks->address));
       connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
+      return -1;
+    }
+
+    if (options->Tor2webMode) {
+      log_warn(LD_APP, "Refusing to connect to non-hidden-service hostname %s "
+               "because tor2web mode is enabled.",
+               safe_str_client(socks->address));
+      connection_mark_unattached_ap(conn, END_STREAM_REASON_ENTRYPOLICY);
       return -1;
     }
 
@@ -1921,20 +2052,35 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
       if (options->ClientRejectInternalAddresses &&
           !conn->use_begindir && !conn->chosen_exit_name && !circ) {
         tor_addr_t addr;
-        if (tor_addr_parse(&addr, socks->address) >= 0 &&
-            tor_addr_is_internal(&addr, 0)) {
+        if (tor_addr_hostname_is_local(socks->address) ||
+            (tor_addr_parse(&addr, socks->address) >= 0 &&
+             tor_addr_is_internal(&addr, 0))) {
           /* If this is an explicit private address with no chosen exit node,
            * then we really don't want to try to connect to it.  That's
            * probably an error. */
           if (conn->is_transparent_ap) {
-            log_warn(LD_NET,
-                     "Rejecting request for anonymous connection to private "
-                     "address %s on a TransPort or NATDPort.  Possible loop "
-                     "in your NAT rules?", safe_str_client(socks->address));
+#define WARN_INTRVL_LOOP 300
+            static ratelim_t loop_warn_limit = RATELIM_INIT(WARN_INTRVL_LOOP);
+            char *m;
+            if ((m = rate_limit_log(&loop_warn_limit, approx_time()))) {
+              log_warn(LD_NET,
+                       "Rejecting request for anonymous connection to private "
+                       "address %s on a TransPort or NATDPort.  Possible loop "
+                       "in your NAT rules?%s", safe_str_client(socks->address),
+                       m);
+              tor_free(m);
+            }
           } else {
-            log_warn(LD_NET,
-                     "Rejecting SOCKS request for anonymous connection to "
-                     "private address %s", safe_str_client(socks->address));
+#define WARN_INTRVL_PRIV 300
+            static ratelim_t priv_warn_limit = RATELIM_INIT(WARN_INTRVL_PRIV);
+            char *m;
+            if ((m = rate_limit_log(&priv_warn_limit, approx_time()))) {
+              log_warn(LD_NET,
+                       "Rejecting SOCKS request for anonymous connection to "
+                       "private address %s.%s",
+                       safe_str_client(socks->address),m);
+              tor_free(m);
+            }
           }
           connection_mark_unattached_ap(conn, END_STREAM_REASON_PRIVATE_ADDR);
           return -1;
@@ -2225,6 +2371,11 @@ connection_ap_handshake_process_socks(entry_connection_t *conn)
     connection_write_to_buf((const char*)socks->reply, socks->replylen,
                             base_conn);
     socks->replylen = 0;
+    if (sockshere == -1) {
+      /* An invalid request just got a reply, no additional
+       * one is necessary. */
+      socks->has_finished = 1;
+    }
   }
 
   if (sockshere == 0) {
@@ -2428,12 +2579,12 @@ connection_ap_handshake_send_begin(entry_connection_t *ap_conn)
 
   edge_conn->stream_id = get_unique_stream_id_by_circ(circ);
   if (edge_conn->stream_id==0) {
-    /* XXXX023 Instead of closing this stream, we should make it get
+    /* XXXX024 Instead of closing this stream, we should make it get
      * retried on another circuit. */
     connection_mark_unattached_ap(ap_conn, END_STREAM_REASON_INTERNAL);
 
     /* Mark this circuit "unusable for new streams". */
-    /* XXXX023 this is a kludgy way to do this. */
+    /* XXXX024 this is a kludgy way to do this. */
     tor_assert(circ->_base.timestamp_dirty);
     circ->_base.timestamp_dirty -= get_options()->MaxCircuitDirtiness;
     return -1;
@@ -2453,7 +2604,9 @@ connection_ap_handshake_send_begin(entry_connection_t *ap_conn)
   begin_type = ap_conn->use_begindir ?
                  RELAY_COMMAND_BEGIN_DIR : RELAY_COMMAND_BEGIN;
   if (begin_type == RELAY_COMMAND_BEGIN) {
+#ifndef NON_ANONYMOUS_MODE_ENABLED
     tor_assert(circ->build_state->onehop_tunnel == 0);
+#endif
   }
 
   if (connection_edge_send_command(edge_conn, begin_type,
@@ -2511,12 +2664,12 @@ connection_ap_handshake_send_resolve(entry_connection_t *ap_conn)
 
   edge_conn->stream_id = get_unique_stream_id_by_circ(circ);
   if (edge_conn->stream_id==0) {
-    /* XXXX023 Instead of closing this stream, we should make it get
+    /* XXXX024 Instead of closing this stream, we should make it get
      * retried on another circuit. */
     connection_mark_unattached_ap(ap_conn, END_STREAM_REASON_INTERNAL);
 
     /* Mark this circuit "unusable for new streams". */
-    /* XXXX023 this is a kludgy way to do this. */
+    /* XXXX024 this is a kludgy way to do this. */
     tor_assert(circ->_base.timestamp_dirty);
     circ->_base.timestamp_dirty -= get_options()->MaxCircuitDirtiness;
     return -1;
@@ -2572,12 +2725,12 @@ connection_ap_handshake_send_resolve(entry_connection_t *ap_conn)
   return 0;
 }
 
-/** Make an AP connection_t, make a new linked connection pair, and attach
- * one side to the conn, connection_add it, initialize it to circuit_wait,
- * and call connection_ap_handshake_attach_circuit(conn) on it.
+/** Make an AP connection_t linked to the connection_t <b>partner</b>. make a
+ * new linked connection pair, and attach one side to the conn, connection_add
+ * it, initialize it to circuit_wait, and call
+ * connection_ap_handshake_attach_circuit(conn) on it.
  *
- * Return the other end of the linked connection pair, or -1 if error.
- * DOCDOC partner.
+ * Return the newly created end of the linked connection pair, or -1 if error.
  */
 entry_connection_t *
 connection_ap_make_link(connection_t *partner,
@@ -2593,7 +2746,7 @@ connection_ap_make_link(connection_t *partner,
            want_onehop ? "direct" : "anonymized",
            safe_str_client(address), port);
 
-  conn = entry_connection_new(CONN_TYPE_AP, AF_INET);
+  conn = entry_connection_new(CONN_TYPE_AP, tor_addr_family(&partner->addr));
   base_conn = ENTRY_TO_CONN(conn);
   base_conn->linked = 1; /* so that we can add it safely below. */
 
@@ -2664,7 +2817,7 @@ tell_controller_about_resolved_result(entry_connection_t *conn,
                    answer_type == RESOLVED_TYPE_HOSTNAME)) {
     return; /* we already told the controller. */
   } else if (answer_type == RESOLVED_TYPE_IPV4 && answer_len >= 4) {
-    char *cp = tor_dup_ip(get_uint32(answer));
+    char *cp = tor_dup_ip(ntohl(get_uint32(answer)));
     control_event_address_mapped(conn->socks_request->address,
                                  cp, expires, NULL);
     tor_free(cp);
@@ -2688,7 +2841,7 @@ tell_controller_about_resolved_result(entry_connection_t *conn,
  * certain errors or for values that didn't come via DNS.  <b>expires</b> is
  * a time when the answer expires, or -1 or TIME_MAX if there's a good TTL.
  **/
-/* XXXX023 the use of the ttl and expires fields is nutty.  Let's make this
+/* XXXX the use of the ttl and expires fields is nutty.  Let's make this
  * interface and those that use it less ugly. */
 void
 connection_ap_handshake_socks_resolved(entry_connection_t *conn,
@@ -3199,7 +3352,7 @@ connection_exit_connect_dir(edge_connection_t *exitconn)
 
   exitconn->_base.state = EXIT_CONN_STATE_OPEN;
 
-  dirconn = dir_connection_new(AF_INET);
+  dirconn = dir_connection_new(tor_addr_family(&exitconn->_base.addr));
 
   tor_addr_copy(&dirconn->_base.addr, &exitconn->_base.addr);
   dirconn->_base.port = 0;
@@ -3287,8 +3440,12 @@ connection_ap_can_use_exit(const entry_connection_t *conn, const node_t *exit)
     }
   }
 
-  if (conn->socks_request->command == SOCKS_COMMAND_CONNECT &&
-      !conn->use_begindir) {
+  if (conn->use_begindir) {
+    /* Internal directory fetches do not count as exiting. */
+    return 1;
+  }
+
+  if (conn->socks_request->command == SOCKS_COMMAND_CONNECT) {
     struct in_addr in;
     tor_addr_t addr, *addrp = NULL;
     addr_policy_result_t r;
@@ -3319,14 +3476,17 @@ connection_ap_can_use_exit(const entry_connection_t *conn, const node_t *exit)
 /** If address is of the form "y.onion" with a well-formed handle y:
  *     Put a NUL after y, lower-case it, and return ONION_HOSTNAME.
  *
- * If address is of the form "y.exit" and <b>allowdotexit</b> is true:
+ * If address is of the form "y.onion" with a badly-formed handle y:
+ *     Return BAD_HOSTNAME and log a message.
+ *
+ * If address is of the form "y.exit":
  *     Put a NUL after y and return EXIT_HOSTNAME.
  *
  * Otherwise:
  *     Return NORMAL_HOSTNAME and change nothing.
  */
 hostname_type_t
-parse_extended_hostname(char *address, int allowdotexit)
+parse_extended_hostname(char *address)
 {
     char *s;
     char query[REND_SERVICE_ID_LEN_BASE32+1];
@@ -3335,16 +3495,8 @@ parse_extended_hostname(char *address, int allowdotexit)
     if (!s)
       return NORMAL_HOSTNAME; /* no dot, thus normal */
     if (!strcmp(s+1,"exit")) {
-      if (allowdotexit) {
-        *s = 0; /* NUL-terminate it */
-        return EXIT_HOSTNAME; /* .exit */
-      } else {
-        log_warn(LD_APP, "The \".exit\" notation is disabled in Tor due to "
-                 "security risks. Set AllowDotExit in your torrc to enable "
-                 "it.");
-        /* FFFF send a controller event too to notify Vidalia users */
-        return BAD_HOSTNAME;
-      }
+      *s = 0; /* NUL-terminate it */
+      return EXIT_HOSTNAME; /* .exit */
     }
     if (strcmp(s+1,"onion"))
       return NORMAL_HOSTNAME; /* neither .exit nor .onion, thus normal */
@@ -3360,6 +3512,8 @@ parse_extended_hostname(char *address, int allowdotexit)
  failed:
     /* otherwise, return to previous state and return 0 */
     *s = '.';
+    log_warn(LD_APP, "Invalid onion hostname %s; rejecting",
+             safe_str_client(address));
     return BAD_HOSTNAME;
 }
 

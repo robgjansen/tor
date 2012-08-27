@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -29,6 +29,7 @@ void reset_bandwidth_test(void);
 int circuit_enough_testing_circs(void);
 
 void circuit_has_opened(origin_circuit_t *circ);
+void circuit_try_attaching_streams(origin_circuit_t *circ);
 void circuit_build_failed(origin_circuit_t *circ);
 
 /** Flag to set when a circuit should have only a single hop. */
@@ -49,6 +50,8 @@ int connection_ap_handshake_attach_chosen_circuit(entry_connection_t *conn,
                                                   origin_circuit_t *circ,
                                                   crypt_path_t *cpath);
 int connection_ap_handshake_attach_circuit(entry_connection_t *conn);
+
+void circuit_change_purpose(circuit_t *circ, uint8_t new_purpose);
 
 int hostname_in_track_host_exits(const or_options_t *options,
                                  const char *address);

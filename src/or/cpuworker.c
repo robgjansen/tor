@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -233,7 +233,7 @@ cpuworker_main(void *data)
   char reply_to_proxy[ONIONSKIN_REPLY_LEN];
   char buf[LEN_ONION_RESPONSE];
   char tag[TAG_LEN];
-  crypto_pk_env_t *onion_key = NULL, *last_onion_key = NULL;
+  crypto_pk_t *onion_key = NULL, *last_onion_key = NULL;
 
   fd = fdarray[1]; /* this side is ours */
 #ifndef TOR_IS_MULTITHREADED
@@ -303,9 +303,9 @@ cpuworker_main(void *data)
   }
  end:
   if (onion_key)
-    crypto_free_pk_env(onion_key);
+    crypto_pk_free(onion_key);
   if (last_onion_key)
-    crypto_free_pk_env(last_onion_key);
+    crypto_pk_free(last_onion_key);
   tor_close_socket(fd);
   crypto_thread_cleanup();
   spawn_exit();
@@ -329,8 +329,8 @@ spawn_cpuworker(void)
     return -1;
   }
 
-  tor_assert(fdarray[0] >= 0);
-  tor_assert(fdarray[1] >= 0);
+  tor_assert(SOCKET_OK(fdarray[0]));
+  tor_assert(SOCKET_OK(fdarray[1]));
 
   fd = fdarray[0];
   spawn_func(cpuworker_main, (void*)fdarray);
@@ -347,6 +347,7 @@ spawn_cpuworker(void)
   /* set up conn so it's got all the data we need to remember */
   conn->s = fd;
   conn->address = tor_strdup("localhost");
+  tor_addr_make_unspec(&conn->addr);
 
   if (connection_add(conn) < 0) { /* no space, forget it */
     log_warn(LD_NET,"connection_add for cpuworker failed. Giving up.");
@@ -416,8 +417,7 @@ cull_wedged_cpuworkers(void)
 {
   time_t now = time(NULL);
   smartlist_t *conns = get_connection_array();
-  SMARTLIST_FOREACH(conns, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(conns, connection_t *, conn) {
     if (!conn->marked_for_close &&
         conn->type == CONN_TYPE_CPUWORKER &&
         conn->state == CPUWORKER_STATE_BUSY_ONION &&
@@ -428,7 +428,7 @@ cull_wedged_cpuworkers(void)
       num_cpuworkers--;
       connection_mark_for_close(conn);
     }
-  });
+  } SMARTLIST_FOREACH_END(conn);
 }
 
 /** Try to tell a cpuworker to perform the public key operations necessary to

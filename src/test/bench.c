@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /* Ordinarily defined in tor_main.c; this bit is just here to provide one
@@ -73,13 +73,12 @@ bench_aes(void)
 {
   int len, i;
   char *b1, *b2;
-  crypto_cipher_env_t *c;
+  crypto_cipher_t *c;
   uint64_t start, end;
   const int bytes_per_iter = (1<<24);
   reset_perftime();
-  c = crypto_new_cipher_env();
-  crypto_cipher_generate_key(c);
-  crypto_cipher_encrypt_init_cipher(c);
+  c = crypto_cipher_new(NULL);
+
   for (len = 1; len <= 8192; len *= 2) {
     int iters = bytes_per_iter / len;
     b1 = tor_malloc_zero(len);
@@ -94,7 +93,7 @@ bench_aes(void)
     printf("%d bytes: %.2f nsec per byte\n", len,
            NANOCOUNT(start, end, iters*len));
   }
-  crypto_free_cipher_env(c);
+  crypto_cipher_free(c);
 }
 
 static void
@@ -105,12 +104,10 @@ bench_cell_aes(void)
   const int iters = (1<<16);
   const int max_misalign = 15;
   char *b = tor_malloc(len+max_misalign);
-  crypto_cipher_env_t *c;
+  crypto_cipher_t *c;
   int i, misalign;
 
-  c = crypto_new_cipher_env();
-  crypto_cipher_generate_key(c);
-  crypto_cipher_encrypt_init_cipher(c);
+  c = crypto_cipher_new(NULL);
 
   reset_perftime();
   for (misalign = 0; misalign <= max_misalign; ++misalign) {
@@ -123,7 +120,7 @@ bench_cell_aes(void)
            NANOCOUNT(start, end, iters*len));
   }
 
-  crypto_free_cipher_env(c);
+  crypto_cipher_free(c);
   tor_free(b);
 }
 
@@ -131,8 +128,8 @@ bench_cell_aes(void)
 static void
 bench_dmap(void)
 {
-  smartlist_t *sl = smartlist_create();
-  smartlist_t *sl2 = smartlist_create();
+  smartlist_t *sl = smartlist_new();
+  smartlist_t *sl2 = smartlist_new();
   uint64_t start, end, pt2, pt3, pt4;
   int iters = 8192;
   const int elts = 4000;
@@ -221,14 +218,10 @@ bench_cell_ops(void)
   or_circ->_base.purpose = CIRCUIT_PURPOSE_OR;
 
   /* Initialize crypto */
-  or_circ->p_crypto = crypto_new_cipher_env();
-  crypto_cipher_generate_key(or_circ->p_crypto);
-  crypto_cipher_encrypt_init_cipher(or_circ->p_crypto);
-  or_circ->n_crypto = crypto_new_cipher_env();
-  crypto_cipher_generate_key(or_circ->n_crypto);
-  crypto_cipher_encrypt_init_cipher(or_circ->n_crypto);
-  or_circ->p_digest = crypto_new_digest_env();
-  or_circ->n_digest = crypto_new_digest_env();
+  or_circ->p_crypto = crypto_cipher_new(NULL);
+  or_circ->n_crypto = crypto_cipher_new(NULL);
+  or_circ->p_digest = crypto_digest_new();
+  or_circ->n_digest = crypto_digest_new();
 
   reset_perftime();
 
@@ -247,10 +240,10 @@ bench_cell_ops(void)
            NANOCOUNT(start,end,iters*CELL_PAYLOAD_SIZE));
   }
 
-  crypto_free_digest_env(or_circ->p_digest);
-  crypto_free_digest_env(or_circ->n_digest);
-  crypto_free_cipher_env(or_circ->p_crypto);
-  crypto_free_cipher_env(or_circ->n_crypto);
+  crypto_digest_free(or_circ->p_digest);
+  crypto_digest_free(or_circ->n_digest);
+  crypto_cipher_free(or_circ->p_crypto);
+  crypto_cipher_free(or_circ->n_crypto);
   tor_free(or_circ);
   tor_free(cell);
 }

@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /* Ordinarily defined in tor_main.c; this bit is just here to provide one
@@ -19,7 +19,7 @@ const char tor_git_revision[] = "";
 #include <fcntl.h>
 #endif
 
-#ifdef MS_WINDOWS
+#ifdef _WIN32
 /* For mkdir() */
 #include <direct.h>
 #else
@@ -71,6 +71,9 @@ int have_failed = 0;
 /** Temporary directory (set up by setup_directory) under which we store all
  * our files during testing. */
 static char temp_dir[256];
+#ifdef _WIN32
+#define pid_t int
+#endif
 static pid_t temp_dir_setup_in_pid = 0;
 
 /** Select and create the temporary directory we'll use to run our unit tests.
@@ -83,12 +86,12 @@ setup_directory(void)
   int r;
   if (is_setup) return;
 
-#ifdef MS_WINDOWS
+#ifdef _WIN32
   {
     char buf[MAX_PATH];
     const char *tmp = buf;
     /* If this fails, we're probably screwed anyway */
-    if (!GetTempPath(sizeof(buf),buf))
+    if (!GetTempPathA(sizeof(buf),buf))
       tmp = "c:\\windows\\temp";
     tor_snprintf(temp_dir, sizeof(temp_dir),
                  "%s\\tor_test_%d", tmp, (int)getpid());
@@ -128,8 +131,7 @@ rm_rf(const char *dir)
 
   elements = tor_listdir(dir);
   if (elements) {
-    SMARTLIST_FOREACH(elements, const char *, cp,
-       {
+    SMARTLIST_FOREACH_BEGIN(elements, const char *, cp) {
          char *tmp = NULL;
          tor_asprintf(&tmp, "%s"PATH_SEPARATOR"%s", dir, cp);
          if (0 == stat(tmp,&st) && (st.st_mode & S_IFDIR)) {
@@ -140,7 +142,7 @@ rm_rf(const char *dir)
            }
          }
          tor_free(tmp);
-       });
+    } SMARTLIST_FOREACH_END(cp);
     SMARTLIST_FOREACH(elements, char *, cp, tor_free(cp));
     smartlist_free(elements);
   }
@@ -164,27 +166,27 @@ remove_directory(void)
 /** Define this if unit tests spend too much time generating public keys*/
 #undef CACHE_GENERATED_KEYS
 
-static crypto_pk_env_t *pregen_keys[5] = {NULL, NULL, NULL, NULL, NULL};
+static crypto_pk_t *pregen_keys[5] = {NULL, NULL, NULL, NULL, NULL};
 #define N_PREGEN_KEYS ((int)(sizeof(pregen_keys)/sizeof(pregen_keys[0])))
 
 /** Generate and return a new keypair for use in unit tests.  If we're using
  * the key cache optimization, we might reuse keys: we only guarantee that
  * keys made with distinct values for <b>idx</b> are different.  The value of
  * <b>idx</b> must be at least 0, and less than N_PREGEN_KEYS. */
-crypto_pk_env_t *
+crypto_pk_t *
 pk_generate(int idx)
 {
 #ifdef CACHE_GENERATED_KEYS
   tor_assert(idx < N_PREGEN_KEYS);
   if (! pregen_keys[idx]) {
-    pregen_keys[idx] = crypto_new_pk_env();
+    pregen_keys[idx] = crypto_pk_new();
     tor_assert(!crypto_pk_generate_key(pregen_keys[idx]));
   }
   return crypto_pk_dup_key(pregen_keys[idx]);
 #else
-  crypto_pk_env_t *result;
+  crypto_pk_t *result;
   (void) idx;
-  result = crypto_new_pk_env();
+  result = crypto_pk_new();
   tor_assert(!crypto_pk_generate_key(result));
   return result;
 #endif
@@ -197,7 +199,7 @@ free_pregenerated_keys(void)
   unsigned idx;
   for (idx = 0; idx < N_PREGEN_KEYS; ++idx) {
     if (pregen_keys[idx]) {
-      crypto_free_pk_env(pregen_keys[idx]);
+      crypto_pk_free(pregen_keys[idx]);
       pregen_keys[idx] = NULL;
     }
   }
@@ -812,7 +814,7 @@ static void
 test_onion_handshake(void)
 {
   /* client-side */
-  crypto_dh_env_t *c_dh = NULL;
+  crypto_dh_t *c_dh = NULL;
   char c_buf[ONIONSKIN_CHALLENGE_LEN];
   char c_keys[40];
 
@@ -821,7 +823,7 @@ test_onion_handshake(void)
   char s_keys[40];
 
   /* shared */
-  crypto_pk_env_t *pk = NULL;
+  crypto_pk_t *pk = NULL;
 
   pk = pk_generate(0);
 
@@ -851,7 +853,7 @@ test_onion_handshake(void)
   if (c_dh)
     crypto_dh_free(c_dh);
   if (pk)
-    crypto_free_pk_env(pk);
+    crypto_pk_free(pk);
 }
 
 static void
@@ -1010,7 +1012,7 @@ test_policy_summary_helper(const char *policy_str,
                            const char *expected_summary)
 {
   config_line_t line;
-  smartlist_t *policy = smartlist_create();
+  smartlist_t *policy = smartlist_new();
   char *summary = NULL;
   int r;
   short_policy_t *short_policy = NULL;
@@ -1050,7 +1052,7 @@ test_policies(void)
   smartlist_t *sm = NULL;
   char *policy_str = NULL;
 
-  policy = smartlist_create();
+  policy = smartlist_new();
 
   p = router_parse_addr_policy_item_from_string("reject 192.168.0.0/16:*",-1);
   test_assert(p != NULL);
@@ -1076,7 +1078,7 @@ test_policies(void)
   test_assert(0 == policies_parse_exit_policy(NULL, &policy2, 1, NULL, 1));
   test_assert(policy2);
 
-  policy3 = smartlist_create();
+  policy3 = smartlist_new();
   p = router_parse_addr_policy_item_from_string("reject *:*",-1);
   test_assert(p != NULL);
   smartlist_add(policy3, p);
@@ -1084,7 +1086,7 @@ test_policies(void)
   test_assert(p != NULL);
   smartlist_add(policy3, p);
 
-  policy4 = smartlist_create();
+  policy4 = smartlist_new();
   p = router_parse_addr_policy_item_from_string("accept *:443",-1);
   test_assert(p != NULL);
   smartlist_add(policy4, p);
@@ -1092,7 +1094,7 @@ test_policies(void)
   test_assert(p != NULL);
   smartlist_add(policy4, p);
 
-  policy5 = smartlist_create();
+  policy5 = smartlist_new();
   p = router_parse_addr_policy_item_from_string("reject 0.0.0.0/8:*",-1);
   test_assert(p != NULL);
   smartlist_add(policy5, p);
@@ -1124,12 +1126,12 @@ test_policies(void)
   test_assert(p != NULL);
   smartlist_add(policy5, p);
 
-  policy6 = smartlist_create();
+  policy6 = smartlist_new();
   p = router_parse_addr_policy_item_from_string("accept 43.3.0.0/9:*",-1);
   test_assert(p != NULL);
   smartlist_add(policy6, p);
 
-  policy7 = smartlist_create();
+  policy7 = smartlist_new();
   p = router_parse_addr_policy_item_from_string("accept 0.0.0.0/8:*",-1);
   test_assert(p != NULL);
   smartlist_add(policy7, p);
@@ -1226,7 +1228,7 @@ test_policies(void)
                              "reject 1,3,5,7");
 
   /* truncation ports */
-  sm = smartlist_create();
+  sm = smartlist_new();
   for (i=1; i<2000; i+=2) {
     char buf[POLICY_BUF_LEN];
     tor_snprintf(buf, sizeof(buf), "reject *:%d", i);
@@ -1273,10 +1275,10 @@ test_rend_fns(void)
   char service_id[DIGEST_LEN];
   char service_id_base32[REND_SERVICE_ID_LEN_BASE32+1];
   const char *next_desc;
-  smartlist_t *descs = smartlist_create();
+  smartlist_t *descs = smartlist_new();
   char computed_desc_id[DIGEST_LEN];
   char parsed_desc_id[DIGEST_LEN];
-  crypto_pk_env_t *pk1 = NULL, *pk2 = NULL;
+  crypto_pk_t *pk1 = NULL, *pk2 = NULL;
   time_t now;
   char *intro_points_encrypted = NULL;
   size_t intro_points_size;
@@ -1287,10 +1289,10 @@ test_rend_fns(void)
   char address3[] = "fooaddress.exit";
   char address4[] = "www.torproject.org";
 
-  test_assert(BAD_HOSTNAME == parse_extended_hostname(address1, 1));
-  test_assert(ONION_HOSTNAME == parse_extended_hostname(address2, 1));
-  test_assert(EXIT_HOSTNAME == parse_extended_hostname(address3, 1));
-  test_assert(NORMAL_HOSTNAME == parse_extended_hostname(address4, 1));
+  test_assert(BAD_HOSTNAME == parse_extended_hostname(address1));
+  test_assert(ONION_HOSTNAME == parse_extended_hostname(address2));
+  test_assert(EXIT_HOSTNAME == parse_extended_hostname(address3));
+  test_assert(NORMAL_HOSTNAME == parse_extended_hostname(address4));
 
   pk1 = pk_generate(0);
   pk2 = pk_generate(1);
@@ -1303,11 +1305,11 @@ test_rend_fns(void)
   generated->timestamp = now;
   generated->version = 2;
   generated->protocols = 42;
-  generated->intro_nodes = smartlist_create();
+  generated->intro_nodes = smartlist_new();
 
   for (i = 0; i < 3; i++) {
     rend_intro_point_t *intro = tor_malloc_zero(sizeof(rend_intro_point_t));
-    crypto_pk_env_t *okey = pk_generate(2 + i);
+    crypto_pk_t *okey = pk_generate(2 + i);
     intro->extend_info = tor_malloc_zero(sizeof(extend_info_t));
     intro->extend_info->onion_key = okey;
     crypto_pk_get_digest(intro->extend_info->onion_key,
@@ -1374,9 +1376,9 @@ test_rend_fns(void)
   if (generated)
     rend_service_descriptor_free(generated);
   if (pk1)
-    crypto_free_pk_env(pk1);
+    crypto_pk_free(pk1);
   if (pk2)
-    crypto_free_pk_env(pk2);
+    crypto_pk_free(pk2);
   tor_free(intro_points_encrypted);
 }
 
@@ -1452,6 +1454,7 @@ test_geoip(void)
   *entry_stats_2 =
       "entry-stats-end 2010-08-12 13:27:30 (86400 s)\n"
       "entry-ips \n";
+  tor_addr_t addr;
 
   /* Populate the DB a bit.  Add these in order, since we can't do the final
    * 'sort' step.  These aren't very good IP addresses, but they're perfectly
@@ -1480,16 +1483,23 @@ test_geoip(void)
   get_options_mutable()->BridgeRelay = 1;
   get_options_mutable()->BridgeRecordUsageByCountry = 1;
   /* Put 9 observations in AB... */
-  for (i=32; i < 40; ++i)
-    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, i, now-7200);
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 225, now-7200);
+  for (i=32; i < 40; ++i) {
+    tor_addr_from_ipv4h(&addr, (uint32_t) i);
+    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now-7200);
+  }
+  tor_addr_from_ipv4h(&addr, (uint32_t) 225);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now-7200);
   /* and 3 observations in XY, several times. */
   for (j=0; j < 10; ++j)
-    for (i=52; i < 55; ++i)
-      geoip_note_client_seen(GEOIP_CLIENT_CONNECT, i, now-3600);
+    for (i=52; i < 55; ++i) {
+      tor_addr_from_ipv4h(&addr, (uint32_t) i);
+      geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now-3600);
+    }
   /* and 17 observations in ZZ... */
-  for (i=110; i < 127; ++i)
-    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, i, now);
+  for (i=110; i < 127; ++i) {
+    tor_addr_from_ipv4h(&addr, (uint32_t) i);
+    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
+  }
   s = geoip_get_client_history(GEOIP_CLIENT_CONNECT);
   test_assert(s);
   test_streq("zz=24,ab=16,xy=8", s);
@@ -1528,14 +1538,16 @@ test_geoip(void)
 
   /* Start testing dirreq statistics by making sure that we don't collect
    * dirreq stats without initializing them. */
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_assert(!s);
 
   /* Initialize stats, note one connecting client, and generate the
    * dirreq-stats history string. */
   geoip_dirreq_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_streq(dirreq_stats_1, s);
   tor_free(s);
@@ -1543,14 +1555,16 @@ test_geoip(void)
   /* Stop collecting stats, add another connecting client, and ensure we
    * don't generate a history string. */
   geoip_dirreq_stats_term();
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 101, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 101);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_assert(!s);
 
   /* Re-start stats, add a connecting client, reset stats, and make sure
    * that we get an all empty history string. */
   geoip_dirreq_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   geoip_reset_dirreq_stats(now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_streq(dirreq_stats_2, s);
@@ -1577,14 +1591,16 @@ test_geoip(void)
 
   /* Start testing entry statistics by making sure that we don't collect
    * anything without initializing entry stats. */
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   s = geoip_format_entry_stats(now + 86400);
   test_assert(!s);
 
   /* Initialize stats, note one connecting client, and generate the
    * entry-stats history string. */
   geoip_entry_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   s = geoip_format_entry_stats(now + 86400);
   test_streq(entry_stats_1, s);
   tor_free(s);
@@ -1592,14 +1608,16 @@ test_geoip(void)
   /* Stop collecting stats, add another connecting client, and ensure we
    * don't generate a history string. */
   geoip_entry_stats_term();
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 101, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 101);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   s = geoip_format_entry_stats(now + 86400);
   test_assert(!s);
 
   /* Re-start stats, add a connecting client, reset stats, and make sure
    * that we get an all empty history string. */
   geoip_entry_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   geoip_reset_entry_stats(now);
   s = geoip_format_entry_stats(now + 86400);
   test_streq(entry_stats_2, s);
@@ -1844,6 +1862,7 @@ extern struct testcase_t util_tests[];
 extern struct testcase_t dir_tests[];
 extern struct testcase_t microdesc_tests[];
 extern struct testcase_t pt_tests[];
+extern struct testcase_t config_tests[];
 
 static struct testgroup_t testgroups[] = {
   { "", test_array },
@@ -1855,6 +1874,7 @@ static struct testgroup_t testgroups[] = {
   { "dir/", dir_tests },
   { "dir/md/", microdesc_tests },
   { "pt/", pt_tests },
+  { "config/", config_tests },
   END_OF_GROUPS
 };
 
@@ -1907,6 +1927,7 @@ main(int c, const char **v)
     printf("Can't initialize crypto subsystem; exiting.\n");
     return 1;
   }
+  crypto_set_tls_dh_prime(NULL);
   rep_hist_init();
   network_init();
   setup_directory();

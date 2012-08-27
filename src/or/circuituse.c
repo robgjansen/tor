@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -73,6 +73,11 @@ circuit_is_acceptable(const origin_circuit_t *origin_circ,
   } else {
     if (purpose != circ->purpose)
       return 0;
+  }
+
+  /* If this is a timed-out hidden service circuit, skip it. */
+  if (origin_circ->hs_circ_has_timed_out) {
+    return 0;
   }
 
   if (purpose == CIRCUIT_PURPOSE_C_GENERAL ||
@@ -351,7 +356,9 @@ circuit_expire_building(void)
    * circuit_build_times_get_initial_timeout() if we haven't computed
    * custom timeouts yet */
   struct timeval general_cutoff, begindir_cutoff, fourhop_cutoff,
-    cannibalize_cutoff, close_cutoff, extremely_old_cutoff;
+    cannibalize_cutoff, close_cutoff, extremely_old_cutoff,
+    hs_extremely_old_cutoff;
+  const or_options_t *options = get_options();
   struct timeval now;
   cpath_build_state_t *build_state;
 
@@ -370,6 +377,10 @@ circuit_expire_building(void)
   SET_CUTOFF(cannibalize_cutoff, circ_times.timeout_ms / 2.0);
   SET_CUTOFF(close_cutoff, circ_times.close_ms);
   SET_CUTOFF(extremely_old_cutoff, circ_times.close_ms*2 + 1000);
+
+  SET_CUTOFF(hs_extremely_old_cutoff,
+             MAX(circ_times.close_ms*2 + 1000,
+                 options->SocksTimeout * 1000));
 
   while (next_circ) {
     struct timeval cutoff;
@@ -391,6 +402,9 @@ circuit_expire_building(void)
       cutoff = close_cutoff;
     else
       cutoff = general_cutoff;
+
+    if (TO_ORIGIN_CIRCUIT(victim)->hs_circ_has_timed_out)
+      cutoff = hs_extremely_old_cutoff;
 
     if (timercmp(&victim->timestamp_created, &cutoff, >))
       continue; /* it's still young, leave it alone */
@@ -467,7 +481,7 @@ circuit_expire_building(void)
           control_event_circuit_status(TO_ORIGIN_CIRCUIT(victim),
                                        CIRC_EVENT_FAILED,
                                        END_CIRC_REASON_TIMEOUT);
-          victim->purpose = CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT;
+          circuit_change_purpose(victim, CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT);
           /* Record this failure to check for too many timeouts
            * in a row. This function does not record a time value yet
            * (we do that later); it only counts the fact that we did
@@ -495,6 +509,60 @@ circuit_expire_building(void)
           circuit_build_times_set_timeout(&circ_times);
         }
       }
+    }
+
+    /* If this is a hidden service client circuit which is far enough
+     * along in connecting to its destination, and we haven't already
+     * flagged it as 'timed out', and the user has not told us to
+     * close such circs immediately on timeout, flag it as 'timed out'
+     * so we'll launch another intro or rend circ, but don't mark it
+     * for close yet.
+     *
+     * (Circs flagged as 'timed out' are given a much longer timeout
+     * period above, so we won't close them in the next call to
+     * circuit_expire_building.) */
+    if (!(options->CloseHSClientCircuitsImmediatelyOnTimeout) &&
+        !(TO_ORIGIN_CIRCUIT(victim)->hs_circ_has_timed_out)) {
+      switch (victim->purpose) {
+      case CIRCUIT_PURPOSE_C_REND_READY:
+        /* We only want to spare a rend circ if it has been specified in
+         * an INTRODUCE1 cell sent to a hidden service.  A circ's
+         * pending_final_cpath field is non-NULL iff it is a rend circ
+         * and we have tried to send an INTRODUCE1 cell specifying it.
+         * Thus, if the pending_final_cpath field *is* NULL, then we
+         * want to not spare it. */
+        if (TO_ORIGIN_CIRCUIT(victim)->build_state->pending_final_cpath ==
+            NULL)
+          break;
+      case CIRCUIT_PURPOSE_C_INTRODUCE_ACK_WAIT:
+      case CIRCUIT_PURPOSE_C_REND_READY_INTRO_ACKED:
+        /* If we have reached this line, we want to spare the circ for now. */
+        log_info(LD_CIRC,"Marking circ %d (state %d:%s, purpose %d) "
+                 "as timed-out HS circ",
+                 victim->n_circ_id,
+                 victim->state, circuit_state_to_string(victim->state),
+                 victim->purpose);
+        TO_ORIGIN_CIRCUIT(victim)->hs_circ_has_timed_out = 1;
+        continue;
+      default:
+        break;
+      }
+    }
+
+    /* If this is a service-side rendezvous circuit which is far
+     * enough along in connecting to its destination, consider sparing
+     * it. */
+    if (!(options->CloseHSServiceRendCircuitsImmediatelyOnTimeout) &&
+        !(TO_ORIGIN_CIRCUIT(victim)->hs_circ_has_timed_out) &&
+        victim->purpose == CIRCUIT_PURPOSE_S_CONNECT_REND) {
+      log_info(LD_CIRC,"Marking circ %d (state %d:%s, purpose %d) "
+               "as timed-out HS circ; relaunching rendezvous attempt.",
+               victim->n_circ_id,
+               victim->state, circuit_state_to_string(victim->state),
+               victim->purpose);
+      TO_ORIGIN_CIRCUIT(victim)->hs_circ_has_timed_out = 1;
+      rend_service_relaunch_rendezvous(TO_ORIGIN_CIRCUIT(victim));
+      continue;
     }
 
     if (victim->n_conn)
@@ -678,6 +746,7 @@ circuit_predict_and_launch_new(void)
    * want, don't do another -- we want to leave a few slots open so
    * we can still build circuits preemptively as needed. */
   if (num < MAX_UNUSED_OPEN_CIRCUITS-2 &&
+      get_options()->LearnCircuitBuildTimeout &&
       circuit_build_times_needs_circuits_now(&circ_times)) {
     flags = CIRCLAUNCH_NEED_CAPACITY;
     log_info(LD_CIRC,
@@ -813,7 +882,8 @@ circuit_expire_old_circuits_clientside(void)
   tor_gettimeofday(&now);
   cutoff = now;
 
-  if (circuit_build_times_needs_circuits(&circ_times)) {
+  if (get_options()->LearnCircuitBuildTimeout &&
+      circuit_build_times_needs_circuits(&circ_times)) {
     /* Circuits should be shorter lived if we need more of them
      * for learning a good build timeout */
     cutoff.tv_sec -= IDLE_TIMEOUT_WHILE_LEARNING;
@@ -1004,7 +1074,6 @@ circuit_testing_failed(origin_circuit_t *circ, int at_last_hop)
 void
 circuit_has_opened(origin_circuit_t *circ)
 {
-  int can_try_clearing_isolation = 0, tried_clearing_isolation = 0;
   control_event_circuit_status(circ, CIRC_EVENT_BUILT, 0);
 
   /* Remember that this circuit has finished building. Now if we start
@@ -1012,13 +1081,18 @@ circuit_has_opened(origin_circuit_t *circ)
    * to consider its build time. */
   circ->has_opened = 1;
 
- again:
-
   switch (TO_CIRCUIT(circ)->purpose) {
     case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
       rend_client_rendcirc_has_opened(circ);
-      can_try_clearing_isolation = 1;
+      /* Start building an intro circ if we don't have one yet. */
       connection_ap_attach_pending();
+      /* This isn't a call to circuit_try_attaching_streams because a
+       * circuit in _C_ESTABLISH_REND state isn't connected to its
+       * hidden service yet, thus we can't attach streams to it yet,
+       * thus circuit_try_attaching_streams would always clear the
+       * circuit's isolation state.  circuit_try_attaching_streams is
+       * called later, when the rend circ enters _C_REND_JOINED
+       * state. */
       break;
     case CIRCUIT_PURPOSE_C_INTRODUCING:
       rend_client_introcirc_has_opened(circ);
@@ -1026,8 +1100,7 @@ circuit_has_opened(origin_circuit_t *circ)
     case CIRCUIT_PURPOSE_C_GENERAL:
       /* Tell any AP connections that have been waiting for a new
        * circuit that one is ready. */
-      can_try_clearing_isolation = 1;
-      connection_ap_attach_pending();
+      circuit_try_attaching_streams(circ);
       break;
     case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
       /* at Bob, waiting for introductions */
@@ -1044,12 +1117,15 @@ circuit_has_opened(origin_circuit_t *circ)
      * This won't happen in normal operation, but might happen if the
      * controller did it. Just let it slide. */
   }
+}
 
+/** If the stream-isolation state of <b>circ</b> can be cleared, clear
+ * it.  Return non-zero iff <b>circ</b>'s isolation state was cleared. */
+static int
+circuit_try_clearing_isolation_state(origin_circuit_t *circ)
+{
   if (/* The circuit may have become non-open if it was cannibalized.*/
       circ->_base.state == CIRCUIT_STATE_OPEN &&
-      /* Only if the purpose is clearable, and only if we haven't tried
-       * to clear isolation yet, do we try. */
-      can_try_clearing_isolation && !tried_clearing_isolation &&
       /* If !isolation_values_set, there is nothing to clear. */
       circ->isolation_values_set &&
       /* It's not legal to clear a circuit's isolation info if it's ever had
@@ -1059,8 +1135,26 @@ circuit_has_opened(origin_circuit_t *circ)
      * we didn't manage to attach any streams to it, then we can
      * and should clear it and try again. */
     circuit_clear_isolation(circ);
-    tried_clearing_isolation = 1;
-    goto again;
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+/** Called when a circuit becomes ready for streams to be attached to
+ * it. */
+void
+circuit_try_attaching_streams(origin_circuit_t *circ)
+{
+  /* Attach streams to this circuit if we can. */
+  connection_ap_attach_pending();
+
+  /* The call to circuit_try_clearing_isolation_state here will do
+   * nothing and return 0 if we didn't attach any streams to circ
+   * above. */
+  if (circuit_try_clearing_isolation_state(circ)) {
+    /* Maybe *now* we can attach some streams to this circuit. */
+    connection_ap_attach_pending();
   }
 }
 
@@ -1215,14 +1309,22 @@ circuit_launch_by_extend_info(uint8_t purpose,
      * internal circs rather than exit circs? -RD */
     circ = circuit_find_to_cannibalize(purpose, extend_info, flags);
     if (circ) {
+      uint8_t old_purpose = circ->_base.purpose;
+      struct timeval old_timestamp_created;
+
       log_info(LD_CIRC,"Cannibalizing circ '%s' for purpose %d (%s)",
                build_state_get_exit_nickname(circ->build_state), purpose,
                circuit_purpose_to_string(purpose));
-      circ->_base.purpose = purpose;
+
+      circuit_change_purpose(TO_CIRCUIT(circ), purpose);
       /* reset the birth date of this circ, else expire_building
        * will see it and think it's been trying to build since it
        * began. */
       tor_gettimeofday(&circ->_base.timestamp_created);
+
+      control_event_circuit_cannibalized(circ, old_purpose,
+                                         &old_timestamp_created);
+
       switch (purpose) {
         case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
         case CIRCUIT_PURPOSE_S_ESTABLISH_INTRO:
@@ -1312,7 +1414,13 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
   need_uptime = !conn->want_onehop && !conn->use_begindir &&
                 smartlist_string_num_isin(options->LongLivedPorts,
                                           conn->socks_request->port);
-  need_internal = desired_circuit_purpose != CIRCUIT_PURPOSE_C_GENERAL;
+
+  if (desired_circuit_purpose != CIRCUIT_PURPOSE_C_GENERAL)
+    need_internal = 1;
+  else if (conn->use_begindir || conn->want_onehop)
+    need_internal = 1;
+  else
+    need_internal = 0;
 
   circ = circuit_get_best(conn, 1, desired_circuit_purpose,
                           need_uptime, need_internal);
@@ -1367,7 +1475,7 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
         return -1;
       }
     } else {
-      /* XXXX023 Duplicates checks in connection_ap_handshake_attach_circuit:
+      /* XXXX024 Duplicates checks in connection_ap_handshake_attach_circuit:
        * refactor into a single function? */
       const node_t *node = node_get_by_nickname(conn->chosen_exit_name, 1);
       int opt = conn->chosen_exit_optional;
@@ -1439,7 +1547,10 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
         int opt = conn->chosen_exit_optional;
         r = node_get_by_nickname(conn->chosen_exit_name, 1);
         if (r && node_has_descriptor(r)) {
-          extend_info = extend_info_from_node(r);
+          /* We might want to connect to an IPv6 bridge for loading
+             descriptors so we use the preferred address rather than
+             the primary.  */
+          extend_info = extend_info_from_node(r, conn->want_onehop ? 1 : 0);
         } else {
           log_debug(LD_DIR, "considering %d, %s",
                     want_onehop, conn->chosen_exit_name);
@@ -1488,6 +1599,12 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
       new_circ_purpose = CIRCUIT_PURPOSE_C_INTRODUCING;
     else
       new_circ_purpose = desired_circuit_purpose;
+
+    if (options->Tor2webMode &&
+        (new_circ_purpose == CIRCUIT_PURPOSE_C_ESTABLISH_REND ||
+         new_circ_purpose == CIRCUIT_PURPOSE_C_INTRODUCING)) {
+      want_onehop = 1;
+    }
 
     {
       int flags = CIRCLAUNCH_NEED_CAPACITY;
@@ -1684,7 +1801,7 @@ consider_recording_trackhost(const entry_connection_t *conn,
 
   addressmap_register(conn->socks_request->address, new_address,
                       time(NULL) + options->TrackHostExitsExpire,
-                      ADDRMAPSRC_TRACKEXIT);
+                      ADDRMAPSRC_TRACKEXIT, 0, 0);
 }
 
 /** Attempt to attach the connection <b>conn</b> to <b>circ</b>, and send a
@@ -1799,7 +1916,7 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
     /* find the circuit that we should use, if there is one. */
     retval = circuit_get_open_circ_or_launch(
         conn, CIRCUIT_PURPOSE_C_GENERAL, &circ);
-    if (retval < 1) // XXX022 if we totally fail, this still returns 0 -RD
+    if (retval < 1) // XXX023 if we totally fail, this still returns 0 -RD
       return retval;
 
     log_debug(LD_APP|LD_CIRC,
@@ -1922,6 +2039,42 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
              introcirc ? introcirc->_base.n_circ_id : 0,
              rendcirc ? rendcirc->_base.n_circ_id : 0, conn_age);
     return 0;
+  }
+}
+
+/** Change <b>circ</b>'s purpose to <b>new_purpose</b>. */
+void
+circuit_change_purpose(circuit_t *circ, uint8_t new_purpose)
+{
+  uint8_t old_purpose;
+  /* Don't allow an OR circ to become an origin circ or vice versa. */
+  tor_assert(!!(CIRCUIT_IS_ORIGIN(circ)) ==
+             !!(CIRCUIT_PURPOSE_IS_ORIGIN(new_purpose)));
+
+  if (circ->purpose == new_purpose) return;
+
+  if (CIRCUIT_IS_ORIGIN(circ)) {
+    char old_purpose_desc[80] = "";
+
+    strncpy(old_purpose_desc, circuit_purpose_to_string(circ->purpose), 80-1);
+    old_purpose_desc[80-1] = '\0';
+
+    log_debug(LD_CIRC,
+              "changing purpose of origin circ %d "
+              "from \"%s\" (%d) to \"%s\" (%d)",
+              TO_ORIGIN_CIRCUIT(circ)->global_identifier,
+              old_purpose_desc,
+              circ->purpose,
+              circuit_purpose_to_string(new_purpose),
+              new_purpose);
+  }
+
+  old_purpose = circ->purpose;
+  circ->purpose = new_purpose;
+
+  if (CIRCUIT_IS_ORIGIN(circ)) {
+    control_event_circuit_purpose_changed(TO_ORIGIN_CIRCUIT(circ),
+                                          old_purpose);
   }
 }
 

@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -80,7 +80,7 @@ time_t download_status_increment_failure(download_status_t *dls,
  * the optional status code <b>sc</b>. */
 #define download_status_failed(dls, sc)                                 \
   download_status_increment_failure((dls), (sc), NULL,                  \
-                                    get_options()->DirPort, time(NULL))
+                                    get_options()->DirPort!=NULL, time(NULL))
 
 void download_status_reset(download_status_t *dls);
 static int download_status_is_ready(download_status_t *dls, time_t now,

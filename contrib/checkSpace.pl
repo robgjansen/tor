@@ -32,10 +32,18 @@ for $fn (@ARGV) {
         if ($C && /\s(?:if|while|for|switch)\(/) {
             print "      KW(:$fn:$.\n";
         }
-        ## Warn about #else #if instead of #elif. 
+        ## Warn about #else #if instead of #elif.
         if (($lastline =~ /^\# *else/) and ($_ =~ /^\# *if/)) {
             print " #else#if:$fn:$.\n";
         }
+        ## Warn about some K&R violations
+        if (/^\s+\{/ and $lastline =~ /^\s*(if|while|for|else if)/ and
+	    $lastline !~ /\{$/) {
+            print "non-K&R {:$fn:$.\n";
+	}
+        if (/^\s*else/ and $lastline =~ /\}$/) {
+	    print "  }\\nelse:$fn:$.\n";
+	}
         $lastline = $_;
         ## Warn about unnecessary empty lines.
         if ($lastnil && /^\s*}\n/) {
@@ -97,7 +105,7 @@ for $fn (@ARGV) {
                 if ($1 ne "if" and $1 ne "while" and $1 ne "for" and
                     $1 ne "switch" and $1 ne "return" and $1 ne "int" and
                     $1 ne "elsif" and $1 ne "WINAPI" and $2 ne "WINAPI" and
-                    $1 ne "void" and $1 ne "__attribute__") {
+                    $1 ne "void" and $1 ne "__attribute__" and $1 ne "op") {
                     print "     fn ():$fn:$.\n";
                 }
             }

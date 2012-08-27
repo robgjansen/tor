@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
@@ -73,17 +73,17 @@ test_addr_basic(void)
 #define _test_op_ip6(a,op,b,e1,e2)                               \
   STMT_BEGIN                                                     \
   tt_assert_test_fmt_type(a,b,e1" "#op" "e2,struct in6_addr*,    \
-    (memcmp(_val1->s6_addr, _val2->s6_addr, 16) op 0),           \
+    (memcmp(val1_->s6_addr, val2_->s6_addr, 16) op 0),           \
     char *, "%s",                                                \
     { int i; char *cp;                                           \
-      cp = _print = tor_malloc(64);                              \
+      cp = print_ = tor_malloc(64);                              \
       for (i=0;i<16;++i) {                                       \
-        tor_snprintf(cp, 3,"%02x", (unsigned)_value->s6_addr[i]);\
+        tor_snprintf(cp, 3,"%02x", (unsigned)value_->s6_addr[i]);\
         cp += 2;                                                 \
         if (i != 15) *cp++ = ':';                                \
       }                                                          \
     },                                                           \
-    { tor_free(_print); },                                       \
+    { tor_free(print_); },                                       \
     TT_EXIT_TEST_FUNCTION                                        \
   );                                                             \
   STMT_END
@@ -613,12 +613,11 @@ test_addr_ip6_helpers(void)
   /* get interface addresses */
   r = get_interface_address6(LOG_DEBUG, AF_INET, &t1);
   i = get_interface_address6(LOG_DEBUG, AF_INET6, &t2);
-#if 0
-  tor_inet_ntop(AF_INET, &t1.sa.sin_addr, buf, sizeof(buf));
-  printf("\nv4 address: %s  (family=%d)", buf, IN_FAMILY(&t1));
-  tor_inet_ntop(AF_INET6, &t2.sa6.sin6_addr, buf, sizeof(buf));
-  printf("\nv6 address: %s  (family=%d)", buf, IN_FAMILY(&t2));
-#endif
+
+  TT_BLATHER(("v4 address: %s (family=%d)", fmt_addr(&t1),
+              tor_addr_family(&t1)));
+  TT_BLATHER(("v6 address: %s (family=%d)", fmt_addr(&t2),
+              tor_addr_family(&t2)));
 
  done:
   ;

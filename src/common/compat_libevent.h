@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, The Tor Project, Inc. */
+/* Copyright (c) 2009-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #ifndef _TOR_COMPAT_LIBEVENT_H
@@ -59,9 +59,15 @@ struct timeval;
 int tor_event_base_loopexit(struct event_base *base, struct timeval *tv);
 #endif
 
+/** Defines a configuration for using libevent with Tor: passed as an argument
+ * to tor_libevent_initialize() to describe how we want to set up. */
 typedef struct tor_libevent_cfg {
+  /** Flag: if true, disable IOCP (assuming that it could be enabled). */
   int disable_iocp;
+  /** How many CPUs should we use (relevant only with IOCP). */
   int num_cpus;
+  /** How many milliseconds should we allow between updating bandwidth limits?
+   * (relevant only with bufferevents). */
   int msec_per_tick;
 } tor_libevent_cfg;
 
@@ -81,6 +87,9 @@ int tor_set_bufferevent_rate_limit(struct bufferevent *bev,
 int tor_add_bufferevent_to_rate_limit_group(struct bufferevent *bev,
                                    struct bufferevent_rate_limit_group *g);
 #endif
+
+void tor_gettimeofday_cached(struct timeval *tv);
+void tor_gettimeofday_cache_clear(void);
 
 #endif
 

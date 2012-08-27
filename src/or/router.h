@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -12,24 +12,25 @@
 #ifndef _TOR_ROUTER_H
 #define _TOR_ROUTER_H
 
-crypto_pk_env_t *get_onion_key(void);
+crypto_pk_t *get_onion_key(void);
 time_t get_onion_key_set_at(void);
-void set_server_identity_key(crypto_pk_env_t *k);
-crypto_pk_env_t *get_server_identity_key(void);
+void set_server_identity_key(crypto_pk_t *k);
+crypto_pk_t *get_server_identity_key(void);
 int server_identity_key_is_set(void);
-void set_client_identity_key(crypto_pk_env_t *k);
-crypto_pk_env_t *get_tlsclient_identity_key(void);
+void set_client_identity_key(crypto_pk_t *k);
+crypto_pk_t *get_tlsclient_identity_key(void);
 int client_identity_key_is_set(void);
 authority_cert_t *get_my_v3_authority_cert(void);
-crypto_pk_env_t *get_my_v3_authority_signing_key(void);
+crypto_pk_t *get_my_v3_authority_signing_key(void);
 authority_cert_t *get_my_v3_legacy_cert(void);
-crypto_pk_env_t *get_my_v3_legacy_signing_key(void);
-void dup_onion_keys(crypto_pk_env_t **key, crypto_pk_env_t **last);
+crypto_pk_t *get_my_v3_legacy_signing_key(void);
+void dup_onion_keys(crypto_pk_t **key, crypto_pk_t **last);
 void rotate_onion_key(void);
-crypto_pk_env_t *init_key_from_file(const char *fname, int generate,
+crypto_pk_t *init_key_from_file(const char *fname, int generate,
                                     int severity);
 void v3_authority_check_key_expiry(void);
 
+int router_initialize_tls_context(void);
 int init_keys(void);
 
 int check_whether_orport_reachable(void);
@@ -38,6 +39,8 @@ void consider_testing_reachability(int test_or, int test_dir);
 void router_orport_found_reachable(void);
 void router_dirport_found_reachable(void);
 void router_perform_bandwidth_test(int num_circs, time_t now);
+
+int net_is_disabled(void);
 
 int authdir_mode(const or_options_t *options);
 int authdir_mode_v1(const or_options_t *options);
@@ -50,6 +53,7 @@ int authdir_mode_publishes_statuses(const or_options_t *options);
 int authdir_mode_tests_reachability(const or_options_t *options);
 int authdir_mode_bridge(const or_options_t *options);
 
+uint16_t router_get_active_listener_port_by_type(int listener_type);
 uint16_t router_get_advertised_or_port(const or_options_t *options);
 uint16_t router_get_advertised_dir_port(const or_options_t *options,
                                         uint16_t dirport);
@@ -81,9 +85,16 @@ int router_fingerprint_is_me(const char *fp);
 int router_pick_published_address(const or_options_t *options, uint32_t *addr);
 int router_rebuild_descriptor(int force);
 int router_dump_router_to_string(char *s, size_t maxlen, routerinfo_t *router,
-                                 crypto_pk_env_t *ident_key);
+                                 crypto_pk_t *ident_key);
+void router_get_prim_orport(const routerinfo_t *router,
+                            tor_addr_port_t *addr_port_out);
+void router_get_pref_orport(const routerinfo_t *router,
+                            tor_addr_port_t *addr_port_out);
+void router_get_pref_ipv6_orport(const routerinfo_t *router,
+                                 tor_addr_port_t *addr_port_out);
+int router_ipv6_preferred(const routerinfo_t *router);
 int extrainfo_dump_to_string(char **s, extrainfo_t *extrainfo,
-                             crypto_pk_env_t *ident_key);
+                             crypto_pk_t *ident_key);
 int is_legal_nickname(const char *s);
 int is_legal_nickname_or_hexdigest(const char *s);
 int is_legal_hexdigest(const char *s);

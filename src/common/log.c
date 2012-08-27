@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -97,6 +97,7 @@ should_log_function_name(log_domain_mask_t domain, int severity)
 
 /** A mutex to guard changes to logfiles and logging. */
 static tor_mutex_t log_mutex;
+/** True iff we have initialized log_mutex */
 static int log_mutex_initialized = 0;
 
 /** Linked list of logfile_t. */
@@ -137,6 +138,13 @@ static void close_log(logfile_t *victim);
 
 static char *domain_to_string(log_domain_mask_t domain,
                              char *buf, size_t buflen);
+static INLINE char *format_msg(char *buf, size_t buf_len,
+           log_domain_mask_t domain, int severity, const char *funcname,
+           const char *format, va_list ap, size_t *msg_len_out)
+  CHECK_PRINTF(6,0);
+static void logv(int severity, log_domain_mask_t domain, const char *funcname,
+                 const char *format, va_list ap)
+  CHECK_PRINTF(4,0);
 
 /** Name of the application: used to generate the message we write at the
  * start of each new log. */
@@ -653,7 +661,7 @@ init_logging(void)
     log_mutex_initialized = 1;
   }
   if (pending_cb_messages == NULL)
-    pending_cb_messages = smartlist_create();
+    pending_cb_messages = smartlist_new();
 }
 
 /** Set whether we report logging domains as a part of our log messages.
@@ -737,7 +745,7 @@ flush_pending_log_callbacks(void)
   }
 
   messages = pending_cb_messages;
-  pending_cb_messages = smartlist_create();
+  pending_cb_messages = smartlist_new();
   do {
     SMARTLIST_FOREACH_BEGIN(messages, pending_cb_message_t *, msg) {
       const int severity = msg->severity;
@@ -993,12 +1001,11 @@ parse_log_severity_config(const char **cfg_ptr,
         return -1;
       domains = 0;
       domains_str = tor_strndup(cfg+1, closebracket-cfg-1);
-      domains_list = smartlist_create();
+      domains_list = smartlist_new();
       smartlist_split_string(domains_list, domains_str, ",", SPLIT_SKIP_SPACE,
                              -1);
       tor_free(domains_str);
-      SMARTLIST_FOREACH(domains_list, const char *, domain,
-          {
+      SMARTLIST_FOREACH_BEGIN(domains_list, const char *, domain) {
             if (!strcmp(domain, "*")) {
               domains = ~0u;
             } else {
@@ -1019,7 +1026,7 @@ parse_log_severity_config(const char **cfg_ptr,
                   domains |= d;
               }
             }
-          });
+      } SMARTLIST_FOREACH_END(domain);
       SMARTLIST_FOREACH(domains_list, char *, d, tor_free(d));
       smartlist_free(domains_list);
       if (err)

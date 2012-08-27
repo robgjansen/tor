@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -64,7 +64,11 @@ int get_proxy_addrport(tor_addr_t *addr, uint16_t *port, int *proxy_type,
                        const connection_t *conn);
 
 int retry_all_listeners(smartlist_t *replaced_conns,
-                        smartlist_t *new_conns);
+                        smartlist_t *new_conns,
+                        int close_all_noncontrol);
+
+void connection_mark_all_noncontrol_listeners(void);
+void connection_mark_all_noncontrol_connections(void);
 
 ssize_t connection_bucket_write_limit(connection_t *conn, time_t now);
 int global_write_bucket_low(connection_t *conn, size_t attempt, int priority);
@@ -88,8 +92,10 @@ int connection_flush(connection_t *conn);
 
 void _connection_write_to_buf_impl(const char *string, size_t len,
                                    connection_t *conn, int zlib);
+/* DOCDOC connection_write_to_buf */
 static void connection_write_to_buf(const char *string, size_t len,
                                     connection_t *conn);
+/* DOCDOC connection_write_to_buf_zlib */
 static void connection_write_to_buf_zlib(const char *string, size_t len,
                                          dir_connection_t *conn, int done);
 static INLINE void
@@ -104,7 +110,9 @@ connection_write_to_buf_zlib(const char *string, size_t len,
   _connection_write_to_buf_impl(string, len, TO_CONN(conn), done ? -1 : 1);
 }
 
+/* DOCDOC connection_get_inbuf_len */
 static size_t connection_get_inbuf_len(connection_t *conn);
+/* DOCDOC connection_get_outbuf_len */
 static size_t connection_get_outbuf_len(connection_t *conn);
 
 static INLINE size_t

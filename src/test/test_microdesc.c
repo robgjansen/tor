@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2011, The Tor Project, Inc. */
+/* Copyright (c) 2010-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
@@ -9,7 +9,7 @@
 
 #include "test.h"
 
-#ifdef MS_WINDOWS
+#ifdef _WIN32
 /* For mkdir() */
 #include <direct.h>
 #else
@@ -66,7 +66,7 @@ test_md_cache(void *data)
   /* Possibly, turn this into a test setup/cleanup pair */
   tor_free(options->DataDirectory);
   options->DataDirectory = tor_strdup(get_fname("md_datadir_test"));
-#ifdef MS_WINDOWS
+#ifdef _WIN32
   tt_int_op(0, ==, mkdir(options->DataDirectory));
 #else
   tt_int_op(0, ==, mkdir(options->DataDirectory, 0700));
@@ -88,7 +88,7 @@ test_md_cache(void *data)
   smartlist_free(added);
   added = NULL;
 
-  wanted = smartlist_create();
+  wanted = smartlist_new();
   added = microdescs_add_to_cache(mc, test_md2, NULL, SAVED_NOWHERE, 0,
                                   time2, wanted);
   /* Should fail, since we didn't list test_md2's digest in wanted */

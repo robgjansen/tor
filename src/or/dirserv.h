@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -54,7 +54,7 @@
 
 int connection_dirserv_flushed_some(dir_connection_t *conn);
 
-int dirserv_add_own_fingerprint(const char *nickname, crypto_pk_env_t *pk);
+int dirserv_add_own_fingerprint(const char *nickname, crypto_pk_t *pk);
 int dirserv_load_fingerprint_file(void);
 void dirserv_free_fingerprint_list(void);
 const char *dirserv_get_nickname_by_digest(const char *digest);
@@ -69,13 +69,14 @@ void dirserv_set_router_is_running(routerinfo_t *router, time_t now);
 int list_server_status_v1(smartlist_t *routers, char **router_status_out,
                           int for_controller);
 int dirserv_dump_directory_to_string(char **dir_out,
-                                     crypto_pk_env_t *private_key);
+                                     crypto_pk_t *private_key);
 
 int directory_fetches_from_authorities(const or_options_t *options);
 int directory_fetches_dir_info_early(const or_options_t *options);
 int directory_fetches_dir_info_later(const or_options_t *options);
 int directory_caches_v2_dir_info(const or_options_t *options);
 #define directory_caches_v1_dir_info(o) directory_caches_v2_dir_info(o)
+int directory_caches_unknown_auth_certs(const or_options_t *options);
 int directory_caches_dir_info(const or_options_t *options);
 int directory_permits_begindir_requests(const or_options_t *options);
 int directory_permits_controller_requests(const or_options_t *options);
@@ -108,8 +109,7 @@ int dirserv_get_routerdescs(smartlist_t *descs_out, const char *key,
                             const char **msg);
 void dirserv_orconn_tls_done(const char *address,
                              uint16_t or_port,
-                             const char *digest_rcvd,
-                             int as_advertised);
+                             const char *digest_rcvd);
 int dirserv_should_launch_reachability_test(const routerinfo_t *ri,
                                             const routerinfo_t *ri_old);
 void dirserv_single_reachability_test(time_t now, routerinfo_t *router);

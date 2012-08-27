@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -52,32 +52,12 @@ static int circuit_consider_stop_edge_reading(circuit_t *circ,
                                               crypt_path_t *layer_hint);
 static int circuit_queue_streams_are_blocked(circuit_t *circ);
 
-/* XXXX023 move this all to compat_libevent */
-/** Cache the current hi-res time; the cache gets reset when libevent
- * calls us. */
-static struct timeval cached_time_hires = {0, 0};
-
 /** Stop reading on edge connections when we have this many cells
  * waiting on the appropriate queue. */
 #define CELL_QUEUE_HIGHWATER_SIZE 256
 /** Start reading from edge connections again when we get down to this many
  * cells. */
 #define CELL_QUEUE_LOWWATER_SIZE 64
-
-static void
-tor_gettimeofday_cached(struct timeval *tv)
-{
-  if (cached_time_hires.tv_sec == 0) {
-    tor_gettimeofday(&cached_time_hires);
-  }
-  *tv = cached_time_hires;
-}
-
-void
-tor_gettimeofday_cache_clear(void)
-{
-  cached_time_hires.tv_sec = 0;
-}
 
 /** Stats: how many relay cells have originated at this hop, or have
  * been relayed onward (not recognized at this hop)?
@@ -92,7 +72,7 @@ uint64_t stats_n_relay_cells_delivered = 0;
  * cell.
  */
 static void
-relay_set_digest(crypto_digest_env_t *digest, cell_t *cell)
+relay_set_digest(crypto_digest_t *digest, cell_t *cell)
 {
   char integrity[4];
   relay_header_t rh;
@@ -113,11 +93,11 @@ relay_set_digest(crypto_digest_env_t *digest, cell_t *cell)
  * and cell to their original state and return 0.
  */
 static int
-relay_digest_matches(crypto_digest_env_t *digest, cell_t *cell)
+relay_digest_matches(crypto_digest_t *digest, cell_t *cell)
 {
   char received_integrity[4], calculated_integrity[4];
   relay_header_t rh;
-  crypto_digest_env_t *backup_digest=NULL;
+  crypto_digest_t *backup_digest=NULL;
 
   backup_digest = crypto_digest_dup(digest);
 
@@ -141,10 +121,10 @@ relay_digest_matches(crypto_digest_env_t *digest, cell_t *cell)
     /* restore the relay header */
     memcpy(rh.integrity, received_integrity, 4);
     relay_header_pack(cell->payload, &rh);
-    crypto_free_digest_env(backup_digest);
+    crypto_digest_free(backup_digest);
     return 0;
   }
-  crypto_free_digest_env(backup_digest);
+  crypto_digest_free(backup_digest);
   return 1;
 }
 
@@ -156,7 +136,7 @@ relay_digest_matches(crypto_digest_env_t *digest, cell_t *cell)
  * Return -1 if the crypto fails, else return 0.
  */
 static int
-relay_crypt_one_payload(crypto_cipher_env_t *cipher, uint8_t *in,
+relay_crypt_one_payload(crypto_cipher_t *cipher, uint8_t *in,
                         int encrypt_mode)
 {
   int r;
@@ -607,7 +587,7 @@ relay_send_command_from_edge(streamid_t stream_id, circuit_t *circ,
       /* If no RELAY_EARLY cells can be sent over this circuit, log which
        * commands have been sent as RELAY_EARLY cells before; helps debug
        * task 878. */
-      smartlist_t *commands_list = smartlist_create();
+      smartlist_t *commands_list = smartlist_new();
       int i = 0;
       char *commands = NULL;
       for (; i < origin_circ->relay_early_cells_sent; i++)
@@ -761,7 +741,7 @@ connection_ap_process_end_not_open(
         /* rewrite it to an IP if we learned one. */
         if (addressmap_rewrite(conn->socks_request->address,
                                sizeof(conn->socks_request->address),
-                               NULL)) {
+                               NULL, NULL)) {
           control_event_stream_status(conn, STREAM_EVENT_REMAP, 0);
         }
         if (conn->chosen_exit_optional ||
@@ -796,7 +776,7 @@ connection_ap_process_end_not_open(
           /* We haven't retried too many times; reattach the connection. */
           circuit_log_path(LOG_INFO,LD_APP,circ);
           /* Mark this circuit "unusable for new streams". */
-          /* XXXX023 this is a kludgy way to do this. */
+          /* XXXX024 this is a kludgy way to do this. */
           tor_assert(circ->_base.timestamp_dirty);
           circ->_base.timestamp_dirty -= get_options()->MaxCircuitDirtiness;
 
@@ -924,6 +904,7 @@ connection_edge_process_relay_cell_not_open(
     }
     circuit_log_path(LOG_INFO,LD_APP,TO_ORIGIN_CIRCUIT(circ));
     /* don't send a socks reply to transparent conns */
+    tor_assert(entry_conn->socks_request != NULL);
     if (!entry_conn->socks_request->has_finished)
       connection_ap_handshake_socks_reply(entry_conn, NULL, 0, 0);
 
@@ -1124,8 +1105,12 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
           (!layer_hint && --circ->deliver_window < 0)) {
         log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
                "(relay data) circ deliver_window below 0. Killing.");
-        connection_edge_end(conn, END_STREAM_REASON_TORPROTOCOL);
-        connection_mark_for_close(TO_CONN(conn));
+        if (conn) {
+          /* XXXX Do we actually need to do this?  Will killing the circuit
+           * not send an END and mark the stream for close as appropriate? */
+          connection_edge_end(conn, END_STREAM_REASON_TORPROTOCOL);
+          connection_mark_for_close(TO_CONN(conn));
+        }
         return -END_CIRC_REASON_TORPROTOCOL;
       }
       log_debug(domain,"circ deliver_window now %d.", layer_hint ?
@@ -1187,13 +1172,40 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
         connection_mark_and_flush(TO_CONN(conn));
       }
       return 0;
-    case RELAY_COMMAND_EXTEND:
+    case RELAY_COMMAND_EXTEND: {
+      static uint64_t total_n_extend=0, total_nonearly=0;
+      total_n_extend++;
       if (conn) {
         log_fn(LOG_PROTOCOL_WARN, domain,
                "'extend' cell received for non-zero stream. Dropping.");
         return 0;
       }
+      if (cell->command != CELL_RELAY_EARLY &&
+          !networkstatus_get_param(NULL,"AllowNonearlyExtend",0,0,1)) {
+#define EARLY_WARNING_INTERVAL 3600
+        static ratelim_t early_warning_limit =
+          RATELIM_INIT(EARLY_WARNING_INTERVAL);
+        char *m;
+        if (cell->command == CELL_RELAY) {
+          ++total_nonearly;
+          if ((m = rate_limit_log(&early_warning_limit, approx_time()))) {
+            double percentage = ((double)total_nonearly)/total_n_extend;
+            percentage *= 100;
+            log_fn(LOG_PROTOCOL_WARN, domain, "EXTEND cell received, "
+                   "but not via RELAY_EARLY. Dropping.%s", m);
+            log_fn(LOG_PROTOCOL_WARN, domain, "  (We have dropped %.02f%% of "
+                   "all EXTEND cells for this reason)", percentage);
+            tor_free(m);
+          }
+        } else {
+          log_fn(LOG_WARN, domain,
+                 "EXTEND cell received, in a cell with type %d! Dropping.",
+                 cell->command);
+        }
+        return 0;
+      }
       return circuit_extend(cell, circ);
+    }
     case RELAY_COMMAND_EXTENDED:
       if (!layer_hint) {
         log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
@@ -1251,7 +1263,7 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
                "'connected' received, no conn attached anymore. Ignoring.");
       return 0;
     case RELAY_COMMAND_SENDME:
-      if (!conn) {
+      if (!rh.stream_id) {
         if (layer_hint) {
           layer_hint->package_window += CIRCWINDOW_INCREMENT;
           log_debug(LD_APP,"circ-level sendme at origin, packagewindow %d.",
@@ -1264,6 +1276,11 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
                     circ->package_window);
           circuit_resume_edge_reading(circ, layer_hint);
         }
+        return 0;
+      }
+      if (!conn) {
+        log_info(domain,"sendme cell dropped, unknown stream (streamid %d).",
+                 rh.stream_id);
         return 0;
       }
       conn->package_window += STREAMWINDOW_INCREMENT;
@@ -1427,7 +1444,7 @@ connection_edge_package_raw_inbuf(edge_connection_t *conn, int package_partial,
   stats_n_data_cells_packaged += 1;
 
   if (PREDICT_UNLIKELY(sending_from_optimistic)) {
-    /* XXX023 We could be more efficient here by sometimes packing
+    /* XXXX We could be more efficient here by sometimes packing
      * previously-sent optimistic data in the same cell with data
      * from the inbuf. */
     generic_buffer_get(entry_conn->sending_optimistic_data, payload, length);
@@ -2058,9 +2075,12 @@ cell_ewma_get_tick(void)
  * has value ewma_scale_factor ** N.)
  */
 static double ewma_scale_factor = 0.1;
+/* DOCDOC ewma_enabled */
 static int ewma_enabled = 0;
 
+/*DOCDOC*/
 #define EPSILON 0.00001
+/*DOCDOC*/
 #define LOG_ONEHALF -0.69314718055994529
 
 /** Adjust the global cell scale factor based on <b>options</b> */
@@ -2555,10 +2575,6 @@ append_cell_to_circuit_queue(circuit_t *circ, or_connection_t *orconn,
     or_circuit_t *orcirc = TO_OR_CIRCUIT(circ);
     queue = &orcirc->p_conn_cells;
     streams_blocked = circ->streams_blocked_on_p_conn;
-  }
-  if (cell->command == CELL_RELAY_EARLY && orconn->link_proto < 2) {
-    /* V1 connections don't understand RELAY_EARLY. */
-    cell->command = CELL_RELAY;
   }
 
   cell_queue_append_packed_copy(queue, cell);
