@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -44,12 +44,12 @@
 
 /********* START VARIABLES **********/
 /** Global list of circuit build times */
-// XXXX023: Add this as a member for entry_guard_t instead of global?
+// XXXX: Add this as a member for entry_guard_t instead of global?
 // Then we could do per-guard statistics, as guards are likely to
 // vary in their own latency. The downside of this is that guards
 // can change frequently, so we'd be building a lot more circuits
 // most likely.
-/* XXXX023 Make this static; add accessor functions. */
+/* XXXX024 Make this static; add accessor functions. */
 circuit_build_times_t circ_times;
 
 /** A global list of all circuits at this hop. */
@@ -70,6 +70,10 @@ typedef struct {
                                   * router, 1 if we have. */
   unsigned int can_retry : 1; /**< Should we retry connecting to this entry,
                                * in spite of having it marked as unreachable?*/
+  unsigned int path_bias_notice : 1; /**< Did we alert the user about path bias
+                                      * for this node already? */
+  unsigned int path_bias_disabled : 1; /**< Have we disabled this node because
+                                        * of path bias issues? */
   time_t bad_since; /**< 0 if this guard is currently usable, or the time at
                       * which it was observed to become (according to the
                       * directory or the user configuration) unusable. */
@@ -78,6 +82,10 @@ typedef struct {
                              * connect to it. */
   time_t last_attempted; /**< 0 if we can connect to this guard, or the time
                           * at which we last failed to connect to it. */
+
+  unsigned first_hops; /**< Number of first hops this guard has completed */
+  unsigned circuit_successes; /**< Number of successfully built circuits using
+                               * this guard as first hop. */
 } entry_guard_t;
 
 /** Information about a configured bridge. Currently this just matches the
@@ -123,6 +131,7 @@ static int count_acceptable_nodes(smartlist_t *routers);
 static int onion_append_hop(crypt_path_t **head_ptr, extend_info_t *choice);
 
 static void entry_guards_changed(void);
+static entry_guard_t *entry_guard_get_by_id_digest(const char *digest);
 
 static void bridge_free(bridge_info_t *bridge);
 
@@ -149,13 +158,18 @@ circuit_build_times_disabled(void)
 
     if (consensus_disabled || config_disabled || dirauth_disabled ||
            state_disabled) {
-      log_info(LD_CIRC,
+      log_debug(LD_CIRC,
                "CircuitBuildTime learning is disabled. "
                "Consensus=%d, Config=%d, AuthDir=%d, StateFile=%d",
                consensus_disabled, config_disabled, dirauth_disabled,
                state_disabled);
       return 1;
     } else {
+      log_debug(LD_CIRC,
+                "CircuitBuildTime learning is not disabled. "
+                "Consensus=%d, Config=%d, AuthDir=%d, StateFile=%d",
+                consensus_disabled, config_disabled, dirauth_disabled,
+                state_disabled);
       return 0;
     }
   }
@@ -171,10 +185,21 @@ circuit_build_times_disabled(void)
 static int32_t
 circuit_build_times_max_timeouts(void)
 {
-  return networkstatus_get_param(NULL, "cbtmaxtimeouts",
+  int32_t cbt_maxtimeouts;
+
+  cbt_maxtimeouts = networkstatus_get_param(NULL, "cbtmaxtimeouts",
                                  CBT_DEFAULT_MAX_RECENT_TIMEOUT_COUNT,
                                  CBT_MIN_MAX_RECENT_TIMEOUT_COUNT,
                                  CBT_MAX_MAX_RECENT_TIMEOUT_COUNT);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_max_timeouts() called, cbtmaxtimeouts is"
+              " %d",
+              cbt_maxtimeouts);
+  }
+
+  return cbt_maxtimeouts;
 }
 
 /**
@@ -193,6 +218,14 @@ circuit_build_times_default_num_xm_modes(void)
                                         CBT_DEFAULT_NUM_XM_MODES,
                                         CBT_MIN_NUM_XM_MODES,
                                         CBT_MAX_NUM_XM_MODES);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_default_num_xm_modes() called, cbtnummodes"
+              " is %d",
+              num);
+  }
+
   return num;
 }
 
@@ -209,6 +242,14 @@ circuit_build_times_min_circs_to_observe(void)
                                         CBT_DEFAULT_MIN_CIRCUITS_TO_OBSERVE,
                                         CBT_MIN_MIN_CIRCUITS_TO_OBSERVE,
                                         CBT_MAX_MIN_CIRCUITS_TO_OBSERVE);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_min_circs_to_observe() called, cbtmincircs"
+              " is %d",
+              num);
+  }
+
   return num;
 }
 
@@ -233,9 +274,18 @@ circuit_build_times_quantile_cutoff(void)
                                         CBT_DEFAULT_QUANTILE_CUTOFF,
                                         CBT_MIN_QUANTILE_CUTOFF,
                                         CBT_MAX_QUANTILE_CUTOFF);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_quantile_cutoff() called, cbtquantile"
+              " is %d",
+              num);
+  }
+
   return num/100.0;
 }
 
+/* DOCDOC circuit_build_times_get_bw_scale */
 int
 circuit_build_times_get_bw_scale(networkstatus_t *ns)
 {
@@ -262,6 +312,13 @@ circuit_build_times_close_quantile(void)
              CBT_DEFAULT_CLOSE_QUANTILE,
              CBT_MIN_CLOSE_QUANTILE,
              CBT_MAX_CLOSE_QUANTILE);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_close_quantile() called, cbtclosequantile"
+              " is %d", param);
+  }
+
   if (param < min) {
     log_warn(LD_DIR, "Consensus parameter cbtclosequantile is "
              "too small, raising to %d", min);
@@ -284,6 +341,13 @@ circuit_build_times_test_frequency(void)
                                         CBT_DEFAULT_TEST_FREQUENCY,
                                         CBT_MIN_TEST_FREQUENCY,
                                         CBT_MAX_TEST_FREQUENCY);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_test_frequency() called, cbttestfreq is %d",
+              num);
+  }
+
   return num;
 }
 
@@ -301,6 +365,13 @@ circuit_build_times_min_timeout(void)
                                         CBT_DEFAULT_TIMEOUT_MIN_VALUE,
                                         CBT_MIN_TIMEOUT_MIN_VALUE,
                                         CBT_MAX_TIMEOUT_MIN_VALUE);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_min_timeout() called, cbtmintimeout is %d",
+              num);
+  }
+
   return num;
 }
 
@@ -318,6 +389,14 @@ circuit_build_times_initial_timeout(void)
                                           CBT_DEFAULT_TIMEOUT_INITIAL_VALUE,
                                           CBT_MIN_TIMEOUT_INITIAL_VALUE,
                                           CBT_MAX_TIMEOUT_INITIAL_VALUE);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_initial_timeout() called, "
+              "cbtinitialtimeout is %d",
+              param);
+  }
+
   if (param < min) {
     log_warn(LD_DIR, "Consensus parameter cbtinitialtimeout is too small, "
              "raising to %d", min);
@@ -336,10 +415,20 @@ circuit_build_times_initial_timeout(void)
 static int32_t
 circuit_build_times_recent_circuit_count(networkstatus_t *ns)
 {
-  return networkstatus_get_param(ns, "cbtrecentcount",
-                                 CBT_DEFAULT_RECENT_CIRCUITS,
-                                 CBT_MIN_RECENT_CIRCUITS,
-                                 CBT_MAX_RECENT_CIRCUITS);
+  int32_t num;
+  num = networkstatus_get_param(ns, "cbtrecentcount",
+                                CBT_DEFAULT_RECENT_CIRCUITS,
+                                CBT_MIN_RECENT_CIRCUITS,
+                                CBT_MAX_RECENT_CIRCUITS);
+
+  if (!(get_options()->LearnCircuitBuildTimeout)) {
+    log_debug(LD_BUG,
+              "circuit_build_times_recent_circuit_count() called, "
+              "cbtrecentcount is %d",
+              num);
+  }
+
+  return num;
 }
 
 /**
@@ -352,41 +441,79 @@ void
 circuit_build_times_new_consensus_params(circuit_build_times_t *cbt,
                                          networkstatus_t *ns)
 {
-  int32_t num = circuit_build_times_recent_circuit_count(ns);
+  int32_t num;
 
-  if (num > 0 && num != cbt->liveness.num_recent_circs) {
-    int8_t *recent_circs;
-    log_notice(LD_CIRC, "The Tor Directory Consensus has changed how many "
-               "circuits we must track to detect network failures from %d "
-               "to %d.", cbt->liveness.num_recent_circs, num);
+  /*
+   * First check if we're doing adaptive timeouts at all; nothing to
+   * update if we aren't.
+   */
 
-    tor_assert(cbt->liveness.timeouts_after_firsthop);
+  if (!circuit_build_times_disabled()) {
+    num = circuit_build_times_recent_circuit_count(ns);
 
-    /*
-     * Technically this is a circular array that we are reallocating
-     * and memcopying. However, since it only consists of either 1s
-     * or 0s, and is only used in a statistical test to determine when
-     * we should discard our history after a sufficient number of 1's
-     * have been reached, it is fine if order is not preserved or
-     * elements are lost.
-     *
-     * cbtrecentcount should only be changing in cases of severe network
-     * distress anyway, so memory correctness here is paramount over
-     * doing acrobatics to preserve the array.
-     */
-    recent_circs = tor_malloc_zero(sizeof(int8_t)*num);
-    memcpy(recent_circs, cbt->liveness.timeouts_after_firsthop,
-           sizeof(int8_t)*MIN(num, cbt->liveness.num_recent_circs));
+    if (num > 0) {
+      if (num != cbt->liveness.num_recent_circs) {
+        int8_t *recent_circs;
+        log_notice(LD_CIRC, "The Tor Directory Consensus has changed how many "
+                   "circuits we must track to detect network failures from %d "
+                   "to %d.", cbt->liveness.num_recent_circs, num);
 
-    // Adjust the index if it needs it.
-    if (num < cbt->liveness.num_recent_circs) {
-      cbt->liveness.after_firsthop_idx = MIN(num-1,
-              cbt->liveness.after_firsthop_idx);
+        tor_assert(cbt->liveness.timeouts_after_firsthop ||
+                   cbt->liveness.num_recent_circs == 0);
+
+        /*
+         * Technically this is a circular array that we are reallocating
+         * and memcopying. However, since it only consists of either 1s
+         * or 0s, and is only used in a statistical test to determine when
+         * we should discard our history after a sufficient number of 1's
+         * have been reached, it is fine if order is not preserved or
+         * elements are lost.
+         *
+         * cbtrecentcount should only be changing in cases of severe network
+         * distress anyway, so memory correctness here is paramount over
+         * doing acrobatics to preserve the array.
+         */
+        recent_circs = tor_malloc_zero(sizeof(int8_t)*num);
+        if (cbt->liveness.timeouts_after_firsthop &&
+            cbt->liveness.num_recent_circs > 0) {
+          memcpy(recent_circs, cbt->liveness.timeouts_after_firsthop,
+                 sizeof(int8_t)*MIN(num, cbt->liveness.num_recent_circs));
+        }
+
+        // Adjust the index if it needs it.
+        if (num < cbt->liveness.num_recent_circs) {
+          cbt->liveness.after_firsthop_idx = MIN(num-1,
+                  cbt->liveness.after_firsthop_idx);
+        }
+
+        tor_free(cbt->liveness.timeouts_after_firsthop);
+        cbt->liveness.timeouts_after_firsthop = recent_circs;
+        cbt->liveness.num_recent_circs = num;
+      }
+      /* else no change, nothing to do */
+    } else { /* num == 0 */
+      /*
+       * Weird.  This probably shouldn't happen, so log a warning, but try
+       * to do something sensible anyway.
+       */
+
+      log_warn(LD_CIRC,
+               "The cbtrecentcircs consensus parameter came back zero!  "
+               "This disables adaptive timeouts since we can't keep track of "
+               "any recent circuits.");
+
+      circuit_build_times_free_timeouts(cbt);
     }
+  } else {
+    /*
+     * Adaptive timeouts are disabled; this might be because of the
+     * LearnCircuitBuildTimes config parameter, and hence permanent, or
+     * the cbtdisabled consensus parameter, so it may be a new condition.
+     * Treat it like getting num == 0 above and free the circuit history
+     * if we have any.
+     */
 
-    tor_free(cbt->liveness.timeouts_after_firsthop);
-    cbt->liveness.timeouts_after_firsthop = recent_circs;
-    cbt->liveness.num_recent_circs = num;
+    circuit_build_times_free_timeouts(cbt);
   }
 }
 
@@ -405,16 +532,26 @@ static double
 circuit_build_times_get_initial_timeout(void)
 {
   double timeout;
-  if (!unit_tests && get_options()->CircuitBuildTimeout) {
-    timeout = get_options()->CircuitBuildTimeout*1000;
-    if (timeout < circuit_build_times_min_timeout()) {
-      log_warn(LD_CIRC, "Config CircuitBuildTimeout too low. Setting to %ds",
-               circuit_build_times_min_timeout()/1000);
-      timeout = circuit_build_times_min_timeout();
+
+  /*
+   * Check if we have LearnCircuitBuildTimeout, and if we don't,
+   * always use CircuitBuildTimeout, no questions asked.
+   */
+  if (get_options()->LearnCircuitBuildTimeout) {
+    if (!unit_tests && get_options()->CircuitBuildTimeout) {
+      timeout = get_options()->CircuitBuildTimeout*1000;
+      if (timeout < circuit_build_times_min_timeout()) {
+        log_warn(LD_CIRC, "Config CircuitBuildTimeout too low. Setting to %ds",
+                 circuit_build_times_min_timeout()/1000);
+        timeout = circuit_build_times_min_timeout();
+      }
+    } else {
+      timeout = circuit_build_times_initial_timeout();
     }
   } else {
-    timeout = circuit_build_times_initial_timeout();
+    timeout = get_options()->CircuitBuildTimeout*1000;
   }
+
   return timeout;
 }
 
@@ -443,12 +580,38 @@ void
 circuit_build_times_init(circuit_build_times_t *cbt)
 {
   memset(cbt, 0, sizeof(*cbt));
-  cbt->liveness.num_recent_circs =
+  /*
+   * Check if we really are using adaptive timeouts, and don't keep
+   * track of this stuff if not.
+   */
+  if (!circuit_build_times_disabled()) {
+    cbt->liveness.num_recent_circs =
       circuit_build_times_recent_circuit_count(NULL);
-  cbt->liveness.timeouts_after_firsthop = tor_malloc_zero(sizeof(int8_t)*
-                                      cbt->liveness.num_recent_circs);
+    cbt->liveness.timeouts_after_firsthop =
+      tor_malloc_zero(sizeof(int8_t)*cbt->liveness.num_recent_circs);
+  } else {
+    cbt->liveness.num_recent_circs = 0;
+    cbt->liveness.timeouts_after_firsthop = NULL;
+  }
   cbt->close_ms = cbt->timeout_ms = circuit_build_times_get_initial_timeout();
   control_event_buildtimeout_set(cbt, BUILDTIMEOUT_SET_EVENT_RESET);
+}
+
+/**
+ * Free the saved timeouts, if the cbtdisabled consensus parameter got turned
+ * on or something.
+ */
+
+void
+circuit_build_times_free_timeouts(circuit_build_times_t *cbt)
+{
+  if (!cbt) return;
+
+  if (cbt->liveness.timeouts_after_firsthop) {
+    tor_free(cbt->liveness.timeouts_after_firsthop);
+  }
+
+  cbt->liveness.num_recent_circs = 0;
 }
 
 #if 0
@@ -1133,9 +1296,14 @@ circuit_build_times_network_is_live(circuit_build_times_t *cbt)
 void
 circuit_build_times_network_circ_success(circuit_build_times_t *cbt)
 {
-  cbt->liveness.timeouts_after_firsthop[cbt->liveness.after_firsthop_idx] = 0;
-  cbt->liveness.after_firsthop_idx++;
-  cbt->liveness.after_firsthop_idx %= cbt->liveness.num_recent_circs;
+  /* Check for NULLness because we might not be using adaptive timeouts */
+  if (cbt->liveness.timeouts_after_firsthop &&
+      cbt->liveness.num_recent_circs > 0) {
+    cbt->liveness.timeouts_after_firsthop[cbt->liveness.after_firsthop_idx]
+      = 0;
+    cbt->liveness.after_firsthop_idx++;
+    cbt->liveness.after_firsthop_idx %= cbt->liveness.num_recent_circs;
+  }
 }
 
 /**
@@ -1150,10 +1318,15 @@ static void
 circuit_build_times_network_timeout(circuit_build_times_t *cbt,
                                     int did_onehop)
 {
-  if (did_onehop) {
-    cbt->liveness.timeouts_after_firsthop[cbt->liveness.after_firsthop_idx]=1;
-    cbt->liveness.after_firsthop_idx++;
-    cbt->liveness.after_firsthop_idx %= cbt->liveness.num_recent_circs;
+  /* Check for NULLness because we might not be using adaptive timeouts */
+  if (cbt->liveness.timeouts_after_firsthop &&
+      cbt->liveness.num_recent_circs > 0) {
+    if (did_onehop) {
+      cbt->liveness.timeouts_after_firsthop[cbt->liveness.after_firsthop_idx]
+        = 1;
+      cbt->liveness.after_firsthop_idx++;
+      cbt->liveness.after_firsthop_idx %= cbt->liveness.num_recent_circs;
+    }
   }
 }
 
@@ -1239,10 +1412,13 @@ circuit_build_times_network_check_changed(circuit_build_times_t *cbt)
   int timeout_count=0;
   int i;
 
-  /* how many of our recent circuits made it to the first hop but then
-   * timed out? */
-  for (i = 0; i < cbt->liveness.num_recent_circs; i++) {
-    timeout_count += cbt->liveness.timeouts_after_firsthop[i];
+  if (cbt->liveness.timeouts_after_firsthop &&
+      cbt->liveness.num_recent_circs > 0) {
+    /* how many of our recent circuits made it to the first hop but then
+     * timed out? */
+    for (i = 0; i < cbt->liveness.num_recent_circs; i++) {
+      timeout_count += cbt->liveness.timeouts_after_firsthop[i];
+    }
   }
 
   /* If 80% of our recent circuits are timing out after the first hop,
@@ -1252,9 +1428,12 @@ circuit_build_times_network_check_changed(circuit_build_times_t *cbt)
   }
 
   circuit_build_times_reset(cbt);
-  memset(cbt->liveness.timeouts_after_firsthop, 0,
-          sizeof(*cbt->liveness.timeouts_after_firsthop)*
-          cbt->liveness.num_recent_circs);
+  if (cbt->liveness.timeouts_after_firsthop &&
+      cbt->liveness.num_recent_circs > 0) {
+    memset(cbt->liveness.timeouts_after_firsthop, 0,
+            sizeof(*cbt->liveness.timeouts_after_firsthop)*
+            cbt->liveness.num_recent_circs);
+  }
   cbt->liveness.after_firsthop_idx = 0;
 
   /* Check to see if this has happened before. If so, double the timeout
@@ -1434,6 +1613,12 @@ circuit_build_times_set_timeout(circuit_build_times_t *cbt)
 {
   long prev_timeout = tor_lround(cbt->timeout_ms/1000);
   double timeout_rate;
+
+  /*
+   * Just return if we aren't using adaptive timeouts
+   */
+  if (circuit_build_times_disabled())
+    return;
 
   if (!circuit_build_times_set_timeout_worker(cbt))
     return;
@@ -2100,8 +2285,28 @@ circuit_send_next_onion_skin(origin_circuit_t *circ)
       }
       log_info(LD_CIRC,"circuit built!");
       circuit_reset_failure_count(0);
-      if (circ->build_state->onehop_tunnel)
+      /* Don't count cannibalized or onehop circs for path bias */
+      if (circ->build_state->onehop_tunnel || circ->has_opened) {
         control_event_bootstrap(BOOTSTRAP_STATUS_REQUESTING_STATUS, 0);
+      } else {
+        entry_guard_t *guard =
+          entry_guard_get_by_id_digest(circ->_base.n_conn->identity_digest);
+
+        if (guard) {
+          guard->circuit_successes++;
+
+          log_info(LD_PROTOCOL, "Got success count %u/%u for guard %s=%s",
+                   guard->circuit_successes, guard->first_hops,
+                   guard->nickname, hex_str(guard->identity, DIGEST_LEN));
+
+          if (guard->first_hops < guard->circuit_successes) {
+            log_warn(LD_BUG, "Unexpectedly high circuit_successes (%u/%u) "
+                     "for guard %s",
+                     guard->circuit_successes, guard->first_hops,
+                     guard->nickname);
+          }
+        }
+      }
       if (!can_complete_circuit && !circ->build_state->onehop_tunnel) {
         const or_options_t *options = get_options();
         can_complete_circuit=1;
@@ -2334,12 +2539,12 @@ circuit_init_cpath_crypto(crypt_path_t *cpath, const char *key_data,
   crypto_digest_add_bytes(cpath->b_digest, key_data+DIGEST_LEN, DIGEST_LEN);
 
   if (!(cpath->f_crypto =
-        crypto_create_init_cipher(key_data+(2*DIGEST_LEN),1))) {
+        crypto_cipher_new(key_data+(2*DIGEST_LEN)))) {
     log_warn(LD_BUG,"Forward cipher initialization failed.");
     return -1;
   }
   if (!(cpath->b_crypto =
-        crypto_create_init_cipher(key_data+(2*DIGEST_LEN)+CIPHER_KEY_LEN,0))) {
+        crypto_cipher_new(key_data+(2*DIGEST_LEN)+CIPHER_KEY_LEN))) {
     log_warn(LD_BUG,"Backward cipher initialization failed.");
     return -1;
   }
@@ -2353,6 +2558,116 @@ circuit_init_cpath_crypto(crypt_path_t *cpath, const char *key_data,
     cpath->b_crypto = tmp_crypto;
   }
 
+  return 0;
+}
+
+/** The minimum number of first hop completions before we start
+  * thinking about warning about path bias and dropping guards */
+static int
+pathbias_get_min_circs(const or_options_t *options)
+{
+#define DFLT_PATH_BIAS_MIN_CIRC 20
+  if (options->PathBiasCircThreshold >= 5)
+    return options->PathBiasCircThreshold;
+  else
+    return networkstatus_get_param(NULL, "pb_mincircs",
+                                   DFLT_PATH_BIAS_MIN_CIRC,
+                                   5, INT32_MAX);
+}
+
+static double
+pathbias_get_notice_rate(const or_options_t *options)
+{
+#define DFLT_PATH_BIAS_NOTICE_PCT 40
+  if (options->PathBiasNoticeRate >= 0.0)
+    return options->PathBiasNoticeRate;
+  else
+    return networkstatus_get_param(NULL, "pb_noticepct",
+                                   DFLT_PATH_BIAS_NOTICE_PCT, 0, 100)/100.0;
+}
+
+static double
+pathbias_get_disable_rate(const or_options_t *options)
+{
+// XXX: This needs tuning based on use + experimentation before we set it
+#define DFLT_PATH_BIAS_DISABLE_PCT 0
+  if (options->PathBiasDisableRate >= 0.0)
+    return options->PathBiasDisableRate;
+  else
+    return networkstatus_get_param(NULL, "pb_disablepct",
+                                   DFLT_PATH_BIAS_DISABLE_PCT, 0, 100)/100.0;
+}
+
+static int
+pathbias_get_scale_threshold(const or_options_t *options)
+{
+#define DFLT_PATH_BIAS_SCALE_THRESHOLD 200
+  if (options->PathBiasScaleThreshold >= 2)
+    return options->PathBiasScaleThreshold;
+  else
+    return networkstatus_get_param(NULL, "pb_scalecircs",
+                                   DFLT_PATH_BIAS_SCALE_THRESHOLD, 10,
+                                   INT32_MAX);
+}
+
+static int
+pathbias_get_scale_factor(const or_options_t *options)
+{
+#define DFLT_PATH_BIAS_SCALE_FACTOR 4
+  if (options->PathBiasScaleFactor >= 1)
+    return options->PathBiasScaleFactor;
+  else
+    return networkstatus_get_param(NULL, "pb_scalefactor",
+                                DFLT_PATH_BIAS_SCALE_THRESHOLD, 1, INT32_MAX);
+}
+
+/** Increment the number of times we successfully extended a circuit to
+ * 'guard', first checking if the failure rate is high enough that we should
+ * eliminate the guard.  Return -1 if the guard looks no good; return 0 if the
+ * guard looks fine. */
+static int
+entry_guard_inc_first_hop_count(entry_guard_t *guard)
+{
+  const or_options_t *options = get_options();
+
+  entry_guards_changed();
+
+  if (guard->first_hops > (unsigned)pathbias_get_min_circs(options)) {
+    /* Note: We rely on the < comparison here to allow us to set a 0
+     * rate and disable the feature entirely. If refactoring, don't
+     * change to <= */
+    if (guard->circuit_successes/((double)guard->first_hops)
+        < pathbias_get_disable_rate(options)) {
+
+      log_warn(LD_PROTOCOL,
+               "Extremely low circuit success rate %u/%u for guard %s=%s. "
+               "This might indicate an attack, or a bug.",
+               guard->circuit_successes, guard->first_hops, guard->nickname,
+               hex_str(guard->identity, DIGEST_LEN));
+
+      guard->path_bias_disabled = 1;
+      guard->bad_since = approx_time();
+      return -1;
+    } else if (guard->circuit_successes/((double)guard->first_hops)
+               < pathbias_get_notice_rate(options)
+               && !guard->path_bias_notice) {
+      guard->path_bias_notice = 1;
+      log_notice(LD_PROTOCOL,
+                 "Low circuit success rate %u/%u for guard %s=%s.",
+                 guard->circuit_successes, guard->first_hops, guard->nickname,
+                 hex_str(guard->identity, DIGEST_LEN));
+    }
+  }
+
+  /* If we get a ton of circuits, just scale everything down */
+  if (guard->first_hops > (unsigned)pathbias_get_scale_threshold(options)) {
+    const int scale_factor = pathbias_get_scale_factor(options);
+    guard->first_hops /= scale_factor;
+    guard->circuit_successes /= scale_factor;
+  }
+  guard->first_hops++;
+  log_info(LD_PROTOCOL, "Got success count %u/%u for guard %s",
+           guard->circuit_successes, guard->first_hops, guard->nickname);
   return 0;
 }
 
@@ -2373,9 +2688,22 @@ circuit_finish_handshake(origin_circuit_t *circ, uint8_t reply_type,
   char keys[CPATH_KEY_MATERIAL_LEN];
   crypt_path_t *hop;
 
-  if (circ->cpath->state == CPATH_STATE_AWAITING_KEYS)
+  if (circ->cpath->state == CPATH_STATE_AWAITING_KEYS) {
     hop = circ->cpath;
-  else {
+    /* Don't count cannibalized or onehop circs for path bias */
+    if (!circ->has_opened && !circ->build_state->onehop_tunnel) {
+      entry_guard_t *guard;
+
+      guard = entry_guard_get_by_id_digest(
+              circ->_base.n_conn->identity_digest);
+      if (guard) {
+        if (entry_guard_inc_first_hop_count(guard) < 0) {
+          /* Bogus guard; we already warned. */
+          return -END_CIRC_REASON_TORPROTOCOL;
+        }
+      }
+    }
+  } else {
     hop = onion_next_hop_in_cpath(circ->cpath);
     if (!hop) { /* got an extended when we're all done? */
       log_warn(LD_PROTOCOL,"got extended when circ already built? Closing.");
@@ -2719,6 +3047,11 @@ choose_good_exit_server_general(int need_uptime, int need_capacity)
       n_supported[i] = -1;
       continue; /* skip routers that are known to be down or bad exits */
     }
+    if (node_get_purpose(node) != ROUTER_PURPOSE_GENERAL) {
+      /* never pick a non-general node as a random exit. */
+      n_supported[i] = -1;
+      continue;
+    }
     if (routerset_contains_node(options->_ExcludeExitNodesUnion, node)) {
       n_supported[i] = -1;
       continue; /* user asked us not to use it, no matter what */
@@ -2842,6 +3175,10 @@ choose_good_exit_server_general(int need_uptime, int need_capacity)
       if (node)
         break;
       smartlist_clear(supporting);
+      /* If we reach this point, we can't actually support any unhandled
+       * predicted ports, so clear all the remaining ones. */
+      if (smartlist_len(needed_ports))
+        rep_hist_remove_predicted_ports(needed_ports);
     }
     SMARTLIST_FOREACH(needed_ports, uint16_t *, cp, tor_free(cp));
     smartlist_free(needed_ports);
@@ -3166,7 +3503,7 @@ choose_good_entry_server(uint8_t purpose, cpath_build_state_t *state)
 
   if (state && options->UseEntryGuards &&
       (purpose != CIRCUIT_PURPOSE_TESTING || options->BridgeRelay)) {
-    /* This is request for an entry server to use for a regular circuit,
+    /* This request is for an entry server to use for a regular circuit,
      * and we use entry guard nodes.  Just return one of the guard nodes.  */
     return choose_random_entry(state);
   }
@@ -3445,6 +3782,8 @@ entry_guard_set_status(entry_guard_t *e, const node_t *node,
     *reason = "not recommended as a guard";
   else if (routerset_contains_node(options->ExcludeNodes, node))
     *reason = "excluded";
+  else if (e->path_bias_disabled)
+    *reason = "path-biased";
 
   if (*reason && ! e->bad_since) {
     /* Router is newly bad. */
@@ -3509,6 +3848,10 @@ entry_is_live(entry_guard_t *e, int need_uptime, int need_capacity,
   const or_options_t *options = get_options();
   tor_assert(msg);
 
+  if (e->path_bias_disabled) {
+    *msg = "path-biased";
+    return NULL;
+  }
   if (e->bad_since) {
     *msg = "bad";
     return NULL;
@@ -3572,8 +3915,8 @@ num_live_entry_guards(void)
 
 /** If <b>digest</b> matches the identity of any node in the
  * entry_guards list, return that node. Else return NULL. */
-static INLINE entry_guard_t *
-is_an_entry_guard(const char *digest)
+static entry_guard_t *
+entry_guard_get_by_id_digest(const char *digest)
 {
   SMARTLIST_FOREACH(entry_guards, entry_guard_t *, entry,
                     if (tor_memeq(digest, entry->identity, DIGEST_LEN))
@@ -3659,7 +4002,7 @@ add_an_entry_guard(const node_t *chosen, int reset_status, int prepend)
 
   if (chosen) {
     node = chosen;
-    entry = is_an_entry_guard(node->identity);
+    entry = entry_guard_get_by_id_digest(node->identity);
     if (entry) {
       if (reset_status) {
         entry->bad_since = 0;
@@ -3728,7 +4071,9 @@ entry_guard_free(entry_guard_t *e)
 
 /** Remove any entry guard which was selected by an unknown version of Tor,
  * or which was selected by a version of Tor that's known to select
- * entry guards badly. */
+ * entry guards badly, or which was selected more 2 months ago. */
+/* XXXX The "obsolete guards" and "chosen long ago guards" things should
+ * probably be different functions. */
 static int
 remove_obsolete_entry_guards(time_t now)
 {
@@ -3801,6 +4146,7 @@ remove_dead_entry_guards(time_t now)
   for (i = 0; i < smartlist_len(entry_guards); ) {
     entry_guard_t *entry = smartlist_get(entry_guards, i);
     if (entry->bad_since &&
+        ! entry->path_bias_disabled &&
         entry->bad_since + ENTRY_GUARD_REMOVE_AFTER < now) {
 
       base16_encode(dbuf, sizeof(dbuf), entry->identity, DIGEST_LEN);
@@ -3857,6 +4203,8 @@ entry_guards_compute_status(const or_options_t *options, time_t now)
 
   if (remove_dead_entry_guards(now))
     changed = 1;
+  if (remove_obsolete_entry_guards(now))
+    changed = 1;
 
   if (changed) {
     SMARTLIST_FOREACH_BEGIN(entry_guards, entry_guard_t *, entry) {
@@ -3890,7 +4238,7 @@ entry_guards_compute_status(const or_options_t *options, time_t now)
  * If <b>mark_relay_status</b>, also call router_set_status() on this
  * relay.
  *
- * XXX023 change succeeded and mark_relay_status into 'int flags'.
+ * XXX024 change succeeded and mark_relay_status into 'int flags'.
  */
 int
 entry_guard_register_connect_status(const char *digest, int succeeded,
@@ -3906,14 +4254,14 @@ entry_guard_register_connect_status(const char *digest, int succeeded,
   if (! entry_guards)
     return 0;
 
-  SMARTLIST_FOREACH(entry_guards, entry_guard_t *, e,
-    {
-      if (tor_memeq(e->identity, digest, DIGEST_LEN)) {
-        entry = e;
-        idx = e_sl_idx;
-        break;
-      }
-    });
+  SMARTLIST_FOREACH_BEGIN(entry_guards, entry_guard_t *, e) {
+    tor_assert(e);
+    if (tor_memeq(e->identity, digest, DIGEST_LEN)) {
+      entry = e;
+      idx = e_sl_idx;
+      break;
+    }
+  } SMARTLIST_FOREACH_END(e);
 
   if (!entry)
     return 0;
@@ -3975,7 +4323,7 @@ entry_guard_register_connect_status(const char *digest, int succeeded,
      * came back? We should give our earlier entries another try too,
      * and close this connection so we don't use it before we've given
      * the others a shot. */
-    SMARTLIST_FOREACH(entry_guards, entry_guard_t *, e, {
+    SMARTLIST_FOREACH_BEGIN(entry_guards, entry_guard_t *, e) {
         if (e == entry)
           break;
         if (e->made_contact) {
@@ -3986,7 +4334,7 @@ entry_guard_register_connect_status(const char *digest, int succeeded,
             e->can_retry = 1;
           }
         }
-      });
+    } SMARTLIST_FOREACH_END(e);
     if (refuse_conn) {
       log_info(LD_CIRC,
                "Connected to new entry guard '%s' (%s). Marking earlier "
@@ -4064,7 +4412,7 @@ entry_guards_set_from_config(const or_options_t *options)
   /* Remove all currently configured guard nodes, excluded nodes, unreachable
    * nodes, or non-Guard nodes from entry_nodes. */
   SMARTLIST_FOREACH_BEGIN(entry_nodes, const node_t *, node) {
-    if (is_an_entry_guard(node->identity)) {
+    if (entry_guard_get_by_id_digest(node->identity)) {
       SMARTLIST_DEL_CURRENT(entry_nodes, node);
       continue;
     } else if (routerset_contains_node(options->ExcludeNodes, node)) {
@@ -4350,13 +4698,37 @@ entry_guards_parse_state(or_state_t *state, int set, char **msg)
         continue;
       }
       digestmap_set(added_by, d, tor_strdup(line->value+HEX_DIGEST_LEN+1));
+    } else if (!strcasecmp(line->key, "EntryGuardPathBias")) {
+      const or_options_t *options = get_options();
+      unsigned hop_cnt, success_cnt;
+
+      if (tor_sscanf(line->value, "%u %u", &success_cnt, &hop_cnt) != 2) {
+        log_warn(LD_GENERAL, "Unable to parse guard path bias info: "
+                 "Misformated EntryGuardPathBias %s", escaped(line->value));
+        continue;
+      }
+
+      node->first_hops = hop_cnt;
+      node->circuit_successes = success_cnt;
+      log_info(LD_GENERAL, "Read %u/%u path bias for node %s",
+               node->circuit_successes, node->first_hops, node->nickname);
+      /* Note: We rely on the < comparison here to allow us to set a 0
+       * rate and disable the feature entirely. If refactoring, don't
+       * change to <= */
+      if (node->circuit_successes/((double)node->first_hops)
+          < pathbias_get_disable_rate(options)) {
+        node->path_bias_disabled = 1;
+        log_info(LD_GENERAL,
+                 "Path bias is too high (%u/%u); disabling node %s",
+                 node->circuit_successes, node->first_hops, node->nickname);
+      }
+
     } else {
       log_warn(LD_BUG, "Unexpected key %s", line->key);
     }
   }
 
-  SMARTLIST_FOREACH(new_entry_guards, entry_guard_t *, e,
-   {
+  SMARTLIST_FOREACH_BEGIN(new_entry_guards, entry_guard_t *, e) {
      char *sp;
      char *val = digestmap_get(added_by, e->identity);
      if (val && (sp = strchr(val, ' '))) {
@@ -4374,7 +4746,10 @@ entry_guards_parse_state(or_state_t *state, int set, char **msg)
          e->chosen_on_date = time(NULL) - crypto_rand_int(3600*24*30);
        }
      }
-   });
+     if (e->path_bias_disabled && !e->bad_since)
+       e->bad_since = time(NULL);
+    }
+  SMARTLIST_FOREACH_END(e);
 
   if (*msg || !set) {
     SMARTLIST_FOREACH(new_entry_guards, entry_guard_t *, e,
@@ -4388,7 +4763,7 @@ entry_guards_parse_state(or_state_t *state, int set, char **msg)
     }
     entry_guards = new_entry_guards;
     entry_guards_dirty = 0;
-    /* XXX023 hand new_entry_guards to this func, and move it up a
+    /* XXX024 hand new_entry_guards to this func, and move it up a
      * few lines, so we don't have to re-dirty it */
     if (remove_obsolete_entry_guards(now))
       entry_guards_dirty = 1;
@@ -4429,8 +4804,7 @@ entry_guards_update_state(or_state_t *state)
   *next = NULL;
   if (!entry_guards)
     entry_guards = smartlist_new();
-  SMARTLIST_FOREACH(entry_guards, entry_guard_t *, e,
-    {
+  SMARTLIST_FOREACH_BEGIN(entry_guards, entry_guard_t *, e) {
       char dbuf[HEX_DIGEST_LEN+1];
       if (!e->made_contact)
         continue; /* don't write this one to disk */
@@ -4469,7 +4843,15 @@ entry_guards_update_state(or_state_t *state)
                      d, e->chosen_by_version, t);
         next = &(line->next);
       }
-    });
+      if (e->first_hops) {
+        *next = line = tor_malloc_zero(sizeof(config_line_t));
+        line->key = tor_strdup("EntryGuardPathBias");
+        tor_asprintf(&line->value, "%u %u",
+                     e->circuit_successes, e->first_hops);
+        next = &(line->next);
+      }
+
+  } SMARTLIST_FOREACH_END(e);
   if (!get_options()->AvoidDiskWrites)
     or_state_mark_dirty(get_or_state(), 0);
   entry_guards_dirty = 0;
@@ -4781,34 +5163,6 @@ transport_add_from_config(const tor_addr_t *addr, uint16_t port,
   }
 }
 
-/** Warn the user of possible pluggable transport misconfiguration.
- *  Return 0 if the validation happened, -1 if we should postpone the
- *  validation. */
-int
-validate_pluggable_transports_config(void)
-{
-  /* Don't validate if managed proxies are not yet fully configured. */
-  if (bridge_list && !pt_proxies_configuration_pending()) {
-    SMARTLIST_FOREACH_BEGIN(bridge_list, bridge_info_t *, b) {
-      /* Skip bridges without transports. */
-      if (!b->transport_name)
-        continue;
-      /* See if the user has Bridges that specify nonexistent
-         pluggable transports. We should warn the user in such case,
-         since it's probably misconfiguration. */
-      if (!transport_get_by_name(b->transport_name))
-        log_warn(LD_CONFIG, "You have a Bridge line using the %s "
-                 "pluggable transport, but there doesn't seem to be a "
-                 "corresponding ClientTransportPlugin line.",
-                 b->transport_name);
-    } SMARTLIST_FOREACH_END(b);
-
-    return 0;
-  } else {
-    return -1;
-  }
-}
-
 /** Return a bridge pointer if <b>ri</b> is one of our known bridges
  * (either by comparing keys if possible, else by comparing addr/port).
  * Else return NULL. */
@@ -4899,6 +5253,71 @@ learned_router_identity(const tor_addr_t *addr, uint16_t port,
   }
 }
 
+/** Return true if <b>bridge</b> has the same identity digest as
+ *  <b>digest</b>. If <b>digest</b> is NULL, it matches
+ *  bridges with unspecified identity digests. */
+static int
+bridge_has_digest(const bridge_info_t *bridge, const char *digest)
+{
+  if (digest)
+    return tor_memeq(digest, bridge->identity, DIGEST_LEN);
+  else
+    return tor_digest_is_zero(bridge->identity);
+}
+
+/** We are about to add a new bridge at <b>addr</b>:<b>port</b>, with optional
+ * <b>digest</b> and <b>transport_name</b>. Mark for removal any previously
+ * existing bridge with the same address and port, and warn the user as
+ * appropriate.
+ */
+static void
+bridge_resolve_conflicts(const tor_addr_t *addr, uint16_t port,
+                         const char *digest, const char *transport_name)
+{
+  /* Iterate the already-registered bridge list:
+
+     If you find a bridge with the same adress and port, mark it for
+     removal. It doesn't make sense to have two active bridges with
+     the same IP:PORT. If the bridge in question has a different
+     digest or transport than <b>digest</b>/<b>transport_name</b>,
+     it's probably a misconfiguration and we should warn the user.
+  */
+  SMARTLIST_FOREACH_BEGIN(bridge_list, bridge_info_t *, bridge) {
+    if (bridge->marked_for_removal)
+      continue;
+
+    if (tor_addr_eq(&bridge->addr, addr) && (bridge->port == port)) {
+
+      bridge->marked_for_removal = 1;
+
+      if (!bridge_has_digest(bridge, digest) ||
+          strcmp_opt(bridge->transport_name, transport_name)) {
+        /* warn the user */
+        char *bridge_description_new, *bridge_description_old;
+        tor_asprintf(&bridge_description_new, "%s:%u:%s:%s",
+                     fmt_addr(addr), port,
+                     digest ? hex_str(digest, DIGEST_LEN) : "",
+                     transport_name ? transport_name : "");
+        tor_asprintf(&bridge_description_old, "%s:%u:%s:%s",
+                     fmt_addr(&bridge->addr), bridge->port,
+                     tor_digest_is_zero(bridge->identity) ?
+                     "" : hex_str(bridge->identity,DIGEST_LEN),
+                     bridge->transport_name ? bridge->transport_name : "");
+
+        log_warn(LD_GENERAL,"Tried to add bridge '%s', but we found a conflict"
+                 " with the already registered bridge '%s'. We will discard"
+                 " the old bridge and keep '%s'. If this is not what you"
+                 " wanted, please change your configuration file accordingly.",
+                 bridge_description_new, bridge_description_old,
+                 bridge_description_new);
+
+        tor_free(bridge_description_new);
+        tor_free(bridge_description_old);
+      }
+    }
+  } SMARTLIST_FOREACH_END(bridge);
+}
+
 /** Remember a new bridge at <b>addr</b>:<b>port</b>. If <b>digest</b>
  * is set, it tells us the identity key too.  If we already had the
  * bridge in our list, unmark it, and don't actually add anything new.
@@ -4910,10 +5329,7 @@ bridge_add_from_config(const tor_addr_t *addr, uint16_t port,
 {
   bridge_info_t *b;
 
-  if ((b = get_configured_bridge_by_addr_port_digest(addr, port, digest))) {
-    b->marked_for_removal = 0;
-    return;
-  }
+  bridge_resolve_conflicts(addr, port, digest, transport_name);
 
   b = tor_malloc_zero(sizeof(bridge_info_t));
   tor_addr_copy(&b->addr, addr);
@@ -4956,6 +5372,22 @@ find_bridge_by_digest(const char *digest)
       if (tor_memeq(bridge->identity, digest, DIGEST_LEN))
         return bridge;
     });
+  return NULL;
+}
+
+/* DOCDOC find_transport_name_by_bridge_addrport */
+const char *
+find_transport_name_by_bridge_addrport(const tor_addr_t *addr, uint16_t port)
+{
+  if (!bridge_list)
+    return NULL;
+
+  SMARTLIST_FOREACH_BEGIN(bridge_list, const bridge_info_t *, bridge) {
+    if (tor_addr_eq(&bridge->addr, addr) &&
+        (bridge->port == port))
+      return bridge->transport_name;
+  } SMARTLIST_FOREACH_END(bridge);
+
   return NULL;
 }
 
@@ -5169,8 +5601,7 @@ rewrite_node_address_for_bridge(const bridge_info_t *bridge, node_t *node)
 
     /* XXXipv6 we lack support for falling back to another address for
        the same relay, warn the user */
-    if (!tor_addr_is_null(&ri->ipv6_addr))
-    {
+    if (!tor_addr_is_null(&ri->ipv6_addr)) {
       tor_addr_port_t ap;
       router_get_pref_orport(ri, &ap);
       log_notice(LD_CONFIG,
@@ -5255,8 +5686,7 @@ int
 any_pending_bridge_descriptor_fetches(void)
 {
   smartlist_t *conns = get_connection_array();
-  SMARTLIST_FOREACH(conns, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(conns, connection_t *, conn) {
     if (conn->type == CONN_TYPE_DIR &&
         conn->purpose == DIR_PURPOSE_FETCH_SERVERDESC &&
         TO_DIR_CONN(conn)->router_purpose == ROUTER_PURPOSE_BRIDGE &&
@@ -5266,7 +5696,7 @@ any_pending_bridge_descriptor_fetches(void)
       log_debug(LD_DIR, "found one: %s", conn->address);
       return 1;
     }
-  });
+  } SMARTLIST_FOREACH_END(conn);
   return 0;
 }
 

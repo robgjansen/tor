@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -108,7 +108,7 @@ chunk_repack(chunk_t *chunk)
   chunk->data = &chunk->mem[0];
 }
 
-#ifdef ENABLE_BUF_FREELISTS
+#if defined(ENABLE_BUF_FREELISTS) || defined(RUNNING_DOXYGEN)
 /** A freelist of chunks. */
 typedef struct chunk_freelist_t {
   size_t alloc_size; /**< What size chunks does this freelist hold? */
@@ -677,12 +677,12 @@ read_to_chunk_tls(buf_t *buf, chunk_t *chunk, tor_tls_t *tls,
  * (because of EOF), set *<b>reached_eof</b> to 1 and return 0. Return -1 on
  * error; else return the number of bytes read.
  */
-/* XXXX023 indicate "read blocked" somehow? */
+/* XXXX024 indicate "read blocked" somehow? */
 int
 read_to_buf(tor_socket_t s, size_t at_most, buf_t *buf, int *reached_eof,
             int *socket_error)
 {
-  /* XXXX023 It's stupid to overload the return values for these functions:
+  /* XXXX024 It's stupid to overload the return values for these functions:
    * "error status" and "number of bytes read" are not mutually exclusive.
    */
   int r = 0;
@@ -744,6 +744,9 @@ read_to_buf_tls(tor_tls_t *tls, size_t at_most, buf_t *buf)
 {
   int r = 0;
   size_t total_read = 0;
+
+  check_no_tls_errors();
+
   check();
 
   while (at_most > total_read) {
@@ -852,7 +855,7 @@ flush_chunk_tls(tor_tls_t *tls, buf_t *buf, chunk_t *chunk,
 int
 flush_buf(tor_socket_t s, buf_t *buf, size_t sz, size_t *buf_flushlen)
 {
-  /* XXXX023 It's stupid to overload the return values for these functions:
+  /* XXXX024 It's stupid to overload the return values for these functions:
    * "error status" and "number of bytes flushed" are not mutually exclusive.
    */
   int r;
@@ -1008,7 +1011,7 @@ fetch_from_buf(char *string, size_t string_len, buf_t *buf)
 
 /** True iff the cell command <b>command</b> is one that implies a
  * variable-length cell in Tor link protocol <b>linkproto</b>. */
-static inline int
+static INLINE int
 cell_command_is_var_length(uint8_t command, int linkproto)
 {
   /* If linkproto is v2 (2), CELL_VERSIONS is the only variable-length cells

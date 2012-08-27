@@ -1,6 +1,6 @@
 /* Copyright (c) 2003, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -22,11 +22,8 @@
 
 #include <assert.h>
 #ifdef _WIN32 /*wrkard for dtls1.h >= 0.9.8m of "#include <winsock.h>"*/
- #ifndef WIN32_WINNT
- #define WIN32_WINNT 0x400
- #endif
  #ifndef _WIN32_WINNT
- #define _WIN32_WINNT 0x400
+ #define _WIN32_WINNT 0x0501
  #endif
  #define WIN32_LEAN_AND_MEAN
  #if defined(_MSC_VER) && (_MSC_VER < 1300)
@@ -226,9 +223,12 @@ static int check_cert_lifetime_internal(int severity, const X509 *cert,
                                    int past_tolerance, int future_tolerance);
 
 /** Global TLS contexts. We keep them here because nobody else needs
- * to touch them. */
+ * to touch them.
+ *
+ * @{ */
 static tor_tls_context_t *server_tls_context = NULL;
 static tor_tls_context_t *client_tls_context = NULL;
+/**@}*/
 
 /** True iff tor_tls_init() has been called. */
 static int tls_library_is_initialized = 0;
@@ -271,6 +271,9 @@ tor_tls_get_state_description(tor_tls_t *tls, char *buf, size_t sz)
   tor_snprintf(buf, sz, "%s%s", ssl_state, tortls_state);
 }
 
+/** Log a single error <b>err</b> as returned by ERR_get_error(), which was
+ * received while performing an operation <b>doing</b> on <b>tls</b>.  Log
+ * the message at <b>severity</b>, in log domain <b>domain</b>. */
 void
 tor_tls_log_one_error(tor_tls_t *tls, unsigned long err,
                   int severity, int domain, const char *doing)
@@ -315,8 +318,8 @@ tor_tls_log_one_error(tor_tls_t *tls, unsigned long err,
   }
 }
 
-/** Log all pending tls errors at level <b>severity</b>.  Use
- * <b>doing</b> to describe our current activities.
+/** Log all pending tls errors at level <b>severity</b> in log domain
+ * <b>domain</b>.  Use <b>doing</b> to describe our current activities.
  */
 static void
 tls_log_errors(tor_tls_t *tls, int severity, int domain, const char *doing)
@@ -671,6 +674,9 @@ tor_tls_create_certificate(crypto_pk_t *rsa,
  * our OpenSSL doesn't know about. */
 static const char CLIENT_CIPHER_LIST[] =
 #include "./ciphers.inc"
+  /* Tell it not to use SSLv2 ciphers, so that it can select an SSLv3 version
+   * of any cipher we say. */
+  "!SSLv2"
   ;
 #undef CIPHER
 #undef XCIPHER
@@ -798,7 +804,7 @@ tor_cert_decode(const uint8_t *certificate, size_t certificate_len)
   return newcert;
 }
 
-/** Set *<b>encoded_out</b> and *<b>size_out/b> to <b>cert</b>'s encoded DER
+/** Set *<b>encoded_out</b> and *<b>size_out</b> to <b>cert</b>'s encoded DER
  * representation and length, respectively. */
 void
 tor_cert_get_der(const tor_cert_t *cert,
@@ -1175,6 +1181,21 @@ tor_tls_context_new(crypto_pk_t *identity, unsigned int key_lifetime,
     goto error;
   SSL_CTX_set_options(result->ctx, SSL_OP_NO_SSLv2);
 
+  /* Disable TLS1.1 and TLS1.2 if they exist.  We need to do this to
+   * workaround a bug present in all OpenSSL 1.0.1 versions (as of 1
+   * June 2012), wherein renegotiating while using one of these TLS
+   * protocols will cause the client to send a TLS 1.0 ServerHello
+   * rather than a ServerHello written with the appropriate protocol
+   * version.  Once some version of OpenSSL does TLS1.1 and TLS1.2
+   * renegotiation properly, we can turn them back on when built with
+   * that version. */
+#ifdef SSL_OP_NO_TLSv1_2
+  SSL_CTX_set_options(result->ctx, SSL_OP_NO_TLSv1_2);
+#endif
+#ifdef SSL_OP_NO_TLSv1_1
+  SSL_CTX_set_options(result->ctx, SSL_OP_NO_TLSv1_1);
+#endif
+
   if (
 #ifdef DISABLE_SSL3_HANDSHAKE
       1 ||
@@ -1330,6 +1351,7 @@ tor_tls_client_is_using_v2_ciphers(const SSL *ssl, const char *address)
   return 1;
 }
 
+/** Invoked when a TLS state changes: log the change at severity 'debug' */
 static void
 tor_tls_debug_state_callback(const SSL *ssl, int type, int val)
 {
@@ -1353,7 +1375,8 @@ tor_tls_server_info_callback(const SSL *ssl, int type, int val)
 
   if (type != SSL_CB_ACCEPT_LOOP)
     return;
-  if (ssl->state != SSL3_ST_SW_SRVR_HELLO_A)
+  if ((ssl->state != SSL3_ST_SW_SRVR_HELLO_A) &&
+      (ssl->state != SSL3_ST_SW_SRVR_HELLO_B))
     return;
 
   tls = tor_tls_get_by_ssl(ssl);
@@ -1370,7 +1393,9 @@ tor_tls_server_info_callback(const SSL *ssl, int type, int val)
 
   /* Now check the cipher list. */
   if (tor_tls_client_is_using_v2_ciphers(ssl, ADDR(tls))) {
-    /*XXXX_TLS keep this from happening more than once! */
+    if (tls->wasV2Handshake)
+      return; /* We already turned this stuff off for the first handshake;
+               * This is a renegotiation. */
 
     /* Yes, we're casting away the const from ssl.  This is very naughty of us.
      * Let's hope openssl doesn't notice! */
@@ -1393,11 +1418,35 @@ tor_tls_server_info_callback(const SSL *ssl, int type, int val)
 }
 #endif
 
+/** Explain which ciphers we're missing. */
+static void
+log_unsupported_ciphers(smartlist_t *unsupported)
+{
+  char *joined;
+
+  log_notice(LD_NET, "We weren't able to find support for all of the "
+             "TLS ciphersuites that we wanted to advertise. This won't "
+             "hurt security, but it might make your Tor (if run as a client) "
+             "more easy for censors to block.");
+
+  if (SSLeay() < 0x10000000L) {
+    log_notice(LD_NET, "To correct this, use a more recent OpenSSL, "
+               "built without disabling any secure ciphers or features.");
+  } else {
+    log_notice(LD_NET, "To correct this, use a version of OpenSSL "
+               "built with none of its ciphers disabled.");
+  }
+
+  joined = smartlist_join_strings(unsupported, ":", 0, NULL);
+  log_info(LD_NET, "The unsupported ciphers were: %s", joined);
+  tor_free(joined);
+}
+
 /** Replace *<b>ciphers</b> with a new list of SSL ciphersuites: specifically,
- * a list designed to mimic a common web browser.  Some of the ciphers in the
- * list won't actually be implemented by OpenSSL: that's okay so long as the
- * server doesn't select them, and the server won't select anything besides
- * what's in SERVER_CIPHER_LIST.
+ * a list designed to mimic a common web browser.  We might not be able to do
+ * that if OpenSSL doesn't support all the ciphers we want.  Some of the
+ * ciphers in the list won't actually be implemented by OpenSSL: that's okay
+ * so long as the server doesn't select them.
  *
  * [If the server <b>does</b> select a bogus cipher, we won't crash or
  * anything; we'll just fail later when we try to look up the cipher in
@@ -1409,14 +1458,17 @@ rectify_client_ciphers(STACK_OF(SSL_CIPHER) **ciphers)
 #ifdef V2_HANDSHAKE_CLIENT
   if (PREDICT_UNLIKELY(!CLIENT_CIPHER_STACK)) {
     /* We need to set CLIENT_CIPHER_STACK to an array of the ciphers
-     * we want.*/
+     * we want to use/advertise. */
     int i = 0, j = 0;
+    smartlist_t *unsupported = smartlist_new();
 
     /* First, create a dummy SSL_CIPHER for every cipher. */
     CLIENT_CIPHER_DUMMIES =
       tor_malloc_zero(sizeof(SSL_CIPHER)*N_CLIENT_CIPHERS);
     for (i=0; i < N_CLIENT_CIPHERS; ++i) {
       CLIENT_CIPHER_DUMMIES[i].valid = 1;
+      /* The "3<<24" here signifies that the cipher is supposed to work with
+       * SSL3 and TLS1. */
       CLIENT_CIPHER_DUMMIES[i].id = CLIENT_CIPHER_INFO_LIST[i].id | (3<<24);
       CLIENT_CIPHER_DUMMIES[i].name = CLIENT_CIPHER_INFO_LIST[i].name;
     }
@@ -1431,27 +1483,49 @@ rectify_client_ciphers(STACK_OF(SSL_CIPHER) **ciphers)
     }
 
     /* Then copy as many ciphers as we can from the good list, inserting
-     * dummies as needed. */
-    j=0;
-    for (i = 0; i < N_CLIENT_CIPHERS; ) {
+     * dummies as needed. Let j be an index into list of ciphers we have
+     * (*ciphers) and let i be an index into the ciphers we want
+     * (CLIENT_INFO_CIPHER_LIST).  We are building a list of ciphers in
+     * CLIENT_CIPHER_STACK.
+     */
+    for (i = j = 0; i < N_CLIENT_CIPHERS; ) {
       SSL_CIPHER *cipher = NULL;
       if (j < sk_SSL_CIPHER_num(*ciphers))
         cipher = sk_SSL_CIPHER_value(*ciphers, j);
       if (cipher && ((cipher->id >> 24) & 0xff) != 3) {
-        log_debug(LD_NET, "Skipping v2 cipher %s", cipher->name);
+        /* Skip over non-v3 ciphers entirely.  (This should no longer be
+         * needed, thanks to saying !SSLv2 above.) */
+        log_debug(LD_NET, "Skipping v%d cipher %s",
+                  (int)((cipher->id>>24) & 0xff),
+                  cipher->name);
         ++j;
       } else if (cipher &&
                  (cipher->id & 0xffff) == CLIENT_CIPHER_INFO_LIST[i].id) {
+        /* "cipher" is the cipher we expect. Put it on the list. */
         log_debug(LD_NET, "Found cipher %s", cipher->name);
         sk_SSL_CIPHER_push(CLIENT_CIPHER_STACK, cipher);
         ++j;
         ++i;
-      } else {
+      } else if (!strcmp(CLIENT_CIPHER_DUMMIES[i].name,
+                         "SSL_RSA_FIPS_WITH_3DES_EDE_CBC_SHA")) {
+        /* We found bogus cipher 0xfeff, which OpenSSL doesn't support and
+         * never has.  For this one, we need a dummy. */
         log_debug(LD_NET, "Inserting fake %s", CLIENT_CIPHER_DUMMIES[i].name);
         sk_SSL_CIPHER_push(CLIENT_CIPHER_STACK, &CLIENT_CIPHER_DUMMIES[i]);
         ++i;
+      } else {
+        /* OpenSSL doesn't have this one. */
+        log_debug(LD_NET, "Completely omitting unsupported cipher %s",
+                  CLIENT_CIPHER_INFO_LIST[i].name);
+        smartlist_add(unsupported, (char*) CLIENT_CIPHER_INFO_LIST[i].name);
+        ++i;
       }
     }
+
+    if (smartlist_len(unsupported))
+      log_unsupported_ciphers(unsupported);
+
+    smartlist_free(unsupported);
   }
 
   sk_SSL_CIPHER_free(*ciphers);
@@ -1607,6 +1681,7 @@ tor_tls_block_renegotiation(tor_tls_t *tls)
   tls->ssl->s3->flags &= ~SSL3_FLAGS_ALLOW_UNSAFE_LEGACY_RENEGOTIATION;
 }
 
+/** Assert that the flags that allow legacy renegotiation are still set */
 void
 tor_tls_assert_renegotiation_unblocked(tor_tls_t *tls)
 {

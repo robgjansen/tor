@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2011, The Tor Project, Inc. */
+/* Copyright (c) 2009-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "or.h"
@@ -80,7 +80,12 @@ dump_microdescriptor(FILE *f, microdesc_t *md, size_t *annotation_len_out)
     char annotation[ISO_TIME_LEN+32];
     format_iso_time(buf, md->last_listed);
     tor_snprintf(annotation, sizeof(annotation), "@last-listed %s\n", buf);
-    fputs(annotation, f);
+    if (fputs(annotation, f) < 0) {
+      log_warn(LD_DIR,
+               "Couldn't write microdescriptor annotation: %s",
+               strerror(ferror(f)));
+      return -1;
+    }
     r += strlen(annotation);
     *annotation_len_out = r;
   } else {
@@ -182,7 +187,7 @@ microdescs_add_to_cache(microdesc_cache_t *cache,
   return added;
 }
 
-/* As microdescs_add_to_cache, but takes a list of micrdescriptors instead of
+/** As microdescs_add_to_cache, but takes a list of micrdescriptors instead of
  * a string to decode.  Frees any members of <b>descriptors</b> that it does
  * not add. */
 smartlist_t *
@@ -226,9 +231,10 @@ microdescs_add_list_to_cache(microdesc_cache_t *cache,
       size_t annotation_len;
       size = dump_microdescriptor(f, md, &annotation_len);
       if (size < 0) {
-        /* XXX handle errors from dump_microdescriptor() */
-        /* log?  return -1?  die?  coredump the universe? */
-        continue;
+        /* we already warned in dump_microdescriptor; */
+        abort_writing_to_file(open_file);
+        smartlist_clear(added);
+        return added;
       }
       md->saved_location = SAVED_IN_JOURNAL;
       cache->journal_len += size;
@@ -367,8 +373,8 @@ microdesc_cache_clean(microdesc_cache_t *cache, time_t cutoff, int force)
   }
 
   if (dropped) {
-    log_notice(LD_DIR, "Removed %d/%d microdescriptors as old.",
-               dropped,dropped+kept);
+    log_info(LD_DIR, "Removed %d/%d microdescriptors as old.",
+             dropped,dropped+kept);
     cache->bytes_dropped += bytes_dropped;
   }
 }
@@ -471,7 +477,7 @@ microdesc_cache_rebuild(microdesc_cache_t *cache, int force)
     md->body = (char*)cache->cache_content->data + md->off;
     if (PREDICT_UNLIKELY(
              md->bodylen < 9 || fast_memneq(md->body, "onion-key", 9) != 0)) {
-      /* XXXX023 once bug 2022 is solved, we can kill this block and turn it
+      /* XXXX once bug 2022 is solved, we can kill this block and turn it
        * into just the tor_assert(!memcmp) */
       off_t avail = cache->cache_content->size - md->off;
       char *bad_str;
@@ -637,8 +643,13 @@ microdesc_list_missing_digest256(networkstatus_t *ns, microdesc_cache_t *cache,
       continue;
     if (skip && digestmap_get(skip, rs->descriptor_digest))
       continue;
-    if (tor_mem_is_zero(rs->descriptor_digest, DIGEST256_LEN))
-      continue; /* This indicates a bug somewhere XXXX023*/
+    if (tor_mem_is_zero(rs->descriptor_digest, DIGEST256_LEN)) {
+      log_info(LD_BUG, "Found an entry in networkstatus with no "
+               "microdescriptor digest. (Router %s=%s at %s:%d.)",
+               rs->nickname, hex_str(rs->identity_digest, DIGEST_LEN),
+               fmt_addr32(rs->addr), rs->or_port);
+      continue;
+    }
     /* XXXX Also skip if we're a noncache and wouldn't use this router.
      * XXXX NM Microdesc
      */

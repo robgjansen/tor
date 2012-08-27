@@ -3,7 +3,6 @@
  */
 
 /* Windows-only defines. */
-#define _WIN32
 #define CONFDIR ""
 
 /* Define to 1 if you have the <arpa/inet.h> header file. */
@@ -233,7 +232,7 @@
 #define USING_TWOS_COMPLEMENT
 
 /* Version number of package */
-#define VERSION "0.2.3.11-alpha-dev"
+#define VERSION "0.2.3.20-rc"
 
 
 

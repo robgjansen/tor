@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #define DIRSERV_PRIVATE
@@ -951,6 +951,7 @@ list_single_server_status(const routerinfo_t *desc, int is_live)
   return tor_strdup(buf);
 }
 
+/* DOCDOC running_long_enough_to_decide_unreachable */
 static INLINE int
 running_long_enough_to_decide_unreachable(void)
 {
@@ -974,7 +975,7 @@ running_long_enough_to_decide_unreachable(void)
 void
 dirserv_set_router_is_running(routerinfo_t *router, time_t now)
 {
-  /*XXXX023 This function is a mess.  Separate out the part that calculates
+  /*XXXX024 This function is a mess.  Separate out the part that calculates
     whether it's reachable and the part that tells rephist that the router was
     unreachable.
    */
@@ -1250,6 +1251,15 @@ int
 directory_caches_v2_dir_info(const or_options_t *options)
 {
   return options->DirPort != NULL;
+}
+
+/** Return true iff we want to fetch and keep certificates for authorities
+ * that we don't acknowledge as aurthorities ourself.
+ */
+int
+directory_caches_unknown_auth_certs(const or_options_t *options)
+{
+  return options->DirPort || options->BridgeRelay;
 }
 
 /** Return 1 if we want to keep descriptors, networkstatuses, etc around
@@ -1783,7 +1793,7 @@ dirserv_thinks_router_is_unreliable(time_t now,
 {
   if (need_uptime) {
     if (!enough_mtbf_info) {
-      /* XXX023 Once most authorities are on v3, we should change the rule from
+      /* XXX024 Once most authorities are on v3, we should change the rule from
        * "use uptime if we don't have mtbf data" to "don't advertise Stable on
        * v3 if we don't have enough mtbf data."  Or maybe not, since if we ever
        * hit a point where we need to reset a lot of authorities at once,
@@ -1845,7 +1855,7 @@ dirserv_thinks_router_is_hs_dir(const routerinfo_t *router,
    * *clients* suffering from bug 2722 are obsolete.  The first version
    * to fix the bug was 0.2.2.25-alpha. */
   return (router->wants_to_be_hs_dir && router->dir_port &&
-          uptime > get_options()->MinUptimeHidServDirectoryV2 &&
+          uptime >= get_options()->MinUptimeHidServDirectoryV2 &&
           node->is_running);
 }
 
@@ -1985,7 +1995,7 @@ dirserv_compute_performance_thresholds(routerlist_t *rl)
   log(LOG_INFO, LD_DIRSERV,
       "Cutoffs: For Stable, %lu sec uptime, %lu sec MTBF. "
       "For Fast: %lu bytes/sec. "
-      "For Guard: WFU %.03lf%%, time-known %lu sec, "
+      "For Guard: WFU %.03f%%, time-known %lu sec, "
       "and bandwidth %lu or %lu bytes/sec. We%s have enough stability data.",
       (unsigned long)stable_uptime,
       (unsigned long)stable_mtbf,
@@ -2283,8 +2293,7 @@ get_possible_sybil_list(const smartlist_t *routers)
 
   last_addr = 0;
   addr_count = 0;
-  SMARTLIST_FOREACH(routers_by_ip, routerinfo_t *, ri,
-    {
+  SMARTLIST_FOREACH_BEGIN(routers_by_ip, routerinfo_t *, ri) {
       if (last_addr != ri->addr) {
         last_addr = ri->addr;
         addr_count = 1;
@@ -2293,7 +2302,7 @@ get_possible_sybil_list(const smartlist_t *routers)
             addr_count > max_with_same_addr_on_authority)
           digestmap_set(omit_as_sybil, ri->cache_info.identity_digest, ri);
       }
-    });
+  } SMARTLIST_FOREACH_END(ri);
 
   smartlist_free(routers_by_ip);
   return omit_as_sybil;
@@ -2311,7 +2320,7 @@ is_router_version_good_for_possible_guard(const char *platform)
 
   tor_version_t router_version;
 
-  /* XXX023 This block should be extracted into its own function. */
+  /* XXX024 This block should be extracted into its own function. */
   /* XXXX Begin code copied from tor_version_as_new_as (in routerparse.c) */
   {
     char *s, *s2, *start;
@@ -2417,8 +2426,7 @@ set_routerstatus_from_routerinfo(routerstatus_t *rs,
         routerbw >= options->AuthDirGuardBWGuarantee) ||
        routerbw >= MIN(guard_bandwidth_including_exits,
                        guard_bandwidth_excluding_exits)) &&
-      (options->GiveGuardFlagTo_CVE_2011_2768_VulnerableRelays ||
-       is_router_version_good_for_possible_guard(ri->platform))) {
+      is_router_version_good_for_possible_guard(ri->platform)) {
     long tk = rep_hist_get_weighted_time_known(
                                       node->identity, now);
     double wfu = rep_hist_get_weighted_fractional_uptime(
@@ -2955,7 +2963,7 @@ generate_v2_networkstatus_opinion(void)
 
   omit_as_sybil = get_possible_sybil_list(routers);
 
-  SMARTLIST_FOREACH(routers, routerinfo_t *, ri, {
+  SMARTLIST_FOREACH_BEGIN(routers, routerinfo_t *, ri) {
     if (ri->cache_info.published_on >= cutoff) {
       routerstatus_t rs;
       char *version = version_from_platform(ri->platform);
@@ -2979,7 +2987,7 @@ generate_v2_networkstatus_opinion(void)
       tor_free(version);
       outp += strlen(outp);
     }
-  });
+  } SMARTLIST_FOREACH_END(ri);
 
   if (tor_snprintf(outp, endp-outp, "directory-signature %s\n",
                    options->Nickname)<0) {
@@ -3097,8 +3105,7 @@ dirserv_get_networkstatus_v2(smartlist_t *result,
     cached_v2_networkstatus = digestmap_new();
 
   dirserv_get_networkstatus_v2_fingerprints(fingerprints, key);
-  SMARTLIST_FOREACH(fingerprints, const char *, fp,
-    {
+  SMARTLIST_FOREACH_BEGIN(fingerprints, const char *, fp) {
       if (router_digest_is_me(fp) && should_generate_v2_networkstatus())
         generate_v2_networkstatus_opinion();
       cached = digestmap_get(cached_v2_networkstatus, fp);
@@ -3110,7 +3117,7 @@ dirserv_get_networkstatus_v2(smartlist_t *result,
         log_info(LD_DIRSERV, "Don't know about any network status with "
                  "fingerprint '%s'", hexbuf);
       }
-    });
+  } SMARTLIST_FOREACH_END(fp);
   SMARTLIST_FOREACH(fingerprints, char *, cp, tor_free(cp));
   smartlist_free(fingerprints);
 }
@@ -3229,8 +3236,7 @@ dirserv_get_routerdescs(smartlist_t *descs_out, const char *key,
     key += strlen("/tor/server/fp/");
     dir_split_resource_into_fingerprints(key, digests, NULL,
                                          DSR_HEX|DSR_SORT_UNIQ);
-    SMARTLIST_FOREACH(digests, const char *, d,
-       {
+    SMARTLIST_FOREACH_BEGIN(digests, const char *, d) {
          if (router_digest_is_me(d)) {
            /* make sure desc_routerinfo exists */
            const routerinfo_t *ri = router_get_my_routerinfo();
@@ -3245,7 +3251,7 @@ dirserv_get_routerdescs(smartlist_t *descs_out, const char *key,
            if (ri && ri->cache_info.published_on > cutoff)
              smartlist_add(descs_out, (void*) &(ri->cache_info));
          }
-       });
+    } SMARTLIST_FOREACH_END(d);
     SMARTLIST_FOREACH(digests, char *, d, tor_free(d));
     smartlist_free(digests);
   } else {
@@ -3264,46 +3270,41 @@ dirserv_get_routerdescs(smartlist_t *descs_out, const char *key,
  * router listening at <b>address</b>:<b>or_port</b>, and has yielded
  * a certificate with digest <b>digest_rcvd</b>.
  *
- * Also, if as_advertised is 1, then inform the reachability checker
- * that we could get to this guy.
+ * Inform the reachability checker that we could get to this guy.
  */
 void
 dirserv_orconn_tls_done(const char *address,
                         uint16_t or_port,
-                        const char *digest_rcvd,
-                        int as_advertised)
+                        const char *digest_rcvd)
 {
-  routerlist_t *rl = router_get_routerlist();
+  routerinfo_t *ri;
   time_t now = time(NULL);
-  int bridge_auth = authdir_mode_bridge(get_options());
   tor_assert(address);
   tor_assert(digest_rcvd);
 
-  /* XXX023 Doing a loop like this is stupid.  We should just look up the
-   * router by digest_rcvd, and see if address, orport, and as_advertised
-   * match up. -NM */
-  SMARTLIST_FOREACH_BEGIN(rl->routers, routerinfo_t *, ri) {
-    if (!strcasecmp(address, ri->address) && or_port == ri->or_port &&
-        as_advertised &&
-        fast_memeq(ri->cache_info.identity_digest, digest_rcvd, DIGEST_LEN)) {
-      /* correct digest. mark this router reachable! */
-      if (!bridge_auth || ri->purpose == ROUTER_PURPOSE_BRIDGE) {
-        tor_addr_t addr, *addrp=NULL;
-        log_info(LD_DIRSERV, "Found router %s to be reachable at %s:%d. Yay.",
-                 router_describe(ri),
-                 address, ri->or_port);
-        if (tor_addr_parse(&addr, ri->address) != -1)
-          addrp = &addr;
-        else
-          log_warn(LD_BUG, "Couldn't parse IP address \"%s\"", ri->address);
-        rep_hist_note_router_reachable(digest_rcvd, addrp, or_port, now);
-        ri->last_reachable = now;
-      }
+  ri = router_get_mutable_by_digest(digest_rcvd);
+
+  if (ri == NULL)
+    return;
+
+  if (!strcasecmp(address, ri->address) && or_port == ri->or_port) {
+    /* Found the right router.  */
+    if (!authdir_mode_bridge(get_options()) ||
+        ri->purpose == ROUTER_PURPOSE_BRIDGE) {
+      /* This is a bridge or we're not a bridge authorititative --
+         mark it as reachable.  */
+      tor_addr_t addr, *addrp=NULL;
+      log_info(LD_DIRSERV, "Found router %s to be reachable at %s:%d. Yay.",
+               router_describe(ri),
+               address, ri->or_port);
+      if (tor_addr_parse(&addr, ri->address) != -1)
+        addrp = &addr;
+      else
+        log_warn(LD_BUG, "Couldn't parse IP address \"%s\"", ri->address);
+      rep_hist_note_router_reachable(digest_rcvd, addrp, or_port, now);
+      ri->last_reachable = now;
     }
-  } SMARTLIST_FOREACH_END(ri);
-  /* FFFF Maybe we should reinstate the code that dumps routers with the same
-   * addr/port but with nonmatching keys, but instead of dumping, we should
-   * skip testing. */
+  }
 }
 
 /** Called when we, as an authority, receive a new router descriptor either as
@@ -3398,7 +3399,7 @@ lookup_cached_dir_by_fp(const char *fp)
     d = strmap_get(cached_consensuses, "ns");
   else if (memchr(fp, '\0', DIGEST_LEN) && cached_consensuses &&
            (d = strmap_get(cached_consensuses, fp))) {
-    /* this here interface is a nasty hack XXXX023 */;
+    /* this here interface is a nasty hack XXXX024 */;
   } else if (router_digest_is_me(fp) && the_v2_networkstatus)
     d = the_v2_networkstatus;
   else if (cached_v2_networkstatus)
@@ -3416,8 +3417,7 @@ int
 dirserv_remove_old_statuses(smartlist_t *fps, time_t cutoff)
 {
   int found_any = 0;
-  SMARTLIST_FOREACH(fps, char *, digest,
-  {
+  SMARTLIST_FOREACH_BEGIN(fps, char *, digest) {
     cached_dir_t *d = lookup_cached_dir_by_fp(digest);
     if (!d)
       continue;
@@ -3426,7 +3426,7 @@ dirserv_remove_old_statuses(smartlist_t *fps, time_t cutoff)
       tor_free(digest);
       SMARTLIST_DEL_CURRENT(fps, digest);
     }
-  });
+  } SMARTLIST_FOREACH_END(digest);
 
   return found_any;
 }
@@ -3465,7 +3465,7 @@ int
 dirserv_have_any_serverdesc(smartlist_t *fps, int spool_src)
 {
   time_t publish_cutoff = time(NULL)-ROUTER_MAX_AGE_TO_PUBLISH;
-  SMARTLIST_FOREACH(fps, const char *, fp, {
+  SMARTLIST_FOREACH_BEGIN(fps, const char *, fp) {
       switch (spool_src)
       {
         case DIR_SPOOL_EXTRA_BY_DIGEST:
@@ -3481,7 +3481,7 @@ dirserv_have_any_serverdesc(smartlist_t *fps, int spool_src)
             return 1;
           break;
       }
-  });
+  } SMARTLIST_FOREACH_END(fp);
   return 0;
 }
 
@@ -3609,7 +3609,7 @@ connection_dirserv_add_servers_to_outbuf(dir_connection_t *conn)
     }
     body = signed_descriptor_get_body(sd);
     if (conn->zlib_state) {
-      /* XXXX022 This 'last' business should actually happen on the last
+      /* XXXX024 This 'last' business should actually happen on the last
        * routerinfo, not on the last fingerprint. */
       int last = ! smartlist_len(conn->fingerprint_stack);
       connection_write_to_buf_zlib(body, sd->signed_descriptor_len, conn,
@@ -3652,7 +3652,7 @@ connection_dirserv_add_microdescs_to_outbuf(dir_connection_t *conn)
     if (!md)
       continue;
     if (conn->zlib_state) {
-      /* XXXX022 This 'last' business should actually happen on the last
+      /* XXXX024 This 'last' business should actually happen on the last
        * routerinfo, not on the last fingerprint. */
       int last = !smartlist_len(conn->fingerprint_stack);
       connection_write_to_buf_zlib(md->body, md->bodylen, conn, last);

@@ -1,6 +1,6 @@
 /* Copyright (c) 2003, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -31,7 +31,7 @@
 #include <direct.h>
 #include <process.h>
 #include <tchar.h>
-#include <Winbase.h>
+#include <winbase.h>
 #else
 #include <dirent.h>
 #include <pwd.h>
@@ -80,7 +80,7 @@
 #include <malloc/malloc.h>
 #endif
 #ifdef HAVE_MALLOC_H
-#ifndef OPENBSD
+#if !defined(OPENBSD) && !defined(__FreeBSD__)
 /* OpenBSD has a malloc.h, but for our purposes, it only exists in order to
  * scold us for being so stupid as to autodetect its presence.  To be fair,
  * they've done this since 1996, when autoconf was only 5 years old. */
@@ -169,6 +169,35 @@ _tor_malloc_zero(size_t size DMALLOC_PARAMS)
    * for big stuff, so we don't bother with calloc. */
   void *result = _tor_malloc(size DMALLOC_FN_ARGS);
   memset(result, 0, size);
+  return result;
+}
+
+/** Allocate a chunk of <b>nmemb</b>*<b>size</b> bytes of memory, fill
+ * the memory with zero bytes, and return a pointer to the result.
+ * Log and terminate the process on error.  (Same as
+ * calloc(<b>nmemb</b>,<b>size</b>), but never returns NULL.)
+ *
+ * XXXX This implementation probably asserts in cases where it could
+ * work, because it only tries dividing SIZE_MAX by size (according to
+ * the calloc(3) man page, the size of an element of the nmemb-element
+ * array to be allocated), not by nmemb (which could in theory be
+ * smaller than size).  Don't do that then.
+ */
+void *
+_tor_calloc(size_t nmemb, size_t size DMALLOC_PARAMS)
+{
+  /* You may ask yourself, "wouldn't it be smart to use calloc instead of
+   * malloc+memset?  Perhaps libc's calloc knows some nifty optimization trick
+   * we don't!"  Indeed it does, but its optimizations are only a big win when
+   * we're allocating something very big (it knows if it just got the memory
+   * from the OS in a pre-zeroed state).  We don't want to use tor_malloc_zero
+   * for big stuff, so we don't bother with calloc. */
+  void *result;
+  size_t max_nmemb = (size == 0) ? SIZE_MAX : SIZE_MAX/size;
+
+  tor_assert(nmemb < max_nmemb);
+
+  result = _tor_malloc_zero((nmemb * size) DMALLOC_FN_ARGS);
   return result;
 }
 
@@ -841,6 +870,9 @@ tor_digest256_is_zero(const char *digest)
 /* Helper: common code to check whether the result of a strtol or strtoul or
  * strtoll is correct. */
 #define CHECK_STRTOX_RESULT()                           \
+  /* Did an overflow occur? */                          \
+  if (errno == ERANGE)                                  \
+    goto err;                                           \
   /* Was at least one character converted? */           \
   if (endptr == s)                                      \
     goto err;                                           \
@@ -877,6 +909,13 @@ tor_parse_long(const char *s, int base, long min, long max,
   char *endptr;
   long r;
 
+  if (base < 0) {
+    if (ok)
+      *ok = 0;
+    return 0;
+  }
+
+  errno = 0;
   r = strtol(s, &endptr, base);
   CHECK_STRTOX_RESULT();
 }
@@ -889,6 +928,13 @@ tor_parse_ulong(const char *s, int base, unsigned long min,
   char *endptr;
   unsigned long r;
 
+  if (base < 0) {
+    if (ok)
+      *ok = 0;
+    return 0;
+  }
+
+  errno = 0;
   r = strtoul(s, &endptr, base);
   CHECK_STRTOX_RESULT();
 }
@@ -900,6 +946,7 @@ tor_parse_double(const char *s, double min, double max, int *ok, char **next)
   char *endptr;
   double r;
 
+  errno = 0;
   r = strtod(s, &endptr);
   CHECK_STRTOX_RESULT();
 }
@@ -913,6 +960,13 @@ tor_parse_uint64(const char *s, int base, uint64_t min,
   char *endptr;
   uint64_t r;
 
+  if (base < 0) {
+    if (ok)
+      *ok = 0;
+    return 0;
+  }
+
+  errno = 0;
 #ifdef HAVE_STRTOULL
   r = (uint64_t)strtoull(s, &endptr, base);
 #elif defined(_WIN32)
@@ -1338,7 +1392,7 @@ format_rfc1123_time(char *buf, time_t t)
   tor_assert(tm.tm_wday >= 0);
   tor_assert(tm.tm_wday <= 6);
   memcpy(buf, WEEKDAY_NAMES[tm.tm_wday], 3);
-  tor_assert(tm.tm_wday >= 0);
+  tor_assert(tm.tm_mon >= 0);
   tor_assert(tm.tm_mon <= 11);
   memcpy(buf+8, MONTH_NAMES[tm.tm_mon], 3);
 }
@@ -1368,7 +1422,8 @@ parse_rfc1123_time(const char *buf, time_t *t)
     tor_free(esc);
     return -1;
   }
-  if (tm_mday > 31 || tm_hour > 23 || tm_min > 59 || tm_sec > 61) {
+  if (tm_mday < 1 || tm_mday > 31 || tm_hour > 23 || tm_min > 59 ||
+      tm_sec > 60) {
     char *esc = esc_for_log(buf);
     log_warn(LD_GENERAL, "Got invalid RFC1123 time %s", esc);
     tor_free(esc);
@@ -1458,7 +1513,7 @@ int
 parse_iso_time(const char *cp, time_t *t)
 {
   struct tm st_tm;
-  unsigned int year=0, month=0, day=0, hour=100, minute=100, second=100;
+  unsigned int year=0, month=0, day=0, hour=0, minute=0, second=0;
   if (tor_sscanf(cp, "%u-%2u-%2u %2u:%2u:%2u", &year, &month,
                 &day, &hour, &minute, &second) < 6) {
     char *esc = esc_for_log(cp);
@@ -1467,7 +1522,7 @@ parse_iso_time(const char *cp, time_t *t)
     return -1;
   }
   if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 ||
-          hour > 23 || minute > 59 || second > 61) {
+          hour > 23 || minute > 59 || second > 60) {
     char *esc = esc_for_log(cp);
     log_warn(LD_GENERAL, "ISO time %s was nonsensical", esc);
     tor_free(esc);
@@ -1507,12 +1562,15 @@ parse_http_time(const char *date, struct tm *tm)
   /* First, try RFC1123 or RFC850 format: skip the weekday.  */
   if ((cp = strchr(date, ','))) {
     ++cp;
-    if (tor_sscanf(date, "%2u %3s %4u %2u:%2u:%2u GMT",
+    if (*cp != ' ')
+      return -1;
+    ++cp;
+    if (tor_sscanf(cp, "%2u %3s %4u %2u:%2u:%2u GMT",
                &tm_mday, month, &tm_year,
                &tm_hour, &tm_min, &tm_sec) == 6) {
       /* rfc1123-date */
       tm_year -= 1900;
-    } else if (tor_sscanf(date, "%2u-%3s-%2u %2u:%2u:%2u GMT",
+    } else if (tor_sscanf(cp, "%2u-%3s-%2u %2u:%2u:%2u GMT",
                       &tm_mday, month, &tm_year,
                       &tm_hour, &tm_min, &tm_sec) == 6) {
       /* rfc850-date */
@@ -1537,18 +1595,20 @@ parse_http_time(const char *date, struct tm *tm)
 
   month[3] = '\0';
   /* Okay, now decode the month. */
+  /* set tm->tm_mon to dummy value so the check below fails. */
+  tm->tm_mon = -1;
   for (i = 0; i < 12; ++i) {
     if (!strcasecmp(MONTH_NAMES[i], month)) {
-      tm->tm_mon = i+1;
+      tm->tm_mon = i;
     }
   }
 
   if (tm->tm_year < 0 ||
-      tm->tm_mon < 1  || tm->tm_mon > 12 ||
-      tm->tm_mday < 0 || tm->tm_mday > 31 ||
+      tm->tm_mon < 0  || tm->tm_mon > 11 ||
+      tm->tm_mday < 1 || tm->tm_mday > 31 ||
       tm->tm_hour < 0 || tm->tm_hour > 23 ||
       tm->tm_min < 0  || tm->tm_min > 59 ||
-      tm->tm_sec < 0  || tm->tm_sec > 61)
+      tm->tm_sec < 0  || tm->tm_sec > 60)
     return -1; /* Out of range, or bad month. */
 
   return 0;
@@ -2318,14 +2378,16 @@ unescape_string(const char *s, char **result, size_t *size_out)
       case '\"':
         goto end_of_loop;
       case '\\':
-        if ((cp[1] == 'x' || cp[1] == 'X')
-            && TOR_ISXDIGIT(cp[2]) && TOR_ISXDIGIT(cp[3])) {
+        if (cp[1] == 'x' || cp[1] == 'X') {
+          if (!(TOR_ISXDIGIT(cp[2]) && TOR_ISXDIGIT(cp[3])))
+            return NULL;
           cp += 4;
         } else if (TOR_ISODIGIT(cp[1])) {
           cp += 2;
           if (TOR_ISODIGIT(*cp)) ++cp;
           if (TOR_ISODIGIT(*cp)) ++cp;
-        } else if (cp[1]) {
+        } else if (cp[1] == 'n' || cp[1] == 'r' || cp[1] == 't' || cp[1] == '"'
+                   || cp[1] == '\\' || cp[1] == '\'') {
           cp += 2;
         } else {
           return NULL;
@@ -2357,9 +2419,19 @@ unescape_string(const char *s, char **result, size_t *size_out)
           case 'r': *out++ = '\r'; cp += 2; break;
           case 't': *out++ = '\t'; cp += 2; break;
           case 'x': case 'X':
-            *out++ = ((hex_decode_digit(cp[2])<<4) +
-                      hex_decode_digit(cp[3]));
-            cp += 4;
+            {
+              int x1, x2;
+
+              x1 = hex_decode_digit(cp[2]);
+              x2 = hex_decode_digit(cp[3]);
+              if (x1 == -1 || x2 == -1) {
+                  tor_free(*result);
+                  return NULL;
+              }
+
+              *out++ = ((x1<<4) + x2);
+              cp += 4;
+            }
             break;
           case '0': case '1': case '2': case '3': case '4': case '5':
           case '6': case '7':
@@ -2416,7 +2488,7 @@ parse_config_line_from_str(const char *line, char **key_out, char **value_out)
      KEYCHAR = Any character except ' ', '\r', '\n', '\t', '#', "\"
 
      VALUES = QUOTEDVALUE | NORMALVALUE
-     QUOTEDVALUE = QUOTE QVITEM* QUOTE EOLSPACE?
+     QUOTEDVALUE = QUOTE QVCHAR* QUOTE EOLSPACE?
      QUOTE = '"'
      QVCHAR = KEYCHAR | ESC ('n' | 't' | 'r' | '"' | ESC |'\'' | OCTAL | HEX)
      ESC = "\\"
@@ -2716,7 +2788,7 @@ tor_vsscanf(const char *buf, const char *pattern, va_list ap)
         ++n_matched;
       } else if (*pattern == '%') {
         if (*buf != '%')
-          return -1;
+          return n_matched;
         ++buf;
         ++pattern;
       } else {
@@ -2730,7 +2802,7 @@ tor_vsscanf(const char *buf, const char *pattern, va_list ap)
 
 /** Minimal sscanf replacement: parse <b>buf</b> according to <b>pattern</b>
  * and store the results in the corresponding argument fields.  Differs from
- * sscanf in that it: Only handles %u and %x and %Ns.  Does not handle
+ * sscanf in that it: Only handles %u, %x, %c and %Ns.  Does not handle
  * arbitrarily long widths. %u and %x do not consume any space.  Is
  * locale-independent.  Returns -1 on malformed patterns.
  *
@@ -2783,7 +2855,7 @@ tor_listdir(const char *dirname)
 #ifdef _WIN32
   char *pattern=NULL;
   TCHAR tpattern[MAX_PATH] = {0};
-  char name[MAX_PATH] = {0};
+  char name[MAX_PATH*2+1] = {0};
   HANDLE handle;
   WIN32_FIND_DATA findData;
   tor_asprintf(&pattern, "%s\\*", dirname);
@@ -2800,6 +2872,7 @@ tor_listdir(const char *dirname)
   while (1) {
 #ifdef UNICODE
     wcstombs(name,findData.cFileName,MAX_PATH);
+    name[sizeof(name)-1] = '\0';
 #else
     strlcpy(name,findData.cFileName,sizeof(name));
 #endif
@@ -3118,6 +3191,68 @@ tor_join_win_cmdline(const char *argv[])
   return joined_argv;
 }
 
+/**
+ * Helper function to output hex numbers, called by
+ * format_helper_exit_status().  This writes the hexadecimal digits of x into
+ * buf, up to max_len digits, and returns the actual number of digits written.
+ * If there is insufficient space, it will write nothing and return 0.
+ *
+ * This function DOES NOT add a terminating NUL character to its output: be
+ * careful!
+ *
+ * This accepts an unsigned int because format_helper_exit_status() needs to
+ * call it with a signed int and an unsigned char, and since the C standard
+ * does not guarantee that an int is wider than a char (an int must be at
+ * least 16 bits but it is permitted for a char to be that wide as well), we
+ * can't assume a signed int is sufficient to accomodate an unsigned char.
+ * Thus, format_helper_exit_status() will still need to emit any require '-'
+ * on its own.
+ *
+ * For most purposes, you'd want to use tor_snprintf("%x") instead of this
+ * function; it's designed to be used in code paths where you can't call
+ * arbitrary C functions.
+ */
+int
+format_hex_number_for_helper_exit_status(unsigned int x, char *buf,
+                                         int max_len)
+{
+  int len;
+  unsigned int tmp;
+  char *cur;
+
+  /* Sanity check */
+  if (!buf || max_len <= 0)
+    return 0;
+
+  /* How many chars do we need for x? */
+  if (x > 0) {
+    len = 0;
+    tmp = x;
+    while (tmp > 0) {
+      tmp >>= 4;
+      ++len;
+    }
+  } else {
+    len = 1;
+  }
+
+  /* Bail if we would go past the end of the buffer */
+  if (len > max_len)
+    return 0;
+
+  /* Point to last one */
+  cur = buf + len - 1;
+
+  /* Convert x to hex */
+  do {
+    *cur-- = "0123456789ABCDEF"[x & 0xf];
+    x >>= 4;
+  } while (x != 0 && cur >= buf);
+
+  /* Return len */
+  return len;
+}
+
 /** Format <b>child_state</b> and <b>saved_errno</b> as a hex string placed in
  * <b>hex_errno</b>.  Called between fork and _exit, so must be signal-handler
  * safe.
@@ -3129,15 +3264,19 @@ tor_join_win_cmdline(const char *argv[])
  * in the processs of starting the child process did the failure occur (see
  * CHILD_STATE_* macros for definition), and SAVED_ERRNO is the value of
  * errno when the failure occurred.
+ *
+ * On success return the number of characters added to hex_errno, not counting
+ * the terminating NUL; return -1 on error.
  */
-
-void
+int
 format_helper_exit_status(unsigned char child_state, int saved_errno,
                           char *hex_errno)
 {
   unsigned int unsigned_errno;
+  int written, left;
   char *cur;
   size_t i;
+  int res = -1;
 
   /* Fill hex_errno with spaces, and a trailing newline (memset may
      not be signal handler safe, so we can't use it) */
@@ -3152,35 +3291,75 @@ format_helper_exit_status(unsigned char child_state, int saved_errno,
     unsigned_errno = (unsigned int) saved_errno;
   }
 
-  /* Convert errno to hex (start before \n) */
-  cur = hex_errno + HEX_ERRNO_SIZE - 2;
+  /*
+   * Count how many chars of space we have left, and keep a pointer into the
+   * current point in the buffer.
+   */
+  left = HEX_ERRNO_SIZE;
+  cur = hex_errno;
 
-  /* Check for overflow on first iteration of the loop */
-  if (cur < hex_errno)
-    return;
+  /* Emit child_state */
+  written = format_hex_number_for_helper_exit_status(child_state,
+                                                     cur, left);
+  if (written <= 0)
+    goto err;
 
-  do {
-    *cur-- = "0123456789ABCDEF"[unsigned_errno % 16];
-    unsigned_errno /= 16;
-  } while (unsigned_errno != 0 && cur >= hex_errno);
+  /* Adjust left and cur */
+  left -= written;
+  cur += written;
+  if (left <= 0)
+    goto err;
 
-  /* Prepend the minus sign if errno was negative */
-  if (saved_errno < 0 && cur >= hex_errno)
-    *cur-- = '-';
+  /* Now the '/' */
+  *cur = '/';
 
-  /* Leave a gap */
-  if (cur >= hex_errno)
-    *cur-- = '/';
+  /* Adjust left and cur */
+  ++cur;
+  --left;
+  if (left <= 0)
+    goto err;
 
-  /* Check for overflow on first iteration of the loop */
-  if (cur < hex_errno)
-    return;
+  /* Need minus? */
+  if (saved_errno < 0) {
+    *cur = '-';
+    ++cur;
+    --left;
+    if (left <= 0)
+      goto err;
+  }
 
-  /* Convert child_state to hex */
-  do {
-    *cur-- = "0123456789ABCDEF"[child_state % 16];
-    child_state /= 16;
-  } while (child_state != 0 && cur >= hex_errno);
+  /* Emit unsigned_errno */
+  written = format_hex_number_for_helper_exit_status(unsigned_errno,
+                                                     cur, left);
+
+  if (written <= 0)
+    goto err;
+
+  /* Adjust left and cur */
+  left -= written;
+  cur += written;
+
+  /* Check that we have enough space left for a newline */
+  if (left <= 0)
+    goto err;
+
+  /* Emit the newline and NUL */
+  *cur++ = '\n';
+  *cur++ = '\0';
+
+  res = (int)(cur - hex_errno - 1);
+
+  goto done;
+
+ err:
+  /*
+   * In error exit, just write a '\0' in the first char so whatever called
+   * this at least won't fall off the end.
+   */
+  *hex_errno = '\0';
+
+ done:
+  return res;
 }
 
 /* Maximum number of file descriptors, if we cannot get it via sysconf() */
@@ -3231,6 +3410,7 @@ tor_process_get_stdout_pipe(process_handle_t *process_handle)
   return process_handle->stdout_pipe;
 }
 #else
+/* DOCDOC tor_process_get_stdout_pipe */
 FILE *
 tor_process_get_stdout_pipe(process_handle_t *process_handle)
 {
@@ -3238,12 +3418,16 @@ tor_process_get_stdout_pipe(process_handle_t *process_handle)
 }
 #endif
 
+/* DOCDOC process_handle_new */
 static process_handle_t *
 process_handle_new(void)
 {
   process_handle_t *out = tor_malloc_zero(sizeof(process_handle_t));
 
-#ifndef _WIN32
+#ifdef _WIN32
+  out->stdout_pipe = INVALID_HANDLE_VALUE;
+  out->stderr_pipe = INVALID_HANDLE_VALUE;
+#else
   out->stdout_pipe = -1;
   out->stderr_pipe = -1;
 #endif
@@ -3251,7 +3435,15 @@ process_handle_new(void)
   return out;
 }
 
-/*DOCDOC*/
+/**
+ * @name child-process states
+ *
+ * Each of these values represents a possible state that a child process can
+ * be in.  They're used to determine what to say when telling the parent how
+ * far along we were before failure.
+ *
+ * @{
+ */
 #define CHILD_STATE_INIT 0
 #define CHILD_STATE_PIPE 1
 #define CHILD_STATE_MAXFD 2
@@ -3262,7 +3454,7 @@ process_handle_new(void)
 #define CHILD_STATE_CLOSEFD 7
 #define CHILD_STATE_EXEC 8
 #define CHILD_STATE_FAILEXEC 9
-
+/** @} */
 /** Start a program in the background. If <b>filename</b> contains a '/', then
  * it will be treated as an absolute or relative path.  Otherwise, on
  * non-Windows systems, the system path will be searched for <b>filename</b>.
@@ -3284,11 +3476,7 @@ process_handle_new(void)
  */
 int
 tor_spawn_background(const char *const filename, const char **argv,
-#ifdef _WIN32
-                     LPVOID envp,
-#else
-                     const char **envp,
-#endif
+                     process_environment_t *env,
                      process_handle_t **process_handle_out)
 {
 #ifdef _WIN32
@@ -3299,13 +3487,11 @@ tor_spawn_background(const char *const filename, const char **argv,
   process_handle_t *process_handle;
   int status;
 
-  STARTUPINFO siStartInfo;
+  STARTUPINFOA siStartInfo;
   BOOL retval = FALSE;
 
   SECURITY_ATTRIBUTES saAttr;
   char *joined_argv;
-
-  (void)envp; // Unused on Windows
 
   saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
   saAttr.bInheritHandle = TRUE;
@@ -3362,7 +3548,7 @@ tor_spawn_background(const char *const filename, const char **argv,
 
   /* Create the child process */
 
-  retval = CreateProcess(filename,      // module name
+  retval = CreateProcessA(filename,      // module name
                  joined_argv,   // command line
   /* TODO: should we set explicit security attributes? (#2046, comment 5) */
                  NULL,          // process security attributes
@@ -3371,7 +3557,7 @@ tor_spawn_background(const char *const filename, const char **argv,
   /*(TODO: set CREATE_NEW CONSOLE/PROCESS_GROUP to make GetExitCodeProcess()
    * work?) */
                  0,             // creation flags
-                 envp,          // use parent's environment
+                 (env==NULL) ? NULL : env->windows_environment_block,
                  NULL,          // use parent's current directory
                  &siStartInfo,  // STARTUPINFO pointer
                  &(process_handle->pid));  // receives PROCESS_INFORMATION
@@ -3435,6 +3621,10 @@ tor_spawn_background(const char *const filename, const char **argv,
     log_warn(LD_GENERAL,
       "Failed to set up pipe for stderr communication with child process: %s",
       strerror(errno));
+
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
+
     return status;
   }
 
@@ -3501,8 +3691,8 @@ tor_spawn_background(const char *const filename, const char **argv,
     /* Call the requested program. We need the cast because
        execvp doesn't define argv as const, even though it
        does not modify the arguments */
-    if (envp)
-      execve(filename, (char *const *) argv, (char*const*)envp);
+    if (env)
+      execve(filename, (char *const *) argv, env->unixoid_environment_block);
     else
       execvp(filename, (char *const *) argv);
 
@@ -3511,15 +3701,20 @@ tor_spawn_background(const char *const filename, const char **argv,
     child_state = CHILD_STATE_FAILEXEC;
 
   error:
-    /* XXX: are we leaking fds from the pipe? */
+    {
+      /* XXX: are we leaking fds from the pipe? */
+      int n;
 
-    format_helper_exit_status(child_state, errno, hex_errno);
+      n = format_helper_exit_status(child_state, errno, hex_errno);
 
-    /* Write the error message. GCC requires that we check the return
-       value, but there is nothing we can do if it fails */
-    /* TODO: Don't use STDOUT, use a pipe set up just for this purpose */
-    nbytes = write(STDOUT_FILENO, error_message, error_message_length);
-    nbytes = write(STDOUT_FILENO, hex_errno, sizeof(hex_errno));
+      if (n >= 0) {
+        /* Write the error message. GCC requires that we check the return
+           value, but there is nothing we can do if it fails */
+        /* TODO: Don't use STDOUT, use a pipe set up just for this purpose */
+        nbytes = write(STDOUT_FILENO, error_message, error_message_length);
+        nbytes = write(STDOUT_FILENO, hex_errno, n);
+      }
+    }
 
     (void) nbytes;
 
@@ -3690,6 +3885,177 @@ tor_get_exit_code(const process_handle_t *process_handle,
 #endif // _WIN32
 
   return PROCESS_EXIT_EXITED;
+}
+
+/** Helper: return the number of characters in <b>s</b> preceding the first
+ * occurrence of <b>ch</b>. If <b>ch</b> does not occur in <b>s</b>, return
+ * the length of <b>s</b>. Should be equivalent to strspn(s, "ch"). */
+static INLINE size_t
+str_num_before(const char *s, char ch)
+{
+  const char *cp = strchr(s, ch);
+  if (cp)
+    return cp - s;
+  else
+    return strlen(s);
+}
+
+/** Return non-zero iff getenv would consider <b>s1</b> and <b>s2</b>
+ * to have the same name as strings in a process's environment. */
+int
+environment_variable_names_equal(const char *s1, const char *s2)
+{
+  size_t s1_name_len = str_num_before(s1, '=');
+  size_t s2_name_len = str_num_before(s2, '=');
+
+  return (s1_name_len == s2_name_len &&
+          tor_memeq(s1, s2, s1_name_len));
+}
+
+/** Free <b>env</b> (assuming it was produced by
+ * process_environment_make). */
+void
+process_environment_free(process_environment_t *env)
+{
+  if (env == NULL) return;
+
+  /* As both an optimization hack to reduce consing on Unixoid systems
+   * and a nice way to ensure that some otherwise-Windows-specific
+   * code will always get tested before changes to it get merged, the
+   * strings which env->unixoid_environment_block points to are packed
+   * into env->windows_environment_block. */
+  tor_free(env->unixoid_environment_block);
+  tor_free(env->windows_environment_block);
+
+  tor_free(env);
+}
+
+/** Make a process_environment_t containing the environment variables
+ * specified in <b>env_vars</b> (as C strings of the form
+ * "NAME=VALUE"). */
+process_environment_t *
+process_environment_make(struct smartlist_t *env_vars)
+{
+  process_environment_t *env = tor_malloc_zero(sizeof(process_environment_t));
+  size_t n_env_vars = smartlist_len(env_vars);
+  size_t i;
+  size_t total_env_length;
+  smartlist_t *env_vars_sorted;
+
+  tor_assert(n_env_vars + 1 != 0);
+  env->unixoid_environment_block = tor_calloc(n_env_vars + 1, sizeof(char *));
+  /* env->unixoid_environment_block is already NULL-terminated,
+   * because we assume that NULL == 0 (and check that during compilation). */
+
+  total_env_length = 1; /* terminating NUL of terminating empty string */
+  for (i = 0; i < n_env_vars; ++i) {
+    const char *s = smartlist_get(env_vars, i);
+    size_t slen = strlen(s);
+
+    tor_assert(slen + 1 != 0);
+    tor_assert(slen + 1 < SIZE_MAX - total_env_length);
+    total_env_length += slen + 1;
+  }
+
+  env->windows_environment_block = tor_malloc_zero(total_env_length);
+  /* env->windows_environment_block is already
+   * (NUL-terminated-empty-string)-terminated. */
+
+  /* Some versions of Windows supposedly require that environment
+   * blocks be sorted.  Or maybe some Windows programs (or their
+   * runtime libraries) fail to look up strings in non-sorted
+   * environment blocks.
+   *
+   * Also, sorting strings makes it easy to find duplicate environment
+   * variables and environment-variable strings without an '=' on all
+   * OSes, and they can cause badness.  Let's complain about those. */
+  env_vars_sorted = smartlist_new();
+  smartlist_add_all(env_vars_sorted, env_vars);
+  smartlist_sort_strings(env_vars_sorted);
+
+  /* Now copy the strings into the environment blocks. */
+  {
+    char *cp = env->windows_environment_block;
+    const char *prev_env_var = NULL;
+
+    for (i = 0; i < n_env_vars; ++i) {
+      const char *s = smartlist_get(env_vars_sorted, i);
+      size_t slen = strlen(s);
+      size_t s_name_len = str_num_before(s, '=');
+
+      if (s_name_len == slen) {
+        log_warn(LD_GENERAL,
+                 "Preparing an environment containing a variable "
+                 "without a value: %s",
+                 s);
+      }
+      if (prev_env_var != NULL &&
+          environment_variable_names_equal(s, prev_env_var)) {
+        log_warn(LD_GENERAL,
+                 "Preparing an environment containing two variables "
+                 "with the same name: %s and %s",
+                 prev_env_var, s);
+      }
+
+      prev_env_var = s;
+
+      /* Actually copy the string into the environment. */
+      memcpy(cp, s, slen+1);
+      env->unixoid_environment_block[i] = cp;
+      cp += slen+1;
+    }
+
+    tor_assert(cp == env->windows_environment_block + total_env_length - 1);
+  }
+
+  smartlist_free(env_vars_sorted);
+
+  return env;
+}
+
+/** Return a newly allocated smartlist containing every variable in
+ * this process's environment, as a NUL-terminated string of the form
+ * "NAME=VALUE".  Note that on some/many/most/all OSes, the parent
+ * process can put strings not of that form in our environment;
+ * callers should try to not get crashed by that.
+ *
+ * The returned strings are heap-allocated, and must be freed by the
+ * caller. */
+struct smartlist_t *
+get_current_process_environment_variables(void)
+{
+  smartlist_t *sl = smartlist_new();
+
+  char **environ_tmp; /* Not const char ** ? Really? */
+  for (environ_tmp = get_environment(); *environ_tmp; ++environ_tmp) {
+    smartlist_add(sl, tor_strdup(*environ_tmp));
+  }
+
+  return sl;
+}
+
+/** For each string s in <b>env_vars</b> such that
+ * environment_variable_names_equal(s, <b>new_var</b>), remove it; if
+ * <b>free_p</b> is non-zero, call <b>free_old</b>(s).  If
+ * <b>new_var</b> contains '=', insert it into <b>env_vars</b>. */
+void
+set_environment_variable_in_smartlist(struct smartlist_t *env_vars,
+                                      const char *new_var,
+                                      void (*free_old)(void*),
+                                      int free_p)
+{
+  SMARTLIST_FOREACH_BEGIN(env_vars, const char *, s) {
+    if (environment_variable_names_equal(s, new_var)) {
+      SMARTLIST_DEL_CURRENT(env_vars, s);
+      if (free_p) {
+        free_old((void *)s);
+      }
+    }
+  } SMARTLIST_FOREACH_END(s);
+
+  if (strchr(new_var, '=') != NULL) {
+    smartlist_add(env_vars, (void *)new_var);
+  }
 }
 
 #ifdef _WIN32
@@ -4033,7 +4399,10 @@ get_string_from_pipe(FILE *stream, char *buf_out, size_t count)
     }
   } else {
     len = strlen(buf_out);
-    tor_assert(len>0);
+    if (len == 0) {
+      /* this probably means we got a NUL at the start of the string. */
+      return IO_STREAM_EAGAIN;
+    }
 
     if (buf_out[len - 1] == '\n') {
       /* Remove the trailing newline */
@@ -4053,6 +4422,7 @@ get_string_from_pipe(FILE *stream, char *buf_out, size_t count)
   return IO_STREAM_TERM;
 }
 
+/* DOCDOC tor_check_port_forwarding */
 void
 tor_check_port_forwarding(const char *filename, int dir_port, int or_port,
                           time_t now)

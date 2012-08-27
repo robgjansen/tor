@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -94,7 +94,9 @@ static int stats_prev_global_read_bucket;
 static int stats_prev_global_write_bucket;
 #endif
 
+/* DOCDOC stats_prev_n_read */
 static uint64_t stats_prev_n_read = 0;
+/* DOCDOC stats_prev_n_written */
 static uint64_t stats_prev_n_written = 0;
 
 /* XXX we might want to keep stats about global_relayed_*_bucket too. Or not.*/
@@ -443,6 +445,7 @@ get_bytes_read(void)
   return stats_n_bytes_read;
 }
 
+/* DOCDOC get_bytes_written */
 uint64_t
 get_bytes_written(void)
 {
@@ -845,14 +848,43 @@ conn_close_if_marked(int i)
                            "Holding conn (fd %d) open for more flushing.",
                            (int)conn->s));
         conn->timestamp_lastwritten = now; /* reset so we can flush more */
-      }  else if(sz == 0) { /* retval is 0 */
-        /* wants to flush, but is rate limited */
-        conn->write_blocked_on_bw = 1;
-        if (connection_is_reading(conn))
-        	connection_stop_reading(conn);
-        if (connection_is_writing(conn))
-        	connection_stop_writing(conn);
- 	  }
+      } else if (sz == 0) {
+        /* Also, retval==0.  If we get here, we didn't want to write anything
+         * (because of rate-limiting) and we didn't. */
+
+        /* Connection must flush before closing, but it's being rate-limited.
+         * Let's remove from Libevent, and mark it as blocked on bandwidth
+         * so it will be re-added on next token bucket refill. Prevents
+         * busy Libevent loops where we keep ending up here and returning
+         * 0 until we are no longer blocked on bandwidth.
+         */
+        if (connection_is_writing(conn)) {
+          conn->write_blocked_on_bw = 1;
+          connection_stop_writing(conn);
+        }
+        if (connection_is_reading(conn)) {
+          /* XXXX024 We should make this code unreachable; if a connection is
+           * marked for close and flushing, there is no point in reading to it
+           * at all. Further, checking at this point is a bit of a hack: it
+           * would make much more sense to react in
+           * connection_handle_read_impl, or to just stop reading in
+           * mark_and_flush */
+#if 0
+#define MARKED_READING_RATE 180
+          static ratelim_t marked_read_lim = RATELIM_INIT(MARKED_READING_RATE);
+          char *m;
+          if ((m = rate_limit_log(&marked_read_lim, now))) {
+            log_warn(LD_BUG, "Marked connection (fd %d, type %s, state %s) "
+                     "is still reading; that shouldn't happen.%s",
+                     (int)conn->s, conn_type_to_string(conn->type),
+                     conn_state_to_string(conn->type, conn->state), m);
+            tor_free(m);
+          }
+#endif
+          conn->read_blocked_on_bw = 1;
+          connection_stop_reading(conn);
+        }
+      }
       return 0;
     }
     if (connection_wants_to_flush(conn)) {
@@ -1122,7 +1154,6 @@ run_scheduled_events(time_t now)
   static int should_init_bridge_stats = 1;
   static time_t time_to_retry_dns_init = 0;
   static time_t time_to_next_heartbeat = 0;
-  static int has_validated_pt = 0;
   const or_options_t *options = get_options();
 
   int is_server = server_mode(options);
@@ -1415,11 +1446,8 @@ run_scheduled_events(time_t now)
    *    We do this before step 4, so it can try building more if
    *    it's not comfortable with the number of available circuits.
    */
-  /* XXXX022 If our circuit build timeout is much lower than a second, maybe
-   * we should do this more often? -NM
-   * It can't be lower than 1.5 seconds currently; see
-   * circuit_build_times_min_timeout(). -RD
-   */
+  /* (If our circuit build timeout can ever become lower than a second (which
+   * it can't, currently), we should do this more often.) */
   circuit_expire_building();
 
   /** 3b. Also look at pending streams and prune the ones that 'began'
@@ -1435,7 +1463,7 @@ run_scheduled_events(time_t now)
 
   /** 3d. And every 60 seconds, we relaunch listeners if any died. */
   if (!net_is_disabled() && time_to_check_listeners < now) {
-    retry_all_listeners(NULL, NULL);
+    retry_all_listeners(NULL, NULL, 0);
     time_to_check_listeners = now+60;
   }
 
@@ -1529,14 +1557,6 @@ run_scheduled_events(time_t now)
   /** 11b. check pending unconfigured managed proxies */
   if (!net_is_disabled() && pt_proxies_configuration_pending())
     pt_configure_remaining_proxies();
-
-  /** 11c. validate pluggable transports configuration if we need to */
-  if (!has_validated_pt &&
-      (options->Bridges || options->ClientTransportPlugin)) {
-    if (validate_pluggable_transports_config() == 0) {
-      has_validated_pt = 1;
-    }
-  }
 
   /** 12. write the heartbeat message */
   if (options->HeartbeatPeriod &&
@@ -1780,8 +1800,16 @@ do_hup(void)
     }
     options = get_options(); /* they have changed now */
   } else {
+    char *msg = NULL;
     log_notice(LD_GENERAL, "Not reloading config file: the controller told "
                "us not to.");
+    /* Make stuff get rescanned, reloaded, etc. */
+    if (set_options((or_options_t*)options, &msg) < 0) {
+      if (!msg)
+        msg = tor_strdup("Unknown error");
+      log_warn(LD_GENERAL, "Unable to re-set previous options: %s", msg);
+      tor_free(msg);
+    }
   }
   if (authdir_mode_handles_descs(options, -1)) {
     /* reload the approved-routers file */
@@ -2077,8 +2105,7 @@ dumpstats(int severity)
 
   log(severity, LD_GENERAL, "Dumping stats:");
 
-  SMARTLIST_FOREACH(connection_array, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(connection_array, connection_t *, conn) {
     int i = conn_sl_idx;
     log(severity, LD_GENERAL,
         "Conn %d (socket %d) type %d (%s), state %d (%s), created %d secs ago",
@@ -2116,7 +2143,7 @@ dumpstats(int severity)
     }
     circuit_dump_by_conn(conn, severity); /* dump info about all the circuits
                                            * using this conn */
-  });
+  } SMARTLIST_FOREACH_END(conn);
   log(severity, LD_NET,
       "Cells processed: "U64_FORMAT" padding\n"
       "                 "U64_FORMAT" create\n"
@@ -2569,8 +2596,7 @@ tor_main(int argc, char *argv[])
   // a file on a folder shared by the wm emulator.
   // if no flashcard (real or emulated) is present,
   // log files will be written in the root folder
-  if (find_flashcard_path(path,MAX_PATH) == -1)
-  {
+  if (find_flashcard_path(path,MAX_PATH) == -1) {
     redir = _wfreopen( L"\\stdout.log", L"w", stdout );
     redirdbg = _wfreopen( L"\\stderr.log", L"w", stderr );
   } else {

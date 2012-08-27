@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -276,13 +276,6 @@ rend_mid_rendezvous(or_circuit_t *circ, const uint8_t *request,
   or_circuit_t *rend_circ;
   char hexid[9];
   int reason = END_CIRC_REASON_INTERNAL;
-  base16_encode(hexid,9,(char*)request,request_len<4?request_len:4);
-
-  if (request_len>=4) {
-    log_info(LD_REND,
-             "Got request for rendezvous from circuit %d to cookie %s.",
-             circ->p_circ_id, hexid);
-  }
 
   if (circ->_base.purpose != CIRCUIT_PURPOSE_OR || circ->_base.n_conn) {
     log_info(LD_REND,
@@ -299,6 +292,12 @@ rend_mid_rendezvous(or_circuit_t *circ, const uint8_t *request,
     reason = END_CIRC_REASON_TORPROTOCOL;
     goto err;
   }
+
+  base16_encode(hexid, sizeof(hexid), (const char*)request, 4);
+
+  log_info(LD_REND,
+           "Got request for rendezvous from circuit %d to cookie %s.",
+           circ->p_circ_id, hexid);
 
   rend_circ = circuit_get_rendezvous((char*)request);
   if (!rend_circ) {

@@ -1,10 +1,10 @@
 dnl Copyright (c) 2001-2004, Roger Dingledine
 dnl Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson
-dnl Copyright (c) 2007-2008, The Tor Project, Inc.
+dnl Copyright (c) 2007-2012, The Tor Project, Inc.
 dnl See LICENSE for licensing information
 
 AC_INIT
-AM_INIT_AUTOMAKE(tor, 0.2.3.11-alpha-dev)
+AM_INIT_AUTOMAKE(tor, 0.2.3.20-rc)
 AM_CONFIG_HEADER(orconfig.h)
 
 AC_CANONICAL_HOST
@@ -122,21 +122,12 @@ dnl -D_FORTIFY_SOURCE=2 -fstack-protector-all
 dnl Others suggest '/gs /safeseh /nxcompat /dynamicbase' for non-gcc on Windows
 dnl This requires that we use gcc and that we add -O2 to the CFLAGS.
 AC_ARG_ENABLE(gcc-hardening,
-     AS_HELP_STRING(--enable-gcc-hardening, enable compiler security checks),
-[if test x$enableval = xyes; then
-    CFLAGS="$CFLAGS -D_FORTIFY_SOURCE=2 -fstack-protector-all"
-    CFLAGS="$CFLAGS -fwrapv -fPIE -Wstack-protector"
-    CFLAGS="$CFLAGS --param ssp-buffer-size=1"
-    LDFLAGS="$LDFLAGS -pie"
-fi])
+    AS_HELP_STRING(--disable-gcc-hardening, disable compiler security checks))
 
 dnl Linker hardening options
 dnl Currently these options are ELF specific - you can't use this with MacOSX
 AC_ARG_ENABLE(linker-hardening,
-        AS_HELP_STRING(--enable-linker-hardening, enable linker security fixups),
-[if test x$enableval = xyes; then
-    LDFLAGS="$LDFLAGS -z relro -z now"
-fi])
+    AS_HELP_STRING(--disable-linker-hardening, disable linker security fixups))
 
 AC_ARG_ENABLE(local-appdata,
    AS_HELP_STRING(--enable-local-appdata, default to host local application data paths on Windows))
@@ -280,7 +271,12 @@ AC_SEARCH_LIBS(socket, [socket network])
 AC_SEARCH_LIBS(gethostbyname, [nsl])
 AC_SEARCH_LIBS(dlopen, [dl])
 AC_SEARCH_LIBS(inet_aton, [resolv])
-AC_SEARCH_LIBS([clock_gettime], [rt], [have_rt=yes])
+saved_LIBS="$LIBS"
+AC_SEARCH_LIBS([clock_gettime], [rt])
+if test "$LIBS" != "$saved_LIBS"; then
+   # Looks like we need -lrt for clock_gettime().
+   have_rt=yes
+fi
 
 if test "$enable_threads" = "yes"; then
   AC_SEARCH_LIBS(pthread_create, [pthread])
@@ -292,6 +288,7 @@ dnl Check for functions before libevent, since libevent-1.2 apparently
 dnl exports strlcpy without defining it in a header.
 
 AC_CHECK_FUNCS(
+        _NSGetEnviron \
         accept4 \
         clock_gettime \
         flock \
@@ -520,7 +517,6 @@ TOR_SEARCH_LIBRARY(openssl, $tryssldir, [-lssl -lcrypto $TOR_LIB_GDI],
 
 dnl XXXX check for OPENSSL_VERSION_NUMBER == SSLeay()
 
-echo "tor_cv_library_openssl_dir is $tor_cv_library_openssl_dir"
 if test "$enable_static_openssl" = "yes"; then
    if test "$tor_cv_library_openssl_dir" = "(system)"; then
      AC_MSG_ERROR("You must specify an explicit --with-openssl-dir=x option when using --enable-static-openssl")
@@ -552,15 +548,44 @@ if test "$enable_static_zlib" = "yes"; then
  using --enable-static-zlib")
    else
      TOR_ZLIB_LIBS="$TOR_LIBDIR_zlib/libz.a"
-     echo "$TOR_LIBDIR_zlib/libz.a"
    fi
 else
      TOR_ZLIB_LIBS="-lz"
 fi
 AC_SUBST(TOR_ZLIB_LIBS)
 
-dnl Make sure to enable support for large off_t if available.
+dnl ---------------------------------------------------------------------
+dnl Now that we know about our major libraries, we can check for compiler
+dnl and linker hardening options.  We need to do this with the libraries known,
+dnl since sometimes the linker will like an option but not be willing to
+dnl use it with a build of a library.
 
+all_ldflags_for_check="$TOR_LDFLAGS_zlib $TOR_LDFLAGS_openssl $TOR_LDFLAGS_libevent"
+all_libs_for_check="$TOR_ZLIB_LIBS $TOR_LIB_MATH $TOR_LIBEVENT_LIBS $TOR_OPENSSL_LIBS $TOR_LIB_WS32 $TOR_LIB_GDI"
+
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [
+#if !defined(__clang__)
+#error
+#endif])], have_clang=yes, have_clang=no)
+
+if test x$enable_gcc_hardening != xno; then
+    CFLAGS="$CFLAGS -D_FORTIFY_SOURCE=2"
+    if test x$have_clang = xyes; then
+        TOR_CHECK_CFLAGS(-Qunused-arguments)
+    fi
+    TOR_CHECK_CFLAGS(-fstack-protector-all)
+    TOR_CHECK_CFLAGS(-Wstack-protector)
+    TOR_CHECK_CFLAGS(-fwrapv)
+    TOR_CHECK_CFLAGS(--param ssp-buffer-size=1)
+    if test "$bwin32" = "false"; then
+       TOR_CHECK_CFLAGS(-fPIE)
+       TOR_CHECK_LDFLAGS(-pie, "$all_ldflags_for_check", "$all_libs_for_check")
+    fi
+fi
+
+if test x$enable_linker_hardening != xno; then
+    TOR_CHECK_LDFLAGS(-z relro -z now, "$all_ldflags_for_check", "$all_libs_for_check")
+fi
 
 dnl ------------------------------------------------------
 dnl Where do you live, libnatpmp?  And how do we call you?
@@ -591,17 +616,37 @@ dnl There are no packages for Debian or Redhat as of this patch
 
 if test "$upnp" = "true"; then
     AC_DEFINE(MINIUPNPC, 1, [Define to 1 if we are building with UPnP.])
-    TOR_SEARCH_LIBRARY(libminiupnpc, $trylibminiupnpcdir, [-lminiupnpc $TOR_LIB_WS32 $TOR_LIB_IPHLPAPI],
-        [#include <miniupnpc/miniwget.h>
-         #include <miniupnpc/miniupnpc.h>
-         #include <miniupnpc/upnpcommands.h>],
-        [void upnpDiscover(int delay, const char * multicastif,
-         const char * minissdpdsock, int sameport);],
-        [upnpDiscover(1, 0, 0, 0); exit(0);],
-        [--with-libminiupnpc-dir],
-        [/usr/lib/])
+
+    dnl Before we call TOR_SEARCH_LIBRARY we'll do a quick compile test
+    dnl to see if we have miniupnpc-1.5 or -1.6
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <miniupnpc/miniupnpc.h>],
+        [upnpDiscover(1, 0, 0, 0);exit(0);])],[miniupnpc15="true"],[miniupnpc15="false"])
+
+    if test "$miniupnpc15" = "true" ; then
+        AC_DEFINE([MINIUPNPC15],[1],[libminiupnpc version 1.5 found])
+        TOR_SEARCH_LIBRARY(libminiupnpc, $trylibminiupnpcdir, [-lminiupnpc $TOR_LIB_WS32 $TOR_LIB_IPHLPAPI],
+            [#include <miniupnpc/miniwget.h>
+             #include <miniupnpc/miniupnpc.h>
+             #include <miniupnpc/upnpcommands.h>],
+            [void upnpDiscover(int delay, const char * multicastif,
+             const char * minissdpdsock, int sameport);],
+            [upnpDiscover(1, 0, 0, 0); exit(0);],
+            [--with-libminiupnpc-dir],
+            [/usr/lib/])
+    else
+        TOR_SEARCH_LIBRARY(libminiupnpc, $trylibminiupnpcdir, [-lminiupnpc $TOR_LIB_WS32 $TOR_LIB_IPHLPAPI],
+            [#include <miniupnpc/miniwget.h>
+             #include <miniupnpc/miniupnpc.h>
+             #include <miniupnpc/upnpcommands.h>],
+            [void upnpDiscover(int delay, const char * multicastif,
+             const char * minissdpdsock, int sameport, int ipv6, int * error);],
+            [upnpDiscover(1, 0, 0, 0, 0, 0); exit(0);],
+            [--with-libminiupnpc-dir],
+            [/usr/lib/])
+    fi
 fi
 
+dnl Make sure to enable support for large off_t if available.
 AC_SYS_LARGEFILE
 
 AC_CHECK_HEADERS(
@@ -622,6 +667,7 @@ dnl These headers are not essential
 
 AC_CHECK_HEADERS(
         arpa/inet.h \
+        crt_externs.h \
         grp.h \
         ifaddrs.h \
         inttypes.h \
@@ -653,6 +699,8 @@ AC_CHECK_HEADERS(
         syslog.h \
         utime.h
 )
+
+AC_CHECK_HEADERS(sys/param.h)
 
 TOR_CHECK_PROTOTYPE(malloc_good_size, HAVE_MALLOC_GOOD_SIZE_PROTOTYPE,
 [#ifdef HAVE_MALLOC_H
@@ -770,8 +818,7 @@ AC_CHECK_TYPES([struct in6_addr, struct sockaddr_in6, sa_family_t], , ,
 #include <sys/socket.h>
 #endif
 #ifdef _WIN32
-#define WIN32_WINNT 0x400
-#define _WIN32_WINNT 0x400
+#define _WIN32_WINNT 0x0501
 #define WIN32_LEAN_AND_MEAN
 #if defined(_MSC_VER) && (_MSC_VER < 1300)
 #include <winsock.h>
@@ -795,8 +842,7 @@ AC_CHECK_MEMBERS([struct in6_addr.s6_addr32, struct in6_addr.s6_addr16, struct s
 #include <sys/socket.h>
 #endif
 #ifdef _WIN32
-#define WIN32_WINNT 0x400
-#define _WIN32_WINNT 0x400
+#define _WIN32_WINNT 0x0501
 #define WIN32_LEAN_AND_MEAN
 #if defined(_MSC_VER) && (_MSC_VER < 1300)
 #include <winsock.h>
@@ -1084,6 +1130,20 @@ int main(int c, char **v) { puts(__FUNCTION__); }])],
   tor_cv_have_FUNCTION_macro=yes,
   tor_cv_have_FUNCTION_macro=no))
 
+AC_CACHE_CHECK([whether we have extern char **environ already declared],
+  tor_cv_have_environ_declared,
+  AC_COMPILE_IFELSE([AC_LANG_SOURCE([
+/* We define _GNU_SOURCE here because it is also defined in compat.c.
+ * Without it environ doesn't get declared. */
+#define _GNU_SOURCE
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
+#include <stdlib.h>
+int main(int c, char **v) { char **t = environ; }])],
+  tor_cv_have_environ_declared=yes,
+  tor_cv_have_environ_declared=no))
+
 if test "$tor_cv_have_func_macro" = 'yes'; then
   AC_DEFINE(HAVE_MACRO__func__, 1, [Defined if the compiler supports __func__])
 fi
@@ -1095,6 +1155,11 @@ fi
 if test "$tor_cv_have_FUNCTION_macro" = 'yes'; then
   AC_DEFINE(HAVE_MACRO__FUNCTION__, 1,
            [Defined if the compiler supports __FUNCTION__])
+fi
+
+if test "$tor_cv_have_environ_declared" = 'yes'; then
+  AC_DEFINE(HAVE_EXTERN_ENVIRON_DECLARED, 1,
+           [Defined if we have extern char **environ already declared])
 fi
 
 # $prefix stores the value of the --prefix command line option, or
@@ -1184,11 +1249,6 @@ if test x$enable_gcc_warnings = xyes || test x$enable_gcc_warnings_advisory = xy
 #if !defined(__GNUC__) || (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ < 3)
 #error
 #endif])], have_gcc43=yes, have_gcc43=no)
-
-AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [
-#if !defined(__clang__)
-#error
-#endif])], have_clang=yes, have_clang=no)
 
   save_CFLAGS="$CFLAGS"
   CFLAGS="$CFLAGS -Wshorten-64-to-32"

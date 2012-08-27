@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #define ROUTER_PRIVATE
@@ -484,6 +484,8 @@ v3_authority_check_key_expiry(void)
   last_warned = now;
 }
 
+/** Set up Tor's TLS contexts, based on our configuration and keys. Return 0
+ * on success, and -1 on failure. */
 int
 router_initialize_tls_context(void)
 {
@@ -651,15 +653,27 @@ init_keys(void)
       return -1;
     }
     if (mydesc) {
+      was_router_added_t added;
       ri = router_parse_entry_from_string(mydesc, NULL, 1, 0, NULL);
       if (!ri) {
         log_err(LD_GENERAL,"Generated a routerinfo we couldn't parse.");
         return -1;
       }
-      if (!WRA_WAS_ADDED(dirserv_add_descriptor(ri, &m, "self"))) {
-        log_err(LD_GENERAL,"Unable to add own descriptor to directory: %s",
-                m?m:"<unknown error>");
-        return -1;
+      added = dirserv_add_descriptor(ri, &m, "self");
+      if (!WRA_WAS_ADDED(added)) {
+        if (!WRA_WAS_OUTDATED(added)) {
+          log_err(LD_GENERAL, "Unable to add own descriptor to directory: %s",
+                  m?m:"<unknown error>");
+          return -1;
+        } else {
+          /* If the descriptor was outdated, that's ok. This can happen
+           * when some config options are toggled that affect workers, but
+           * we don't really need new keys yet so the descriptor doesn't
+           * change and the old one is still fresh. */
+          log_info(LD_GENERAL, "Couldn't add own descriptor to directory "
+                   "after key init: %s. This is usually not a problem.",
+                   m?m:"<unknown error>");
+        }
       }
     }
   }
@@ -1216,6 +1230,22 @@ consider_publishable_server(int force)
   }
 }
 
+/** Return the port of the first active listener of type
+ *  <b>listener_type</b>. */
+/** XXX not a very good interface. it's not reliable when there are
+    multiple listeners. */
+uint16_t
+router_get_active_listener_port_by_type(int listener_type)
+{
+  /* Iterate all connections, find one of the right kind and return
+     the port. Not very sophisticated or fast, but effective. */
+  const connection_t *c = connection_get_by_type(listener_type);
+  if (c)
+    return c->port;
+
+  return 0;
+}
+
 /** Return the port that we should advertise as our ORPort; this is either
  * the one configured in the ORPort option, or the one we actually bound to
  * if ORPort is "auto".
@@ -1226,12 +1256,11 @@ router_get_advertised_or_port(const or_options_t *options)
   int port = get_primary_or_port();
   (void)options;
 
-  if (port == CFG_AUTO_PORT) {
-    connection_t *c = connection_get_by_type(CONN_TYPE_OR_LISTENER);
-    if (c)
-      return c->port;
-    return 0;
-  }
+  /* If the port is in 'auto' mode, we have to use
+     router_get_listener_port_by_type(). */
+  if (port == CFG_AUTO_PORT)
+    return router_get_active_listener_port_by_type(CONN_TYPE_OR_LISTENER);
+
   return port;
 }
 
@@ -1248,12 +1277,10 @@ router_get_advertised_dir_port(const or_options_t *options, uint16_t dirport)
 
   if (!dirport_configured)
     return dirport;
-  if (dirport_configured == CFG_AUTO_PORT) {
-    connection_t *c = connection_get_by_type(CONN_TYPE_DIR_LISTENER);
-    if (c)
-      return c->port;
-    return 0;
-  }
+
+  if (dirport_configured == CFG_AUTO_PORT)
+    return router_get_active_listener_port_by_type(CONN_TYPE_DIR_LISTENER);
+
   return dirport_configured;
 }
 
@@ -1518,10 +1545,18 @@ router_rebuild_descriptor(int force)
       if (p->type == CONN_TYPE_OR_LISTENER &&
           ! p->no_advertise &&
           ! p->ipv4_only &&
-          tor_addr_family(&p->addr) == AF_INET6 &&
-          ! tor_addr_is_internal(&p->addr, 1)) {
-        ipv6_orport = p;
-        break;
+          tor_addr_family(&p->addr) == AF_INET6) {
+        if (! tor_addr_is_internal(&p->addr, 0)) {
+          ipv6_orport = p;
+          break;
+        } else {
+          char addrbuf[TOR_ADDR_BUF_LEN];
+          log_warn(LD_CONFIG,
+                   "Unable to use configured IPv6 address \"%s\" in a "
+                   "descriptor. Skipping it. "
+                   "Try specifying a globally reachable address explicitly. ",
+                   tor_addr_to_str(addrbuf, &p->addr, sizeof(addrbuf), 1));
+        }
       }
     } SMARTLIST_FOREACH_END(p);
     if (ipv6_orport) {
@@ -1563,7 +1598,7 @@ router_rebuild_descriptor(int force)
     ri->is_valid = ri->is_named = 1; /* believe in yourself */
 #endif
 
-  if (options->MyFamily) {
+  if (options->MyFamily && ! options->BridgeRelay) {
     smartlist_t *family;
     if (!warned_nonexistent_family)
       warned_nonexistent_family = smartlist_new();
@@ -1635,6 +1670,7 @@ router_rebuild_descriptor(int force)
     ei->cache_info.signed_descriptor_len =
       strlen(ei->cache_info.signed_descriptor_body);
     router_get_extrainfo_hash(ei->cache_info.signed_descriptor_body,
+                              ei->cache_info.signed_descriptor_len,
                               ei->cache_info.signed_descriptor_digest);
   }
 
@@ -1660,12 +1696,15 @@ router_rebuild_descriptor(int force)
 
   ri->purpose =
     options->BridgeRelay ? ROUTER_PURPOSE_BRIDGE : ROUTER_PURPOSE_GENERAL;
-  ri->cache_info.send_unencrypted = 1;
-  /* Let bridges serve their own descriptors unencrypted, so they can
-   * pass reachability testing. (If they want to be harder to notice,
-   * they can always leave the DirPort off). */
-  if (ei && !options->BridgeRelay)
-    ei->cache_info.send_unencrypted = 1;
+  if (options->BridgeRelay) {
+    /* Bridges shouldn't be able to send their descriptors unencrypted,
+       anyway, since they don't have a DirPort, and always connect to the
+       bridge authority anonymously.  But just in case they somehow think of
+       sending them on an unencrypted connection, don't allow them to try. */
+    ri->cache_info.send_unencrypted = ei->cache_info.send_unencrypted = 0;
+  } else {
+    ri->cache_info.send_unencrypted = ei->cache_info.send_unencrypted = 1;
+  }
 
   router_get_router_hash(ri->cache_info.signed_descriptor_body,
                          strlen(ri->cache_info.signed_descriptor_body),
@@ -1738,8 +1777,10 @@ mark_my_descriptor_dirty_if_too_old(time_t now)
 void
 mark_my_descriptor_dirty(const char *reason)
 {
+  const or_options_t *options = get_options();
+  if (server_mode(options) && options->_PublishServerDescriptor)
+    log_info(LD_OR, "Decided to publish new relay descriptor: %s", reason);
   desc_clean_since = 0;
-  log_info(LD_OR, "Decided to publish new relay descriptor: %s", reason);
   if (!desc_dirty_reason)
     desc_dirty_reason = reason;
 }
@@ -1775,21 +1816,20 @@ check_descriptor_bandwidth_changed(time_t now)
 /** Note at log level severity that our best guess of address has changed from
  * <b>prev</b> to <b>cur</b>. */
 static void
-log_addr_has_changed(int severity, uint32_t prev, uint32_t cur,
+log_addr_has_changed(int severity,
+                     const tor_addr_t *prev,
+                     const tor_addr_t *cur,
                      const char *source)
 {
-  char addrbuf_prev[INET_NTOA_BUF_LEN];
-  char addrbuf_cur[INET_NTOA_BUF_LEN];
-  struct in_addr in_prev;
-  struct in_addr in_cur;
+  char addrbuf_prev[TOR_ADDR_BUF_LEN];
+  char addrbuf_cur[TOR_ADDR_BUF_LEN];
 
-  in_prev.s_addr = htonl(prev);
-  tor_inet_ntoa(&in_prev, addrbuf_prev, sizeof(addrbuf_prev));
+  if (tor_addr_to_str(addrbuf_prev, prev, sizeof(addrbuf_prev), 1) == NULL)
+    strlcpy(addrbuf_prev, "???", TOR_ADDR_BUF_LEN);
+  if (tor_addr_to_str(addrbuf_cur, cur, sizeof(addrbuf_cur), 1) == NULL)
+    strlcpy(addrbuf_cur, "???", TOR_ADDR_BUF_LEN);
 
-  in_cur.s_addr = htonl(cur);
-  tor_inet_ntoa(&in_cur, addrbuf_cur, sizeof(addrbuf_cur));
-
-  if (prev)
+  if (!tor_addr_is_null(prev))
     log_fn(severity, LD_GENERAL,
            "Our IP Address has changed from %s to %s; "
            "rebuilding descriptor (source: %s).",
@@ -1813,6 +1853,7 @@ check_descriptor_ipaddress_changed(time_t now)
   if (!desc_routerinfo)
     return;
 
+  /* XXXX ipv6 */
   prev = desc_routerinfo->addr;
   if (resolve_my_address(LOG_INFO, options, &cur, NULL) < 0) {
     log_info(LD_CONFIG,"options->Address didn't resolve into an IP.");
@@ -1820,14 +1861,17 @@ check_descriptor_ipaddress_changed(time_t now)
   }
 
   if (prev != cur) {
-    log_addr_has_changed(LOG_NOTICE, prev, cur, "resolve");
+    tor_addr_t tmp_prev, tmp_cur;
+    tor_addr_from_ipv4h(&tmp_prev, prev);
+    tor_addr_from_ipv4h(&tmp_cur, cur);
+    log_addr_has_changed(LOG_NOTICE, &tmp_prev, &tmp_cur, "resolve");
     ip_address_changed(0);
   }
 }
 
 /** The most recently guessed value of our IP address, based on directory
  * headers. */
-static uint32_t last_guessed_ip = 0;
+static tor_addr_t last_guessed_ip = TOR_ADDR_NULL;
 
 /** A directory server <b>d_conn</b> told us our IP address is
  * <b>suggestion</b>.
@@ -1837,35 +1881,36 @@ void
 router_new_address_suggestion(const char *suggestion,
                               const dir_connection_t *d_conn)
 {
-  uint32_t addr, cur = 0;
-  struct in_addr in;
+  tor_addr_t addr;
+  uint32_t cur = 0;             /* Current IPv4 address.  */
   const or_options_t *options = get_options();
 
   /* first, learn what the IP address actually is */
-  if (!tor_inet_aton(suggestion, &in)) {
+  if (tor_addr_parse(&addr, suggestion) == -1) {
     log_debug(LD_DIR, "Malformed X-Your-Address-Is header %s. Ignoring.",
               escaped(suggestion));
     return;
   }
-  addr = ntohl(in.s_addr);
 
   log_debug(LD_DIR, "Got X-Your-Address-Is: %s.", suggestion);
 
   if (!server_mode(options)) {
-    last_guessed_ip = addr; /* store it in case we need it later */
+    tor_addr_copy(&last_guessed_ip, &addr);
     return;
   }
 
+  /* XXXX ipv6 */
   if (resolve_my_address(LOG_INFO, options, &cur, NULL) >= 0) {
     /* We're all set -- we already know our address. Great. */
-    last_guessed_ip = cur; /* store it in case we need it later */
+    tor_addr_from_ipv4h(&last_guessed_ip, cur); /* store it in case we
+                                                   need it later */
     return;
   }
-  if (is_internal_IP(addr, 0)) {
+  if (tor_addr_is_internal(&addr, 0)) {
     /* Don't believe anybody who says our IP is, say, 127.0.0.1. */
     return;
   }
-  if (tor_addr_eq_ipv4h(&d_conn->_base.addr, addr)) {
+  if (tor_addr_eq(&d_conn->_base.addr, &addr)) {
     /* Don't believe anybody who says our IP is their IP. */
     log_debug(LD_DIR, "A directory server told us our IP address is %s, "
               "but he's just reporting his own IP address. Ignoring.",
@@ -1876,14 +1921,15 @@ router_new_address_suggestion(const char *suggestion,
   /* Okay.  We can't resolve our own address, and X-Your-Address-Is is giving
    * us an answer different from what we had the last time we managed to
    * resolve it. */
-  if (last_guessed_ip != addr) {
+  if (!tor_addr_eq(&last_guessed_ip, &addr)) {
     control_event_server_status(LOG_NOTICE,
                                 "EXTERNAL_ADDRESS ADDRESS=%s METHOD=DIRSERV",
                                 suggestion);
-    log_addr_has_changed(LOG_NOTICE, last_guessed_ip, addr,
+    log_addr_has_changed(LOG_NOTICE, &last_guessed_ip, &addr,
                          d_conn->_base.address);
     ip_address_changed(0);
-    last_guessed_ip = addr; /* router_rebuild_descriptor() will fetch it */
+    tor_addr_copy(&last_guessed_ip, &addr); /* router_rebuild_descriptor()
+                                               will fetch it */
   }
 }
 
@@ -1894,8 +1940,8 @@ router_new_address_suggestion(const char *suggestion,
 static int
 router_guess_address_from_dir_headers(uint32_t *guess)
 {
-  if (last_guessed_ip) {
-    *guess = last_guessed_ip;
+  if (!tor_addr_is_null(&last_guessed_ip)) {
+    *guess = tor_addr_to_ipv4h(&last_guessed_ip);
     return 0;
   }
   return -1;
@@ -1908,7 +1954,8 @@ router_guess_address_from_dir_headers(uint32_t *guess)
 void
 get_platform_str(char *platform, size_t len)
 {
-  tor_snprintf(platform, len, "Tor %s on %s", get_version(), get_uname());
+  tor_snprintf(platform, len, "Tor %s on %s",
+               get_short_version(), get_uname());
 }
 
 /* XXX need to audit this thing and count fenceposts. maybe
@@ -1997,7 +2044,7 @@ router_dump_router_to_string(char *s, size_t maxlen, routerinfo_t *router,
     if (a) {
       tor_asprintf(&extra_or_address,
                    "or-address %s:%d\n", a, router->ipv6_orport);
-      log_notice(LD_OR, "My line is <%s>", extra_or_address);
+      log_debug(LD_OR, "My or-address line is <%s>", extra_or_address);
     }
   }
 
@@ -2332,7 +2379,7 @@ extrainfo_dump_to_string(char **s_out, extrainfo_t *extrainfo,
   }
 
   memset(sig, 0, sizeof(sig));
-  if (router_get_extrainfo_hash(s, digest) < 0 ||
+  if (router_get_extrainfo_hash(s, strlen(s), digest) < 0 ||
       router_append_dirobj_signature(sig, sizeof(sig), digest, DIGEST_LEN,
                                      ident_key) < 0) {
     log_warn(LD_BUG, "Could not append signature to extra-info "

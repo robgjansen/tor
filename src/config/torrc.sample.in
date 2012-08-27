@@ -1,5 +1,5 @@
 ## Configuration file for a typical Tor user
-## Last updated 8 February 2012 for Tor 0.2.3.12-alpha.
+## Last updated 22 April 2012 for Tor 0.2.3.14-alpha.
 ## (may or may not work for much older or much newer versions of Tor.)
 ##
 ## Lines that begin with "## " try to explain what's going on. Lines
@@ -12,16 +12,15 @@
 ## Tor will look for this file in various places based on your platform:
 ## https://www.torproject.org/docs/faq#torrc
 
-
-## Replace this with "SocksPort 0" if you plan to run Tor only as a
-## relay, and not make any local application connections yourself.
-SocksPort 9050 # what port to open for local application connections
-SocksListenAddress 127.0.0.1 # accept connections only from localhost
-#SocksListenAddress 192.168.0.1:9100 # listen on this IP:port also
+## Tor opens a socks proxy on port 9050 by default -- even if you don't
+## configure one below. Set "SocksPort 0" if you plan to run Tor only
+## as a relay, and not make any local application connections yourself.
+#SocksPort 9050 # Default: Bind to localhost:9050 for local connections.
+#SocksPort 192.168.0.1:9100 # Bind to this adddress:port too.
 
 ## Entry policies to allow/deny SOCKS requests based on IP address.
 ## First entry that matches wins. If no SocksPolicy is set, we accept
-## all (and only) requests from SocksListenAddress. Untrusted users who
+## all (and only) requests that reach a SocksPort. Untrusted users who
 ## can access your SocksPort may be able to learn about the connections
 ## you make.
 #SocksPolicy accept 192.168.0.0/16
@@ -82,11 +81,12 @@ SocksListenAddress 127.0.0.1 # accept connections only from localhost
 
 ## Required: what port to advertise for incoming Tor connections.
 #ORPort 9001
-## If you want to listen on a port other than the one advertised
-## in ORPort (e.g. to advertise 443 but bind to 9090), uncomment the
-## line below too. You'll need to do ipchains or other port forwarding
+## If you want to listen on a port other than the one advertised in
+## ORPort (e.g. to advertise 443 but bind to 9090), you can do it as
+## follows.  You'll need to do ipchains or other port forwarding
 ## yourself to make this work.
-#ORListenAddress 0.0.0.0:9090
+#ORPort 443 NoListen
+#ORPort 127.0.0.1:9090 NoAdvertise
 
 ## The IP address or full DNS name for incoming connections to your
 ## relay. Leave commented out and Tor will guess.
@@ -102,6 +102,8 @@ SocksListenAddress 127.0.0.1 # accept connections only from localhost
 ## Define these to limit how much relayed traffic you will allow. Your
 ## own traffic is still unthrottled. Note that RelayBandwidthRate must
 ## be at least 20 KB.
+## Note that units for these config options are bytes per second, not bits
+## per second, and that prefixes are binary prefixes, i.e. 2^10, 2^20, etc.
 #RelayBandwidthRate 100 KB  # Throttle traffic to 100KB/s (800Kbps)
 #RelayBandwidthBurst 200 KB # But allow bursts up to 200KB/s (1600Kbps)
 
@@ -128,11 +130,12 @@ SocksListenAddress 127.0.0.1 # accept connections only from localhost
 ## Uncomment this to mirror directory information for others. Please do
 ## if you have enough bandwidth.
 #DirPort 9030 # what port to advertise for directory connections
-## If you want to listen on a port other than the one advertised
-## in DirPort (e.g. to advertise 80 but bind to 9091), uncomment the line
-## below too. You'll need to do ipchains or other port forwarding yourself
-## to make this work.
-#DirListenAddress 0.0.0.0:9091
+## If you want to listen on a port other than the one advertised in
+## DirPort (e.g. to advertise 80 but bind to 9091), you can do it as
+## follows.  below too. You'll need to do ipchains or other port
+## forwarding yourself to make this work.
+#DirPort 80 NoListen
+#DirPort 127.0.0.1:9091 NoAdvertise
 ## Uncomment to return an arbitrary blob of html on your DirPort. Now you
 ## can explain what Tor is if anybody wonders why your IP address is
 ## contacting them. See contrib/tor-exit-notice.html in Tor's source
@@ -144,6 +147,8 @@ SocksListenAddress 127.0.0.1 # accept connections only from localhost
 ## different networks. You declare it here so Tor clients can avoid
 ## using more than one of your relays in a single circuit. See
 ## https://www.torproject.org/docs/faq#MultipleRelays
+## However, you should never include a bridge's fingerprint here, as it would
+## break its concealability and potentionally reveal its IP/TCP address.
 #MyFamily $keyid,$keyid,...
 
 ## A comma-separated list of exit policies. They're considered first

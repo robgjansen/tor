@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -23,11 +23,8 @@
 #endif
 
 #ifdef _WIN32
-#ifndef WIN32_WINNT
-#define WIN32_WINNT 0x400
-#endif
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x400
+#define _WIN32_WINNT 0x0501
 #endif
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -187,7 +184,7 @@
 #define ROUTER_MAX_AGE (60*60*48)
 /** How old can a router get before we (as a server) will no longer
  * consider it live? In seconds. */
-#define ROUTER_MAX_AGE_TO_PUBLISH (60*60*20)
+#define ROUTER_MAX_AGE_TO_PUBLISH (60*60*24)
 /** How old do we let a saved descriptor get before force-removing it? */
 #define OLD_ROUTER_DESC_MAX_AGE (60*60*24*5)
 
@@ -1078,6 +1075,7 @@ typedef struct connection_t {
   uint64_t dirreq_id;
 } connection_t;
 
+/** Subtype of connection_t; used for a listener socket. */
 typedef struct listener_connection_t {
   connection_t _base;
 
@@ -1264,7 +1262,8 @@ typedef struct or_connection_t {
                     * bandwidthburst. (OPEN ORs only) */
   int write_bucket; /**< When this hits 0, stop writing. Like read_bucket. */
 #else
-  /** DOCDOC */
+  /** A rate-limiting configuration object to determine how this connection
+   * set its read- and write- limits. */
   /* XXXX we could share this among all connections. */
   struct ev_token_bucket_cfg *bucket_cfg;
 #endif
@@ -1474,6 +1473,12 @@ typedef struct control_connection_t {
   /** True if we have received a takeownership command on this
    * connection. */
   unsigned int is_owning_control_connection:1;
+
+  /** If we have sent an AUTHCHALLENGE reply on this connection and
+   * have not received a successful AUTHENTICATE command, points to
+   * the value which the client must send to authenticate itself;
+   * otherwise, NULL. */
+  char *safecookie_client_hash;
 
   /** Amount of space allocated in incoming_cmd. */
   uint32_t incoming_cmd_len;
@@ -1737,7 +1742,7 @@ typedef struct {
   uint16_t or_port; /**< Port for TLS connections. */
   uint16_t dir_port; /**< Port for HTTP directory connections. */
 
-  /* DOCDOC */
+  /** A router's IPv6 address, if it has one. */
   /* XXXXX187 Actually these should probably be part of a list of addresses,
    * not just a special case.  Use abstractions to access these; don't do it
    * directly. */
@@ -3050,10 +3055,11 @@ typedef struct {
                                * that aggregates bridge descriptors? */
 
   /** If set on a bridge authority, it will answer requests on its dirport
-   * for bridge statuses -- but only if the requests use this password.
-   * If set on a bridge user, request bridge statuses, and use this password
-   * when doing so. */
+   * for bridge statuses -- but only if the requests use this password. */
   char *BridgePassword;
+  /** If BridgePassword is set, this is a SHA256 digest of the basic http
+   * authenticator for it. Used so we can do a time-independent comparison. */
+  char *_BridgePassword_AuthDigest;
 
   int UseBridges; /**< Boolean: should we start all circuits with a bridge? */
   config_line_t *Bridges; /**< List of bootstrap bridge addresses. */
@@ -3276,10 +3282,6 @@ typedef struct {
   int AuthDirMaxServersPerAuthAddr; /**< Do not permit more than this
                                      * number of servers per IP address shared
                                      * with an authority. */
-
-  /** Should we assign the Guard flag to relays which would allow
-   * exploitation of CVE-2011-2768 against their clients? */
-  int GiveGuardFlagTo_CVE_2011_2768_VulnerableRelays;
 
   /** If non-zero, always vote the Fast flag for any relay advertising
    * this amount of capacity or more. */
@@ -3561,6 +3563,17 @@ typedef struct {
   /** If 1, we accept and launch no external network connections, except on
    * control ports. */
   int DisableNetwork;
+
+  /**
+   * Parameters for path-bias detection.
+   * @{
+   */
+  int PathBiasCircThreshold;
+  double PathBiasNoticeRate;
+  double PathBiasDisableRate;
+  int PathBiasScaleThreshold;
+  int PathBiasScaleFactor;
+  /** @} */
 
 } or_options_t;
 
@@ -3867,6 +3880,11 @@ typedef enum {
   /** We're remapping this address because we got a DNS resolution from a
    * Tor server that told us what its value was. */
   ADDRMAPSRC_DNS,
+
+  /** No remapping has occurred.  This isn't a possible value for an
+   * addrmap_entry_t; it's used as a null value when we need to answer "Why
+   * did this remapping happen." */
+  ADDRMAPSRC_NONE
 } addressmap_entry_source_t;
 
 /********************************* control.c ***************************/

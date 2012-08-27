@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -588,7 +588,7 @@ rep_hist_get_weighted_time_known(const char *id, time_t when)
 int
 rep_hist_have_measured_enough_stability(void)
 {
-  /* XXXX022 This doesn't do so well when we change our opinion
+  /* XXXX023 This doesn't do so well when we change our opinion
    * as to whether we're tracking router stability. */
   return started_tracking_stability < time(NULL) - 4*60*60;
 }
@@ -839,7 +839,7 @@ rep_hist_record_mtbf_data(time_t now, int missing_means_down)
       format_iso_time(time_buf, hist->start_of_run);
       t = time_buf;
     }
-    PRINTF((f, "+MTBF %lu %.5lf%s%s\n",
+    PRINTF((f, "+MTBF %lu %.5f%s%s\n",
             hist->weighted_run_length, hist->total_run_weights,
             t ? " S=" : "", t ? t : ""));
     t = NULL;
@@ -889,10 +889,10 @@ rep_hist_format_router_status(or_history_t *hist, time_t now)
   tor_asprintf(&cp,
                "%s%s%s"
                "%s%s%s"
-               "wfu %0.3lf\n"
+               "wfu %0.3f\n"
                " weighted-time %lu\n"
                " weighted-uptime %lu\n"
-               "mtbf %0.1lf\n"
+               "mtbf %0.1f\n"
                " weighted-run-length %lu\n"
                " total-run-weights %f\n",
                up?"uptime-started ":"", up?sor_buf:"", up?" UTC\n":"",
@@ -1772,8 +1772,13 @@ rep_hist_load_state(or_state_t *state, char **err)
 
 /*********************************************************************/
 
+/** A single predicted port: used to remember which ports we've made
+ * connections to, so that we can try to keep making circuits that can handle
+ * those ports. */
 typedef struct predicted_port_t {
+  /** The port we connected to */
   uint16_t port;
+  /** The time at which we last used it */
   time_t time;
 } predicted_port_t;
 
@@ -1866,6 +1871,26 @@ rep_hist_get_predicted_ports(time_t now)
     }
   } SMARTLIST_FOREACH_END(pp);
   return out;
+}
+
+/**
+ * Take a list of uint16_t *, and remove every port in the list from the
+ * current list of predicted ports.
+ */
+void
+rep_hist_remove_predicted_ports(const smartlist_t *rmv_ports)
+{
+  /* Let's do this on O(N), not O(N^2). */
+  bitarray_t *remove_ports = bitarray_init_zero(UINT16_MAX);
+  SMARTLIST_FOREACH(rmv_ports, const uint16_t *, p,
+                    bitarray_set(remove_ports, *p));
+  SMARTLIST_FOREACH_BEGIN(predicted_ports_list, predicted_port_t *, pp) {
+    if (bitarray_is_set(remove_ports, pp->port)) {
+      tor_free(pp);
+      SMARTLIST_DEL_CURRENT(predicted_ports_list, pp);
+    }
+  } SMARTLIST_FOREACH_END(pp);
+  bitarray_free(remove_ports);
 }
 
 /** The user asked us to do a resolve. Rather than keeping track of
@@ -2453,8 +2478,9 @@ char *
 rep_hist_format_buffer_stats(time_t now)
 {
 #define SHARES 10
-  int processed_cells[SHARES], circs_in_share[SHARES],
-      number_of_circuits, i;
+  uint64_t processed_cells[SHARES];
+  uint32_t circs_in_share[SHARES];
+  int number_of_circuits, i;
   double queued_cells[SHARES], time_in_queue[SHARES];
   smartlist_t *processed_cells_strings, *queued_cells_strings,
               *time_in_queue_strings;
@@ -2469,8 +2495,8 @@ rep_hist_format_buffer_stats(time_t now)
   tor_assert(now >= start_of_buffer_stats_interval);
 
   /* Calculate deciles if we saw at least one circuit. */
-  memset(processed_cells, 0, SHARES * sizeof(int));
-  memset(circs_in_share, 0, SHARES * sizeof(int));
+  memset(processed_cells, 0, SHARES * sizeof(uint64_t));
+  memset(circs_in_share, 0, SHARES * sizeof(uint32_t));
   memset(queued_cells, 0, SHARES * sizeof(double));
   memset(time_in_queue, 0, SHARES * sizeof(double));
   if (!circuits_for_buffer_stats)
@@ -2498,8 +2524,9 @@ rep_hist_format_buffer_stats(time_t now)
   time_in_queue_strings = smartlist_new();
   for (i = 0; i < SHARES; i++) {
     smartlist_add_asprintf(processed_cells_strings,
-                           "%d", !circs_in_share[i] ? 0 :
-                              processed_cells[i] / circs_in_share[i]);
+                           U64_FORMAT, !circs_in_share[i] ? 0 :
+                           U64_PRINTF_ARG(processed_cells[i] /
+                           circs_in_share[i]));
   }
   for (i = 0; i < SHARES; i++) {
     smartlist_add_asprintf(queued_cells_strings, "%.2f",
@@ -2650,22 +2677,30 @@ rep_hist_format_desc_stats(time_t now)
   const char *key;
   void *val;
   unsigned size;
-  int *vals;
+  int *vals, max = 0, q3 = 0, md = 0, q1 = 0, min = 0;
   int n = 0;
 
   if (!start_of_served_descs_stats_interval)
     return NULL;
 
-  size =  digestmap_size(served_descs);
-  vals = tor_malloc(size * sizeof(int));
-
-  for (iter = digestmap_iter_init(served_descs); !digestmap_iter_done(iter);
-      iter = digestmap_iter_next(served_descs, iter) ) {
-    uintptr_t count;
-    digestmap_iter_get(iter, &key, &val);
-    count = (uintptr_t)val;
-    vals[n++] = (int)count;
-    (void)key;
+  size = digestmap_size(served_descs);
+  if (size > 0) {
+    vals = tor_malloc(size * sizeof(int));
+    for (iter = digestmap_iter_init(served_descs);
+         !digestmap_iter_done(iter);
+         iter = digestmap_iter_next(served_descs, iter)) {
+      uintptr_t count;
+      digestmap_iter_get(iter, &key, &val);
+      count = (uintptr_t)val;
+      vals[n++] = (int)count;
+      (void)key;
+    }
+    max = find_nth_int(vals, size, size-1);
+    q3 = find_nth_int(vals, size, (3*size-1)/4);
+    md = find_nth_int(vals, size, (size-1)/2);
+    q1 = find_nth_int(vals, size, (size-1)/4);
+    min = find_nth_int(vals, size, 0);
+    tor_free(vals);
   }
 
   format_iso_time(t, now);
@@ -2676,14 +2711,8 @@ rep_hist_format_desc_stats(time_t now)
                t,
                (unsigned) (now - start_of_served_descs_stats_interval),
                total_descriptor_downloads,
-               size,
-               find_nth_int(vals, size, size-1),
-               find_nth_int(vals, size, (3*size-1)/4),
-               find_nth_int(vals, size, (size-1)/2),
-               find_nth_int(vals, size, (size-1)/4),
-               find_nth_int(vals, size, 0));
+               size, max, q3, md, q1, min);
 
-  tor_free(vals);
   return result;
 }
 
@@ -2703,6 +2732,7 @@ rep_hist_desc_stats_write(time_t now)
     return start_of_served_descs_stats_interval + WRITE_STATS_INTERVAL;
 
   str = rep_hist_format_desc_stats(now);
+  tor_assert(str != NULL);
 
   statsdir = get_datadir_fname("stats");
   if (check_private_dir(statsdir, CPD_CREATE, get_options()->User) < 0) {
@@ -2722,6 +2752,7 @@ rep_hist_desc_stats_write(time_t now)
   return start_of_served_descs_stats_interval + WRITE_STATS_INTERVAL;
 }
 
+/* DOCDOC rep_hist_note_desc_served */
 void
 rep_hist_note_desc_served(const char * desc)
 {
@@ -2763,27 +2794,27 @@ rep_hist_conn_stats_init(time_t now)
  * connection stats. */
 #define BIDI_INTERVAL 10
 
-/* Start of next BIDI_INTERVAL second interval. */
+/** Start of next BIDI_INTERVAL second interval. */
 static time_t bidi_next_interval = 0;
 
-/* Number of connections that we read and wrote less than BIDI_THRESHOLD
+/** Number of connections that we read and wrote less than BIDI_THRESHOLD
  * bytes from/to in BIDI_INTERVAL seconds. */
 static uint32_t below_threshold = 0;
 
-/* Number of connections that we read at least BIDI_FACTOR times more
+/** Number of connections that we read at least BIDI_FACTOR times more
  * bytes from than we wrote to in BIDI_INTERVAL seconds. */
 static uint32_t mostly_read = 0;
 
-/* Number of connections that we wrote at least BIDI_FACTOR times more
+/** Number of connections that we wrote at least BIDI_FACTOR times more
  * bytes to than we read from in BIDI_INTERVAL seconds. */
 static uint32_t mostly_written = 0;
 
-/* Number of connections that we read and wrote at least BIDI_THRESHOLD
+/** Number of connections that we read and wrote at least BIDI_THRESHOLD
  * bytes from/to, but not BIDI_FACTOR times more in either direction in
  * BIDI_INTERVAL seconds. */
 static uint32_t both_read_and_written = 0;
 
-/* Entry in a map from connection ID to the number of read and written
+/** Entry in a map from connection ID to the number of read and written
  * bytes on this connection in a BIDI_INTERVAL second interval. */
 typedef struct bidi_map_entry_t {
   HT_ENTRY(bidi_map_entry_t) node;
@@ -2803,6 +2834,7 @@ bidi_map_ent_eq(const bidi_map_entry_t *a, const bidi_map_entry_t *b)
   return a->conn_id == b->conn_id;
 }
 
+/* DOCDOC bidi_map_ent_hash */
 static unsigned
 bidi_map_ent_hash(const bidi_map_entry_t *entry)
 {
@@ -2814,6 +2846,7 @@ HT_PROTOTYPE(bidimap, bidi_map_entry_t, node, bidi_map_ent_hash,
 HT_GENERATE(bidimap, bidi_map_entry_t, node, bidi_map_ent_hash,
             bidi_map_ent_eq, 0.6, malloc, realloc, free);
 
+/* DOCDOC bidi_map_free */
 static void
 bidi_map_free(void)
 {

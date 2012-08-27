@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -66,7 +66,6 @@ void set_routerstatus_from_routerinfo(routerstatus_t *rs,
                                       routerinfo_t *ri, time_t now,
                                       int naming, int listbadexits,
                                       int listbaddirs, int vote_on_hsdirs);
-void router_clear_status_flags(routerinfo_t *ri);
 networkstatus_t *
 dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
                                         authority_cert_t *cert);

@@ -1,7 +1,7 @@
 /* Copyright (c) 2001, Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -13,11 +13,8 @@
 #include "orconfig.h"
 
 #ifdef _WIN32
-#ifndef WIN32_WINNT
-#define WIN32_WINNT 0x400
-#endif
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x400
+#define _WIN32_WINNT 0x0501
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -72,7 +69,8 @@
 /** Longest recognized */
 #define MAX_DNS_LABEL_SIZE 63
 
-#if OPENSSL_VERSION_NUMBER < OPENSSL_V_SERIES(0,9,8)
+#if OPENSSL_VERSION_NUMBER < OPENSSL_V_SERIES(0,9,8) && \
+  !defined(RUNNING_DOXYGEN)
 /** @{ */
 /** On OpenSSL versions before 0.9.8, there is no working SHA256
  * implementation, so we use Tom St Denis's nice speedy one, slightly adapted
@@ -119,6 +117,7 @@ struct crypto_pk_t
 struct crypto_cipher_t
 {
   char key[CIPHER_KEY_LEN]; /**< The raw key. */
+  char iv[CIPHER_IV_LEN]; /**< The initial IV. */
   aes_cnt_cipher_t *cipher; /**< The key in format usable for counter-mode AES
                              * encryption */
 };
@@ -139,7 +138,6 @@ crypto_get_rsa_padding_overhead(int padding)
 {
   switch (padding)
     {
-    case RSA_NO_PADDING: return 0;
     case RSA_PKCS1_OAEP_PADDING: return 42;
     case RSA_PKCS1_PADDING: return 11;
     default: tor_assert(0); return -1;
@@ -153,7 +151,6 @@ crypto_get_rsa_padding(int padding)
 {
   switch (padding)
     {
-    case PK_NO_PADDING: return RSA_NO_PADDING;
     case PK_PKCS1_PADDING: return RSA_PKCS1_PADDING;
     case PK_PKCS1_OAEP_PADDING: return RSA_PKCS1_OAEP_PADDING;
     default: tor_assert(0); return -1;
@@ -383,48 +380,39 @@ crypto_pk_free(crypto_pk_t *env)
   tor_free(env);
 }
 
-/** Create a new symmetric cipher for a given key and encryption flag
- * (1=encrypt, 0=decrypt).  Return the crypto object on success; NULL
- * on failure.
+/** Allocate and return a new symmetric cipher using the provided key and iv.
+ * The key is CIPHER_KEY_LEN bytes; the IV is CIPHER_IV_LEN bytes.  If you
+ * provide NULL in place of either one, it is generated at random.
  */
 crypto_cipher_t *
-crypto_create_init_cipher(const char *key, int encrypt_mode)
-{
-  int r;
-  crypto_cipher_t *crypto = NULL;
-
-  if (! (crypto = crypto_cipher_new())) {
-    log_warn(LD_CRYPTO, "Unable to allocate crypto object");
-    return NULL;
-  }
-
-  crypto_cipher_set_key(crypto, key);
-
-  if (encrypt_mode)
-    r = crypto_cipher_encrypt_init_cipher(crypto);
-  else
-    r = crypto_cipher_decrypt_init_cipher(crypto);
-
-  if (r)
-    goto error;
-  return crypto;
-
- error:
-  if (crypto)
-    crypto_cipher_free(crypto);
-  return NULL;
-}
-
-/** Allocate and return a new symmetric cipher.
- */
-crypto_cipher_t *
-crypto_cipher_new(void)
+crypto_cipher_new_with_iv(const char *key, const char *iv)
 {
   crypto_cipher_t *env;
 
   env = tor_malloc_zero(sizeof(crypto_cipher_t));
-  env->cipher = aes_new_cipher();
+
+  if (key == NULL)
+    crypto_rand(env->key, CIPHER_KEY_LEN);
+  else
+    memcpy(env->key, key, CIPHER_KEY_LEN);
+  if (iv == NULL)
+    crypto_rand(env->iv, CIPHER_IV_LEN);
+  else
+    memcpy(env->iv, iv, CIPHER_IV_LEN);
+
+  env->cipher = aes_new_cipher(env->key, env->iv);
+
   return env;
+}
+
+/** Return a new crypto_cipher_t with the provided <b>key</b> and an IV of all
+ * zero bytes.  */
+crypto_cipher_t *
+crypto_cipher_new(const char *key)
+{
+  char zeroiv[CIPHER_IV_LEN];
+  memset(zeroiv, 0, sizeof(zeroiv));
+  return crypto_cipher_new_with_iv(key, zeroiv);
 }
 
 /** Free a symmetric cipher.
@@ -1001,9 +989,6 @@ crypto_pk_private_sign_digest(crypto_pk_t *env, char *to, size_t tolen,
  * bytes of data from <b>from</b>, with padding type 'padding',
  * storing the results on <b>to</b>.
  *
- * If no padding is used, the public key must be at least as large as
- * <b>from</b>.
- *
  * Returns the number of bytes written on success, -1 on failure.
  *
  * The encrypted data consists of:
@@ -1034,9 +1019,6 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_t *env,
   overhead = crypto_get_rsa_padding_overhead(crypto_get_rsa_padding(padding));
   pkeylen = crypto_pk_keysize(env);
 
-  if (padding == PK_NO_PADDING && fromlen < pkeylen)
-    return -1;
-
   if (!force && fromlen+overhead <= pkeylen) {
     /* It all fits in a single encrypt. */
     return crypto_pk_public_encrypt(env,to,
@@ -1046,20 +1028,8 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_t *env,
   tor_assert(tolen >= fromlen + overhead + CIPHER_KEY_LEN);
   tor_assert(tolen >= pkeylen);
 
-  cipher = crypto_cipher_new();
-  if (!cipher) return -1;
-  if (crypto_cipher_generate_key(cipher)<0)
-    goto err;
-  /* You can't just run around RSA-encrypting any bitstream: if it's
-   * greater than the RSA key, then OpenSSL will happily encrypt, and
-   * later decrypt to the wrong value.  So we set the first bit of
-   * 'cipher->key' to 0 if we aren't padding.  This means that our
-   * symmetric key is really only 127 bits.
-   */
-  if (padding == PK_NO_PADDING)
-    cipher->key[0] &= 0x7f;
-  if (crypto_cipher_encrypt_init_cipher(cipher)<0)
-    goto err;
+  cipher = crypto_cipher_new(NULL); /* generate a new key. */
+
   buf = tor_malloc(pkeylen+1);
   memcpy(buf, cipher->key, CIPHER_KEY_LEN);
   memcpy(buf+CIPHER_KEY_LEN, from, pkeylen-overhead-CIPHER_KEY_LEN);
@@ -1081,11 +1051,10 @@ crypto_pk_public_hybrid_encrypt(crypto_pk_t *env,
   tor_assert(outlen+symlen < INT_MAX);
   return (int)(outlen + symlen);
  err:
-  if (buf) {
-    memset(buf, 0, pkeylen);
-    tor_free(buf);
-  }
-  if (cipher) crypto_cipher_free(cipher);
+
+  memset(buf, 0, pkeylen);
+  tor_free(buf);
+  crypto_cipher_free(cipher);
   return -1;
 }
 
@@ -1124,7 +1093,7 @@ crypto_pk_private_hybrid_decrypt(crypto_pk_t *env,
            "No room for a symmetric key");
     goto err;
   }
-  cipher = crypto_create_init_cipher(buf, 0);
+  cipher = crypto_cipher_new(buf);
   if (!cipher) {
     goto err;
   }
@@ -1142,7 +1111,7 @@ crypto_pk_private_hybrid_decrypt(crypto_pk_t *env,
  err:
   memset(buf,0,pkeylen);
   tor_free(buf);
-  if (cipher) crypto_cipher_free(cipher);
+  crypto_cipher_free(cipher);
   return -1;
 }
 
@@ -1312,79 +1281,12 @@ crypto_pk_check_fingerprint_syntax(const char *s)
 
 /* symmetric crypto */
 
-/** Generate a new random key for the symmetric cipher in <b>env</b>.
- * Return 0 on success, -1 on failure.  Does not initialize the cipher.
- */
-int
-crypto_cipher_generate_key(crypto_cipher_t *env)
-{
-  tor_assert(env);
-
-  return crypto_rand(env->key, CIPHER_KEY_LEN);
-}
-
-/** Set the symmetric key for the cipher in <b>env</b> to the first
- * CIPHER_KEY_LEN bytes of <b>key</b>. Does not initialize the cipher.
- */
-void
-crypto_cipher_set_key(crypto_cipher_t *env, const char *key)
-{
-  tor_assert(env);
-  tor_assert(key);
-
-  memcpy(env->key, key, CIPHER_KEY_LEN);
-}
-
-/** Generate an initialization vector for our AES-CTR cipher; store it
- * in the first CIPHER_IV_LEN bytes of <b>iv_out</b>. */
-void
-crypto_cipher_generate_iv(char *iv_out)
-{
-  crypto_rand(iv_out, CIPHER_IV_LEN);
-}
-
-/** Adjust the counter of <b>env</b> to point to the first byte of the block
- * corresponding to the encryption of the CIPHER_IV_LEN bytes at
- * <b>iv</b>.  */
-int
-crypto_cipher_set_iv(crypto_cipher_t *env, const char *iv)
-{
-  tor_assert(env);
-  tor_assert(iv);
-  aes_set_iv(env->cipher, iv);
-  return 0;
-}
-
 /** Return a pointer to the key set for the cipher in <b>env</b>.
  */
 const char *
 crypto_cipher_get_key(crypto_cipher_t *env)
 {
   return env->key;
-}
-
-/** Initialize the cipher in <b>env</b> for encryption.  Return 0 on
- * success, -1 on failure.
- */
-int
-crypto_cipher_encrypt_init_cipher(crypto_cipher_t *env)
-{
-  tor_assert(env);
-
-  aes_set_key(env->cipher, env->key, CIPHER_KEY_LEN*8);
-  return 0;
-}
-
-/** Initialize the cipher in <b>env</b> for decryption. Return 0 on
- * success, -1 on failure.
- */
-int
-crypto_cipher_decrypt_init_cipher(crypto_cipher_t *env)
-{
-  tor_assert(env);
-
-  aes_set_key(env->cipher, env->key, CIPHER_KEY_LEN*8);
-  return 0;
 }
 
 /** Encrypt <b>fromlen</b> bytes from <b>from</b> using the cipher
@@ -1435,20 +1337,17 @@ crypto_cipher_crypt_inplace(crypto_cipher_t *env, char *buf, size_t len)
 }
 
 /** Encrypt <b>fromlen</b> bytes (at least 1) from <b>from</b> with the key in
- * <b>cipher</b> to the buffer in <b>to</b> of length
+ * <b>key</b> to the buffer in <b>to</b> of length
  * <b>tolen</b>. <b>tolen</b> must be at least <b>fromlen</b> plus
  * CIPHER_IV_LEN bytes for the initialization vector. On success, return the
  * number of bytes written, on failure, return -1.
- *
- * This function adjusts the current position of the counter in <b>cipher</b>
- * to immediately after the encrypted data.
  */
 int
-crypto_cipher_encrypt_with_iv(crypto_cipher_t *cipher,
+crypto_cipher_encrypt_with_iv(const char *key,
                               char *to, size_t tolen,
                               const char *from, size_t fromlen)
 {
-  tor_assert(cipher);
+  crypto_cipher_t *cipher;
   tor_assert(from);
   tor_assert(to);
   tor_assert(fromlen < INT_MAX);
@@ -1458,28 +1357,27 @@ crypto_cipher_encrypt_with_iv(crypto_cipher_t *cipher,
   if (tolen < fromlen + CIPHER_IV_LEN)
     return -1;
 
-  crypto_cipher_generate_iv(to);
-  if (crypto_cipher_set_iv(cipher, to)<0)
-    return -1;
+  cipher = crypto_cipher_new_with_iv(key, NULL);
+
+  memcpy(to, cipher->iv, CIPHER_IV_LEN);
   crypto_cipher_encrypt(cipher, to+CIPHER_IV_LEN, from, fromlen);
+  crypto_cipher_free(cipher);
   return (int)(fromlen + CIPHER_IV_LEN);
 }
 
 /** Decrypt <b>fromlen</b> bytes (at least 1+CIPHER_IV_LEN) from <b>from</b>
- * with the key in <b>cipher</b> to the buffer in <b>to</b> of length
+ * with the key in <b>key</b> to the buffer in <b>to</b> of length
  * <b>tolen</b>. <b>tolen</b> must be at least <b>fromlen</b> minus
  * CIPHER_IV_LEN bytes for the initialization vector. On success, return the
  * number of bytes written, on failure, return -1.
- *
- * This function adjusts the current position of the counter in <b>cipher</b>
- * to immediately after the decrypted data.
  */
 int
-crypto_cipher_decrypt_with_iv(crypto_cipher_t *cipher,
+crypto_cipher_decrypt_with_iv(const char *key,
                               char *to, size_t tolen,
                               const char *from, size_t fromlen)
 {
-  tor_assert(cipher);
+  crypto_cipher_t *cipher;
+  tor_assert(key);
   tor_assert(from);
   tor_assert(to);
   tor_assert(fromlen < INT_MAX);
@@ -1489,9 +1387,10 @@ crypto_cipher_decrypt_with_iv(crypto_cipher_t *cipher,
   if (tolen < fromlen - CIPHER_IV_LEN)
     return -1;
 
-  if (crypto_cipher_set_iv(cipher, from)<0)
-    return -1;
+  cipher = crypto_cipher_new_with_iv(key, from);
+
   crypto_cipher_encrypt(cipher, to, from+CIPHER_IV_LEN, fromlen-CIPHER_IV_LEN);
+  crypto_cipher_free(cipher);
   return (int)(fromlen - CIPHER_IV_LEN);
 }
 
@@ -1716,8 +1615,8 @@ crypto_hmac_sha1(char *hmac_out,
 }
 
 /** Compute the HMAC-SHA-256 of the <b>msg_len</b> bytes in <b>msg</b>, using
- * the <b>key</b> of length <b>key_len</b>.  Store the DIGEST_LEN-byte result
- * in <b>hmac_out</b>.
+ * the <b>key</b> of length <b>key_len</b>.  Store the DIGEST256_LEN-byte
+ * result in <b>hmac_out</b>.
  */
 void
 crypto_hmac_sha256(char *hmac_out,
@@ -1910,7 +1809,6 @@ crypto_get_stored_dynamic_dh_modulus(const char *fname)
   char *contents = NULL;
   const char *contents_tmp = NULL;
   int dh_codes;
-  char *fname_new = NULL;
   DH *stored_dh = NULL;
   BIGNUM *dynamic_dh_modulus = NULL;
   int length = 0;
@@ -1985,12 +1883,10 @@ crypto_get_stored_dynamic_dh_modulus(const char *fname)
 
  err:
 
-  { /* move broken prime to $filename.broken */
-    fname_new = tor_malloc(strlen(fname) + 8);
-
-    /* no can do if these functions return error */
-    strlcpy(fname_new, fname, strlen(fname) + 8);
-    strlcat(fname_new, ".broken", strlen(fname) + 8);
+  {
+    /* move broken prime to $filename.broken */
+    char *fname_new=NULL;
+    tor_asprintf(&fname_new, "%s.broken", fname);
 
     log_warn(LD_CRYPTO, "Moving broken dynamic DH prime to '%s'.", fname_new);
 

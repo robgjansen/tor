@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #define MAIN_PRIVATE
@@ -455,7 +455,7 @@ static char *
 nt_service_command_line(int *using_default_torrc)
 {
   TCHAR tor_exe[MAX_PATH+1];
-  char tor_exe_ascii[MAX_PATH+1];
+  char tor_exe_ascii[MAX_PATH*2+1];
   char *command=NULL, *options=NULL;
   smartlist_t *sl;
   int i;
@@ -483,6 +483,7 @@ nt_service_command_line(int *using_default_torrc)
 
 #ifdef UNICODE
   wcstombs(tor_exe_ascii, tor_exe, sizeof(tor_exe_ascii));
+  tor_exe_ascii[sizeof(tor_exe_ascii)-1] = '\0';
 #else
   strlcpy(tor_exe_ascii, tor_exe, sizeof(tor_exe_ascii));
 #endif

@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -50,7 +50,7 @@ int control_event_or_conn_status(or_connection_t *conn,
 int control_event_bandwidth_used(uint32_t n_read, uint32_t n_written);
 int control_event_stream_bandwidth(edge_connection_t *edge_conn);
 int control_event_stream_bandwidth_used(void);
-void control_event_logmsg(int severity, unsigned int domain, const char *msg);
+void control_event_logmsg(int severity, uint32_t domain, const char *msg);
 int control_event_descriptors_changed(smartlist_t *routers);
 int control_event_address_mapped(const char *from, const char *to,
                                  time_t expires, const char *error);

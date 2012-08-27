@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -355,7 +355,9 @@ tor_addr_is_internal(const tor_addr_t *addr, int for_listening)
 
   /* unknown address family... assume it's not safe for external use */
   /* rather than tor_assert(0) */
-  log_warn(LD_BUG, "tor_addr_is_internal() called with a non-IP address.");
+  log_warn(LD_BUG, "tor_addr_is_internal() called with a non-IP address of "
+           "type %d", (int)v_family);
+  tor_fragile_assert();
   return 1;
 }
 
@@ -984,16 +986,21 @@ tor_dup_addr(const tor_addr_t *addr)
   }
 }
 
-/** Return a string representing the address <b>addr</b>.  This string is
- * statically allocated, and must not be freed.  Each call to
- * <b>fmt_addr</b> invalidates the last result of the function.  This
- * function is not thread-safe. */
+/** Return a string representing the address <b>addr</b>.  This string
+ * is statically allocated, and must not be freed.  Each call to
+ * <b>fmt_addr_impl</b> invalidates the last result of the function.
+ * This function is not thread-safe. If <b>decorate</b> is set, add
+ * brackets to IPv6 addresses.
+ *
+ * It's better to use the wrapper macros of this function:
+ * <b>fmt_addr()</b> and <b>fmt_and_decorate_addr()</b>.
+ */
 const char *
-fmt_addr(const tor_addr_t *addr)
+fmt_addr_impl(const tor_addr_t *addr, int decorate)
 {
   static char buf[TOR_ADDR_BUF_LEN];
   if (!addr) return "<null>";
-  if (tor_addr_to_str(buf, addr, sizeof(buf), 0))
+  if (tor_addr_to_str(buf, addr, sizeof(buf), decorate))
     return buf;
   else
     return "???";
@@ -1356,7 +1363,7 @@ get_interface_address6(int severity, sa_family_t family, tor_addr_t *addr)
 
 /* ======
  * IPv4 helpers
- * XXXX023 IPv6 deprecate some of these.
+ * XXXX024 IPv6 deprecate some of these.
  */
 
 /** Return true iff <b>ip</b> (in host order) is an IP reserved to localhost,
@@ -1519,7 +1526,7 @@ parse_port_range(const char *port, uint16_t *port_min_out,
     } else if (endptr && *endptr == '-') {
       port = endptr+1;
       endptr = NULL;
-      port_max = (int)tor_parse_long(port, 10, 1, 65536, &ok, &endptr);
+      port_max = (int)tor_parse_long(port, 10, 1, 65535, &ok, &endptr);
       if (!ok) {
         log_warn(LD_GENERAL,
                  "Malformed port %s on address range; rejecting.",
@@ -1678,5 +1685,15 @@ get_interface_address(int severity, uint32_t *addr)
   if (r>=0)
     *addr = tor_addr_to_ipv4h(&local_addr);
   return r;
+}
+
+/** Return true if we can tell that <b>name</b> is a canonical name for the
+ * loopback address. */
+int
+tor_addr_hostname_is_local(const char *name)
+{
+  return !strcasecmp(name, "localhost") ||
+    !strcasecmp(name, "local") ||
+    !strcasecmpend(name, ".local");
 }
 

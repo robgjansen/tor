@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
@@ -94,14 +94,10 @@ test_pt_protocol(void)
   managed_proxy_t *mp = tor_malloc_zero(sizeof(managed_proxy_t));
   mp->conf_state = PT_PROTO_LAUNCHED;
   mp->transports = smartlist_new();
+  mp->argv = tor_malloc_zero(sizeof(char*)*2);
+  mp->argv[0] = tor_strdup("<testcase>");
 
   /* various wrong protocol runs: */
-
-  strcpy(line, "TEST TEST");
-  handle_proxy_line(line, mp);
-  test_assert(mp->conf_state == PT_PROTO_BROKEN);
-
-  reset_mp(mp);
 
   strcpy(line,"VERSION 1");
   handle_proxy_line(line, mp);

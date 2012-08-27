@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -74,10 +74,15 @@ static void connection_send_socks5_connect(connection_t *conn);
 static const char *proxy_type_to_string(int proxy_type);
 static int get_proxy_type(void);
 
-/** The last IPv4 address that our network interface seemed to have been
- * binding to, in host order.  We use this to detect when our IP changes. */
-static uint32_t last_interface_ip = 0;
-/** A list of uint32_ts for addresses we've used in outgoing connections.
+/** The last addresses that our network interface seemed to have been
+ * binding to.  We use this as one way to detect when our IP changes.
+ *
+ * XXX024 We should really use the entire list of interfaces here.
+ **/
+static tor_addr_t *last_interface_ipv4 = NULL;
+/* DOCDOC last_interface_ipv6 */
+static tor_addr_t *last_interface_ipv6 = NULL;
+/** A list of tor_addr_t for addresses we've used in outgoing connections.
  * Used to detect IP address changes. */
 static smartlist_t *outgoing_addrs = NULL;
 
@@ -512,6 +517,7 @@ _connection_free(connection_t *conn)
   }
   if (conn->type == CONN_TYPE_CONTROL) {
     control_connection_t *control_conn = TO_CONTROL_CONN(conn);
+    tor_free(control_conn->safecookie_client_hash);
     tor_free(control_conn->incoming_cmd);
   }
 
@@ -704,8 +710,7 @@ connection_expire_held_open(void)
 
   now = time(NULL);
 
-  SMARTLIST_FOREACH(conns, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(conns, connection_t *, conn) {
     /* If we've been holding the connection open, but we haven't written
      * for 15 seconds...
      */
@@ -727,10 +732,10 @@ connection_expire_held_open(void)
         conn->hold_open_until_flushed = 0;
       }
     }
-  });
+  } SMARTLIST_FOREACH_END(conn);
 }
 
-#ifdef HAVE_SYS_UN_H
+#if defined(HAVE_SYS_UN_H) || defined(RUNNING_DOXYGEN)
 /** Create an AF_UNIX listenaddr struct.
  * <b>listenaddress</b> provides the path to the Unix socket.
  *
@@ -776,8 +781,9 @@ create_unix_sockaddr(const char *listenaddress, char **readable_address,
   log_fn(LOG_ERR, LD_BUG,
          "Unix domain sockets not supported, yet we tried to create one.");
   *len_out = 0;
-  tor_assert(0);
-};
+  tor_fragile_assert();
+  return NULL;
+}
 #endif /* HAVE_SYS_UN_H */
 
 /** Warn that an accept or a connect has failed because we're running up
@@ -906,6 +912,26 @@ connection_listener_new(const struct sockaddr *listensockaddr,
 
     make_socket_reuseable(s);
 
+#ifdef IPV6_V6ONLY
+    if (listensockaddr->sa_family == AF_INET6) {
+#ifdef _WIN32
+      /* In Redmond, this kind of thing passes for standards-conformance. */
+      DWORD one = 1;
+#else
+      int one = 1;
+#endif
+      /* We need to set IPV6_V6ONLY so that this socket can't get used for
+       * IPv4 connections. */
+      if (setsockopt(s,IPPROTO_IPV6, IPV6_V6ONLY,
+                     (void*)&one, sizeof(one))<0) {
+        int e = tor_socket_errno(s);
+        log_warn(LD_NET, "Error setting IPV6_V6ONLY flag: %s",
+                 tor_socket_strerror(e));
+        /* Keep going; probably not harmful. */
+      }
+    }
+#endif
+
     if (bind(s,listensockaddr,socklen) < 0) {
       const char *helpfulhint = "";
       int e = tor_socket_errno(s);
@@ -1025,7 +1051,12 @@ connection_listener_new(const struct sockaddr *listensockaddr,
     if (port_cfg->session_group >= 0) {
       lis_conn->session_group = port_cfg->session_group;
     } else {
-      /* XXXX023 This can wrap after ~INT_MAX ports are opened. */
+      /* This can wrap after around INT_MAX listeners are opened.  But I don't
+       * believe that matters, since you would need to open a ridiculous
+       * number of listeners while keeping the early ones open before you ever
+       * hit this.  An OR with a dozen ports open, for example, would have to
+       * close and re-open its listeners every second for 4 years nonstop.
+       */
       lis_conn->session_group = global_next_session_group--;
     }
   }
@@ -1308,6 +1339,7 @@ connection_connect(connection_t *conn, const char *address,
 
   if (get_n_open_sockets() >= get_options()->_ConnLimit-1) {
     warn_too_many_conns();
+    *socket_error = SOCK_ERRNO(ENOBUFS);
     return -1;
   }
 
@@ -1394,17 +1426,17 @@ connection_connect(connection_t *conn, const char *address,
     }
   }
 
-  if (!server_mode(options))
-    client_check_address_changed(s);
-
   /* it succeeded. we're connected. */
   log_fn(inprogress?LOG_DEBUG:LOG_INFO, LD_NET,
          "Connection to %s:%u %s (sock %d).",
          escaped_safe_str_client(address),
          port, inprogress?"in progress":"established", s);
   conn->s = s;
-  if (connection_add_connecting(conn) < 0) /* no space, forget it */
+  if (connection_add_connecting(conn) < 0) {
+    /* no space, forget it */
+    *socket_error = SOCK_ERRNO(ENOBUFS);
     return -1;
+  }
   return inprogress ? 0 : 1;
 }
 
@@ -1467,10 +1499,13 @@ connection_proxy_connect(connection_t *conn, int type)
       }
 
       if (base64_authenticator) {
+        const char *addr = fmt_addr(&conn->addr);
         tor_snprintf(buf, sizeof(buf), "CONNECT %s:%d HTTP/1.1\r\n"
+                     "Host: %s:%d\r\n"
                      "Proxy-Authorization: Basic %s\r\n\r\n",
-                     fmt_addr(&conn->addr),
-                     conn->port, base64_authenticator);
+                     addr, conn->port,
+                     addr, conn->port,
+                     base64_authenticator);
         tor_free(base64_authenticator);
       } else {
         tor_snprintf(buf, sizeof(buf), "CONNECT %s:%d HTTP/1.0\r\n\r\n",
@@ -1637,7 +1672,8 @@ connection_send_socks5_connect(connection_t *conn)
   conn->proxy_state = PROXY_SOCKS5_WANT_CONNECT_OK;
 }
 
-/** DOCDOC */
+/** Wrapper around fetch_from_(buf/evbuffer)_socks_client: see those functions
+ * for documentation of its behavior. */
 static int
 connection_fetch_from_buf_socks_client(connection_t *conn,
                                        int state, char **reason)
@@ -1787,17 +1823,28 @@ connection_read_proxy_handshake(connection_t *conn)
  * entry in <b>ports</b>.  Add to <b>new_conns</b> new every connection we
  * launch.
  *
+ * If <b>control_listeners_only</b> is true, then we only open control
+ * listeners, and we do not remove any noncontrol listeners from old_conns.
+ *
  * Return 0 on success, -1 on failure.
  **/
 static int
 retry_listener_ports(smartlist_t *old_conns,
                      const smartlist_t *ports,
-                     smartlist_t *new_conns)
+                     smartlist_t *new_conns,
+                     int control_listeners_only)
 {
   smartlist_t *launch = smartlist_new();
   int r = 0;
 
-  smartlist_add_all(launch, ports);
+  if (control_listeners_only) {
+    SMARTLIST_FOREACH(ports, port_cfg_t *, p, {
+        if (p->type == CONN_TYPE_CONTROL_LISTENER)
+          smartlist_add(launch, p);
+    });
+  } else {
+    smartlist_add_all(launch, ports);
+  }
 
   /* Iterate through old_conns, comparing it to launch: remove from both lists
    * each pair of elements that corresponds to the same port. */
@@ -1897,10 +1944,13 @@ retry_listener_ports(smartlist_t *old_conns,
  *
  * Add all old conns that should be closed to <b>replaced_conns</b>.
  * Add all new connections to <b>new_conns</b>.
+ *
+ * If <b>close_all_noncontrol</b> is true, then we only open control
+ * listeners, and we close all other listeners.
  */
 int
 retry_all_listeners(smartlist_t *replaced_conns,
-                    smartlist_t *new_conns)
+                    smartlist_t *new_conns, int close_all_noncontrol)
 {
   smartlist_t *listeners = smartlist_new();
   const or_options_t *options = get_options();
@@ -1915,7 +1965,8 @@ retry_all_listeners(smartlist_t *replaced_conns,
 
   if (retry_listener_ports(listeners,
                            get_configured_ports(),
-                           new_conns) < 0)
+                           new_conns,
+                           close_all_noncontrol) < 0)
     retval = -1;
 
   /* Any members that were still in 'listeners' don't correspond to
@@ -2202,7 +2253,9 @@ global_write_bucket_low(connection_t *conn, size_t attempt, int priority)
   return 0;
 }
 
-/** DOCDOC */
+/** Helper: adjusts our bandwidth history and informs the controller as
+ * appropriate, given that we have just read <b>num_read</b> bytes and written
+ * <b>num_written</b> bytes on <b>conn</b>. */
 static void
 record_num_bytes_transferred_impl(connection_t *conn,
                              time_t now, size_t num_read, size_t num_written)
@@ -2233,12 +2286,13 @@ record_num_bytes_transferred_impl(connection_t *conn,
 }
 
 #ifdef USE_BUFFEREVENTS
-/** DOCDOC */
+/** Wrapper around fetch_from_(buf/evbuffer)_socks_client: see those functions
+ * for documentation of its behavior. */
 static void
 record_num_bytes_transferred(connection_t *conn,
                              time_t now, size_t num_read, size_t num_written)
 {
-  /* XXX023 check if this is necessary */
+  /* XXX024 check if this is necessary */
   if (num_written >= INT_MAX || num_read >= INT_MAX) {
     log_err(LD_BUG, "Value out of range. num_read=%lu, num_written=%lu, "
              "connection type=%s, state=%s",
@@ -2432,8 +2486,7 @@ connection_bucket_refill(int milliseconds_elapsed, time_t now)
   } 
   
   /* refill the per-connection buckets */
-  SMARTLIST_FOREACH(conns, connection_t *, conn,
-  {
+  SMARTLIST_FOREACH_BEGIN(conns, connection_t *, conn) {
     if (connection_speaks_cells(conn)) {
       or_connection_t *or_conn = TO_OR_CONN(conn);
       int orbandwidthrate = or_conn->bandwidthrate;
@@ -2480,7 +2533,7 @@ connection_bucket_refill(int milliseconds_elapsed, time_t now)
       conn->write_blocked_on_bw = 0;
       connection_start_writing(conn);
     }
-  });
+  } SMARTLIST_FOREACH_END(conn);
 }
 
 /** Is the <b>bucket</b> for connection <b>conn</b> low enough that we
@@ -2561,7 +2614,8 @@ connection_get_rate_limit_totals(uint64_t *read_out, uint64_t *written_out)
   }
 }
 
-/** DOCDOC */
+/** Perform whatever operations are needed on <b>conn</b> to enable
+ * rate-limiting. */
 void
 connection_enable_rate_limiting(connection_t *conn)
 {
@@ -2585,10 +2639,6 @@ connection_consider_empty_read_buckets(connection_t *conn)
 #endif
 
 /** Read bytes from conn-\>s and process them.
- *
- * This function gets called from conn_read() in main.c, either
- * when poll() has declared that conn wants to read, or (for OR conns)
- * when there are pending TLS bytes.
  *
  * It calls connection_read_to_buf() to bring in any new bytes,
  * and then calls connection_process_inbuf() to process them.
@@ -2698,6 +2748,7 @@ connection_handle_read_impl(connection_t *conn)
   return 0;
 }
 
+/* DOCDOC connection_handle_read */
 int
 connection_handle_read(connection_t *conn)
 {
@@ -2891,7 +2942,7 @@ evbuffer_inbuf_callback(struct evbuffer *buf,
     connection_consider_empty_read_buckets(conn);
     if (conn->type == CONN_TYPE_AP) {
       edge_connection_t *edge_conn = TO_EDGE_CONN(conn);
-      /*XXXX022 check for overflow*/
+      /*XXXX024 check for overflow*/
       edge_conn->n_read += (int)info->n_added;
     }
   }
@@ -2912,7 +2963,7 @@ evbuffer_outbuf_callback(struct evbuffer *buf,
     connection_consider_empty_write_buckets(conn);
     if (conn->type == CONN_TYPE_AP) {
       edge_connection_t *edge_conn = TO_EDGE_CONN(conn);
-      /*XXXX022 check for overflow*/
+      /*XXXX024 check for overflow*/
       edge_conn->n_written += (int)info->n_deleted;
     }
   }
@@ -3290,6 +3341,7 @@ connection_handle_write_impl(connection_t *conn, int force)
   return 0;
 }
 
+/* DOCDOC connection_handle_write */
 int
 connection_handle_write(connection_t *conn, int force)
 {
@@ -3684,47 +3736,62 @@ alloc_http_authenticator(const char *authenticator)
 static void
 client_check_address_changed(tor_socket_t sock)
 {
-  uint32_t iface_ip, ip_out; /* host order */
-  struct sockaddr_in out_addr;
-  socklen_t out_addr_len = (socklen_t) sizeof(out_addr);
-  uint32_t *ip; /* host order */
+  struct sockaddr_storage out_sockaddr;
+  socklen_t out_addr_len = (socklen_t) sizeof(out_sockaddr);
+  tor_addr_t out_addr, iface_addr;
+  tor_addr_t **last_interface_ip_ptr;
+  sa_family_t family;
 
-  if (!last_interface_ip)
-    get_interface_address(LOG_INFO, &last_interface_ip);
   if (!outgoing_addrs)
     outgoing_addrs = smartlist_new();
 
-  if (getsockname(sock, (struct sockaddr*)&out_addr, &out_addr_len)<0) {
+  if (getsockname(sock, (struct sockaddr*)&out_sockaddr, &out_addr_len)<0) {
     int e = tor_socket_errno(sock);
     log_warn(LD_NET, "getsockname() to check for address change failed: %s",
              tor_socket_strerror(e));
     return;
   }
+  tor_addr_from_sockaddr(&out_addr, (struct sockaddr*)&out_sockaddr, NULL);
+  family = tor_addr_family(&out_addr);
+
+  if (family == AF_INET)
+    last_interface_ip_ptr = &last_interface_ipv4;
+  else if (family == AF_INET6)
+    last_interface_ip_ptr = &last_interface_ipv6;
+  else
+    return;
+
+  if (! *last_interface_ip_ptr) {
+    tor_addr_t *a = tor_malloc_zero(sizeof(tor_addr_t));
+    if (get_interface_address6(LOG_INFO, family, a)==0) {
+      *last_interface_ip_ptr = a;
+    } else {
+      tor_free(a);
+    }
+  }
 
   /* If we've used this address previously, we're okay. */
-  ip_out = ntohl(out_addr.sin_addr.s_addr);
-  SMARTLIST_FOREACH(outgoing_addrs, uint32_t*, ip_ptr,
-                    if (*ip_ptr == ip_out) return;
+  SMARTLIST_FOREACH(outgoing_addrs, const tor_addr_t *, a_ptr,
+                    if (tor_addr_eq(a_ptr, &out_addr))
+                      return;
                     );
 
   /* Uh-oh.  We haven't connected from this address before. Has the interface
    * address changed? */
-  if (get_interface_address(LOG_INFO, &iface_ip)<0)
+  if (get_interface_address6(LOG_INFO, family, &iface_addr)<0)
     return;
-  ip = tor_malloc(sizeof(uint32_t));
-  *ip = ip_out;
 
-  if (iface_ip == last_interface_ip) {
+  if (tor_addr_eq(&iface_addr, *last_interface_ip_ptr)) {
     /* Nope, it hasn't changed.  Add this address to the list. */
-    smartlist_add(outgoing_addrs, ip);
+    smartlist_add(outgoing_addrs, tor_memdup(&out_addr, sizeof(tor_addr_t)));
   } else {
     /* The interface changed.  We're a client, so we need to regenerate our
      * keys.  First, reset the state. */
     log(LOG_NOTICE, LD_NET, "Our IP address has changed.  Rotating keys...");
-    last_interface_ip = iface_ip;
-    SMARTLIST_FOREACH(outgoing_addrs, void*, ip_ptr, tor_free(ip_ptr));
+    tor_addr_copy(*last_interface_ip_ptr, &iface_addr);
+    SMARTLIST_FOREACH(outgoing_addrs, tor_addr_t*, a_ptr, tor_free(a_ptr));
     smartlist_clear(outgoing_addrs);
-    smartlist_add(outgoing_addrs, ip);
+    smartlist_add(outgoing_addrs, tor_memdup(&out_addr, sizeof(tor_addr_t)));
     /* Okay, now change our keys. */
     ip_address_changed(1);
   }
@@ -3853,6 +3920,14 @@ static int
 connection_finished_connecting(connection_t *conn)
 {
   tor_assert(conn);
+
+  if (!server_mode(get_options())) {
+    /* See whether getsockname() says our address changed.  We need to do this
+     * now that the connection has finished, because getsockname() on Windows
+     * won't work until then. */
+    client_check_address_changed(conn->s);
+  }
+
   switch (conn->type)
     {
     case CONN_TYPE_OR:
@@ -3907,8 +3982,7 @@ connection_dump_buffer_mem_stats(int severity)
   memset(alloc_by_type, 0, sizeof(alloc_by_type));
   memset(n_conns_by_type, 0, sizeof(n_conns_by_type));
 
-  SMARTLIST_FOREACH(conns, connection_t *, c,
-  {
+  SMARTLIST_FOREACH_BEGIN(conns, connection_t *, c) {
     int tp = c->type;
     ++n_conns_by_type[tp];
     if (c->inbuf) {
@@ -3919,7 +3993,7 @@ connection_dump_buffer_mem_stats(int severity)
       used_by_type[tp] += buf_datalen(c->outbuf);
       alloc_by_type[tp] += buf_allocation(c->outbuf);
     }
-  });
+  } SMARTLIST_FOREACH_END(c);
   for (i=0; i <= _CONN_TYPE_MAX; ++i) {
     total_used += used_by_type[i];
     total_alloc += alloc_by_type[i];
@@ -4224,7 +4298,7 @@ connection_free_all(void)
   SMARTLIST_FOREACH(conns, connection_t *, conn, _connection_free(conn));
 
   if (outgoing_addrs) {
-    SMARTLIST_FOREACH(outgoing_addrs, void*, addr, tor_free(addr));
+    SMARTLIST_FOREACH(outgoing_addrs, tor_addr_t *, addr, tor_free(addr));
     smartlist_free(outgoing_addrs);
     outgoing_addrs = NULL;
   }

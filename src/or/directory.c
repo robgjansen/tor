@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "or.h"
@@ -130,8 +130,9 @@ purpose_needs_anonymity(uint8_t dir_purpose, uint8_t router_purpose)
 {
   if (get_options()->AllDirActionsPrivate)
     return 1;
-  if (router_purpose == ROUTER_PURPOSE_BRIDGE && can_complete_circuit)
-    return 1; /* if no circuits yet, we may need this info to bootstrap. */
+  if (router_purpose == ROUTER_PURPOSE_BRIDGE)
+    return 1; /* if no circuits yet, this might break bootstrapping, but it's
+               * needed to be safe. */
   if (dir_purpose == DIR_PURPOSE_UPLOAD_DIR ||
       dir_purpose == DIR_PURPOSE_UPLOAD_VOTE ||
       dir_purpose == DIR_PURPOSE_UPLOAD_SIGNATURES ||
@@ -354,6 +355,7 @@ directory_get_from_dirserver(uint8_t dir_purpose, uint8_t router_purpose,
   const routerstatus_t *rs = NULL;
   const or_options_t *options = get_options();
   int prefer_authority = directory_fetches_from_authorities(options);
+  int require_authority = 0;
   int get_via_tor = purpose_needs_anonymity(dir_purpose, router_purpose);
   dirinfo_type_t type;
   time_t if_modified_since = 0;
@@ -369,6 +371,7 @@ directory_get_from_dirserver(uint8_t dir_purpose, uint8_t router_purpose,
     case DIR_PURPOSE_FETCH_V2_NETWORKSTATUS:
       type = V2_DIRINFO;
       prefer_authority = 1; /* Only v2 authorities have these anyway. */
+      require_authority = 1; /* Don't fallback to asking a non-authority */
       break;
     case DIR_PURPOSE_FETCH_SERVERDESC:
       type = (router_purpose == ROUTER_PURPOSE_BRIDGE ? BRIDGE_DIRINFO :
@@ -469,6 +472,11 @@ directory_get_from_dirserver(uint8_t dir_purpose, uint8_t router_purpose,
             return;
           }
         }
+        if (rs == NULL && require_authority) {
+          log_info(LD_DIR, "No authorities were available for %s: will try "
+                   "later.", dir_conn_purpose_to_string(dir_purpose));
+          return;
+        }
       }
       if (!rs && type != BRIDGE_DIRINFO) {
         /* anybody with a non-zero dirport will do */
@@ -527,9 +535,8 @@ directory_get_from_all_authorities(uint8_t dir_purpose,
   tor_assert(dir_purpose == DIR_PURPOSE_FETCH_STATUS_VOTE ||
              dir_purpose == DIR_PURPOSE_FETCH_DETACHED_SIGNATURES);
 
-  SMARTLIST_FOREACH(router_get_trusted_dir_servers(),
-                    trusted_dir_server_t *, ds,
-    {
+  SMARTLIST_FOREACH_BEGIN(router_get_trusted_dir_servers(),
+                          trusted_dir_server_t *, ds) {
       routerstatus_t *rs;
       if (router_digest_is_me(ds->digest))
         continue;
@@ -538,7 +545,7 @@ directory_get_from_all_authorities(uint8_t dir_purpose,
       rs = &ds->fake_status;
       directory_initiate_command_routerstatus(rs, dir_purpose, router_purpose,
                                               0, resource, NULL, 0, 0);
-    });
+  } SMARTLIST_FOREACH_END(ds);
 }
 
 /** Same as directory_initiate_command_routerstatus(), but accepts
@@ -1084,9 +1091,8 @@ directory_get_consensus_url(int supports_conditional_consensus,
     char *authority_id_list;
     smartlist_t *authority_digests = smartlist_new();
 
-    SMARTLIST_FOREACH(router_get_trusted_dir_servers(),
-                      trusted_dir_server_t *, ds,
-      {
+    SMARTLIST_FOREACH_BEGIN(router_get_trusted_dir_servers(),
+                            trusted_dir_server_t *, ds) {
         char *hex;
         if (!(ds->type & V3_DIRINFO))
           continue;
@@ -1095,7 +1101,7 @@ directory_get_consensus_url(int supports_conditional_consensus,
         base16_encode(hex, 2*CONDITIONAL_CONSENSUS_FPR_LEN+1,
                       ds->v3_identity_digest, CONDITIONAL_CONSENSUS_FPR_LEN);
         smartlist_add(authority_digests, hex);
-      });
+    } SMARTLIST_FOREACH_END(ds);
     smartlist_sort(authority_digests, _compare_strs);
     authority_id_list = smartlist_join_strings(authority_digests,
                                                "+", 0, NULL);
@@ -2430,7 +2436,8 @@ write_http_response_header(dir_connection_t *conn, ssize_t length,
                              cache_lifetime);
 }
 
-#ifdef INSTRUMENT_DOWNLOADS
+#if defined(INSTRUMENT_DOWNLOADS) || defined(RUNNING_DOXYGEN)
+/* DOCDOC */
 typedef struct request_t {
   uint64_t bytes; /**< How many bytes have we transferred? */
   uint64_t count; /**< How many requests have we made? */
@@ -2766,10 +2773,11 @@ directory_handle_command_get(dir_connection_t *conn, const char *headers,
       else
         request_type = "/tor/status/?";
     } else {
-      networkstatus_t *v = networkstatus_get_latest_consensus();
+      networkstatus_t *v;
       time_t now = time(NULL);
       const char *want_fps = NULL;
       char *flavor = NULL;
+      int flav = FLAV_NS;
       #define CONSENSUS_URL_PREFIX "/tor/status-vote/current/consensus/"
       #define CONSENSUS_FLAVORED_PREFIX "/tor/status-vote/current/consensus-"
       /* figure out the flavor if any, and who we wanted to sign the thing */
@@ -2783,12 +2791,16 @@ directory_handle_command_get(dir_connection_t *conn, const char *headers,
         } else {
           flavor = tor_strdup(f);
         }
+        flav = networkstatus_parse_flavor_name(flavor);
+        if (flav < 0)
+          flav = FLAV_NS;
       } else {
         if (!strcmpstart(url, CONSENSUS_URL_PREFIX))
           want_fps = url+strlen(CONSENSUS_URL_PREFIX);
       }
 
-      /* XXXX MICRODESC NM NM should check document of correct flavor */
+      v = networkstatus_get_latest_consensus_by_flavor(flav);
+
       if (v && want_fps &&
           !client_likes_consensus(v, want_fps)) {
         write_http_status_line(conn, 404, "Consensus not signed by sufficient "
@@ -2845,8 +2857,10 @@ directory_handle_command_get(dir_connection_t *conn, const char *headers,
 
     {
       struct in_addr in;
+      tor_addr_t addr;
       if (tor_inet_aton((TO_CONN(conn))->address, &in)) {
-        geoip_note_client_seen(act, ntohl(in.s_addr), time(NULL));
+        tor_addr_from_ipv4h(&addr, ntohl(in.s_addr));
+        geoip_note_client_seen(act, &addr, time(NULL));
         geoip_note_ns_response(act, GEOIP_SUCCESS);
         /* Note that a request for a network status has started, so that we
          * can measure the download time later on. */
@@ -3215,22 +3229,24 @@ directory_handle_command_get(dir_connection_t *conn, const char *headers,
   }
 
   if (options->BridgeAuthoritativeDir &&
-      options->BridgePassword &&
+      options->_BridgePassword_AuthDigest &&
       connection_dir_is_encrypted(conn) &&
       !strcmp(url,"/tor/networkstatus-bridges")) {
     char *status;
-    char *secret = alloc_http_authenticator(options->BridgePassword);
+    char digest[DIGEST256_LEN];
 
     header = http_get_header(headers, "Authorization: Basic ");
+    if (header)
+      crypto_digest256(digest, header, strlen(header), DIGEST_SHA256);
 
     /* now make sure the password is there and right */
-    if (!header || strcmp(header, secret)) {
+    if (!header ||
+        tor_memneq(digest,
+                   options->_BridgePassword_AuthDigest, DIGEST256_LEN)) {
       write_http_status_line(conn, 404, "Not found");
-      tor_free(secret);
       tor_free(header);
       goto done;
     }
-    tor_free(secret);
     tor_free(header);
 
     /* all happy now. send an answer. */
@@ -3585,8 +3601,7 @@ dir_networkstatus_download_failed(smartlist_t *failed, int status_code)
 {
   if (status_code == 503)
     return;
-  SMARTLIST_FOREACH(failed, const char *, fp,
-  {
+  SMARTLIST_FOREACH_BEGIN(failed, const char *, fp) {
     char digest[DIGEST_LEN];
     trusted_dir_server_t *dir;
     if (base16_decode(digest, DIGEST_LEN, fp, strlen(fp))<0) {
@@ -3598,7 +3613,7 @@ dir_networkstatus_download_failed(smartlist_t *failed, int status_code)
 
     if (dir)
       download_status_failed(&dir->v2_ns_dl_status, status_code);
-  });
+  } SMARTLIST_FOREACH_END(fp);
 }
 
 /** Schedule for when servers should download things in general. */
@@ -3752,8 +3767,7 @@ dir_routerdesc_download_failed(smartlist_t *failed, int status_code,
     }
     return; /* FFFF should implement for other-than-router-purpose someday */
   }
-  SMARTLIST_FOREACH(failed, const char *, cp,
-  {
+  SMARTLIST_FOREACH_BEGIN(failed, const char *, cp) {
     download_status_t *dls = NULL;
     if (base16_decode(digest, DIGEST_LEN, cp, strlen(cp)) < 0) {
       log_warn(LD_BUG, "Malformed fingerprint in list: %s", escaped(cp));
@@ -3770,13 +3784,16 @@ dir_routerdesc_download_failed(smartlist_t *failed, int status_code,
     if (!dls || dls->n_download_failures >= MAX_ROUTERDESC_DOWNLOAD_FAILURES)
       continue;
     download_status_increment_failure(dls, status_code, cp, server, now);
-  });
+  } SMARTLIST_FOREACH_END(cp);
 
   /* No need to relaunch descriptor downloads here: we already do it
    * every 10 or 60 seconds (FOO_DESCRIPTOR_RETRY_INTERVAL) in main.c. */
 }
 
-/* DOCDOC NM */
+/** Called when a connection to download microdescriptors has failed in whole
+ * or in part. <b>failed</b> is a list of every microdesc digest we didn't
+ * get. <b>status_code</b> is the http status code we received. Reschedule the
+ * microdesc downloads as appropriate. */
 static void
 dir_microdesc_download_failed(smartlist_t *failed,
                               int status_code)

@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -26,6 +26,8 @@ typedef struct tor_addr_t
 {
   sa_family_t family;
   union {
+    uint32_t dummy_; /* This field is here so we have something to initialize
+                      * with a reliable cross-platform type. */
     struct in_addr in_addr;
     struct in6_addr in6_addr;
   } addr;
@@ -37,6 +39,8 @@ typedef struct tor_addr_port_t
   tor_addr_t addr;
   uint16_t port;
 } tor_addr_port_t;
+
+#define TOR_ADDR_NULL {AF_UNSPEC, {0}};
 
 static INLINE const struct in6_addr *tor_addr_to_in6(const tor_addr_t *a);
 static INLINE uint32_t tor_addr_to_ipv4n(const tor_addr_t *a);
@@ -133,7 +137,14 @@ tor_addr_eq_ipv4h(const tor_addr_t *a, uint32_t u)
 
 int tor_addr_lookup(const char *name, uint16_t family, tor_addr_t *addr_out);
 char *tor_dup_addr(const tor_addr_t *addr) ATTR_MALLOC;
-const char *fmt_addr(const tor_addr_t *addr);
+
+/** Wrapper function of fmt_addr_impl(). It does not decorate IPv6
+ *  addresses. */
+#define fmt_addr(a) fmt_addr_impl((a), 0)
+/** Wrapper function of fmt_addr_impl(). It decorates IPv6
+ *  addresses. */
+#define fmt_and_decorate_addr(a) fmt_addr_impl((a), 1)
+const char *fmt_addr_impl(const tor_addr_t *addr, int decorate);
 const char * fmt_addr32(uint32_t addr);
 int get_interface_address6(int severity, sa_family_t family, tor_addr_t *addr);
 
@@ -190,6 +201,8 @@ int tor_addr_is_loopback(const tor_addr_t *addr);
 
 int tor_addr_port_split(int severity, const char *addrport,
                         char **address_out, uint16_t *port_out);
+
+int tor_addr_hostname_is_local(const char *name);
 
 /* IPv4 helpers */
 int is_internal_IP(uint32_t ip, int for_listening);

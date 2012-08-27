@@ -1,7 +1,7 @@
 /* Copyright 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -1086,6 +1086,7 @@ circuit_find_to_cannibalize(uint8_t purpose, extend_info_t *info,
           (!need_capacity || circ->build_state->need_capacity) &&
           (internal == circ->build_state->is_internal) &&
           circ->remaining_relay_early_cells &&
+          circ->build_state->desired_path_len == DEFAULT_ROUTE_LEN &&
           !circ->build_state->onehop_tunnel &&
           !circ->isolation_values_set) {
         if (info) {
@@ -1179,7 +1180,7 @@ circuit_mark_all_unused_circs(void)
  * This is useful for letting the user change pseudonyms, so new
  * streams will not be linkable to old streams.
  */
-/* XXX023 this is a bad name for what this function does */
+/* XXX024 this is a bad name for what this function does */
 void
 circuit_expire_all_dirty_circs(void)
 {
@@ -1190,7 +1191,7 @@ circuit_expire_all_dirty_circs(void)
     if (CIRCUIT_IS_ORIGIN(circ) &&
         !circ->marked_for_close &&
         circ->timestamp_dirty)
-      /* XXXX023 This is a screwed-up way to say "This is too dirty
+      /* XXXX024 This is a screwed-up way to say "This is too dirty
        * for new circuits. */
       circ->timestamp_dirty -= options->MaxCircuitDirtiness;
   }

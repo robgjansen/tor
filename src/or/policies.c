@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -77,8 +77,7 @@ policy_expand_private(smartlist_t **policy)
 
   tmp = smartlist_new();
 
-  SMARTLIST_FOREACH(*policy, addr_policy_t *, p,
-  {
+  SMARTLIST_FOREACH_BEGIN(*policy, addr_policy_t *, p) {
      if (! p->is_private) {
        smartlist_add(tmp, p);
        continue;
@@ -95,7 +94,7 @@ policy_expand_private(smartlist_t **policy)
        smartlist_add(tmp, addr_policy_get_canonical_entry(&newpolicy));
      }
      addr_policy_free(p);
-  });
+  } SMARTLIST_FOREACH_END(p);
 
   smartlist_free(*policy);
   *policy = tmp;
@@ -127,8 +126,7 @@ parse_addr_policy(config_line_t *cfg, smartlist_t **dest,
   for (; cfg; cfg = cfg->next) {
     smartlist_split_string(entries, cfg->value, ",",
                            SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
-    SMARTLIST_FOREACH(entries, const char *, ent,
-    {
+    SMARTLIST_FOREACH_BEGIN(entries, const char *, ent) {
       log_debug(LD_CONFIG,"Adding new entry '%s'",ent);
       item = router_parse_addr_policy_item_from_string(ent, assume_action);
       if (item) {
@@ -137,7 +135,7 @@ parse_addr_policy(config_line_t *cfg, smartlist_t **dest,
         log_warn(LD_CONFIG,"Malformed policy '%s'.", ent);
         r = -1;
       }
-    });
+    } SMARTLIST_FOREACH_END(ent);
     SMARTLIST_FOREACH(entries, char *, ent, tor_free(ent));
     smartlist_clear(entries);
   }
@@ -535,6 +533,7 @@ typedef struct policy_map_ent_t {
   addr_policy_t *policy;
 } policy_map_ent_t;
 
+/* DOCDOC policy_root */
 static HT_HEAD(policy_map, policy_map_ent_t) policy_root = HT_INITIALIZER();
 
 /** Return true iff a and b are equal. */
@@ -669,7 +668,7 @@ compare_unknown_tor_addr_to_addr_policy(uint16_t port,
 
   SMARTLIST_FOREACH_BEGIN(policy, addr_policy_t *, tmpe) {
     if (tmpe->prt_min <= port && port <= tmpe->prt_max) {
-       if (tmpe->maskbits == 0) {
+      if (tmpe->maskbits == 0) {
         /* Definitely matches, since it covers all addresses. */
         if (tmpe->policy_type == ADDR_POLICY_ACCEPT) {
           /* If we already hit a clause that might trigger a 'reject', than we
@@ -911,7 +910,7 @@ exit_policy_is_general_exit_helper(smartlist_t *policy, int port)
   char subnet_status[256];
 
   memset(subnet_status, 0, sizeof(subnet_status));
-  SMARTLIST_FOREACH(policy, addr_policy_t *, p, {
+  SMARTLIST_FOREACH_BEGIN(policy, addr_policy_t *, p) {
     if (tor_addr_family(&p->addr) != AF_INET)
       continue; /* IPv4 only for now */
     if (p->prt_min > port || p->prt_max < port)
@@ -942,7 +941,7 @@ exit_policy_is_general_exit_helper(smartlist_t *policy, int port)
         subnet_status[i] = 1;
       }
     }
-  });
+  } SMARTLIST_FOREACH_END(p);
   return 0;
 }
 
@@ -1452,7 +1451,17 @@ compare_tor_addr_to_short_policy(const tor_addr_t *addr, uint16_t port,
   else
     accept = ! policy->is_accept;
 
-  /* ???? are these right? */
+  /* ???? are these right? -NM */
+  /* We should be sure not to return ADDR_POLICY_ACCEPTED in the accept
+   * case here, because it would cause clients to believe that the node
+   * allows exit enclaving. Trying it anyway would open up a cool attack
+   * where the node refuses due to exitpolicy, the client reacts in
+   * surprise by rewriting the node's exitpolicy to reject *:*, and then
+   * a bad guy targets users by causing them to attempt such connections
+   * to 98% of the exits.
+   *
+   * Once microdescriptors can handle addresses in special cases (e.g. if
+   * we ever solve ticket 1774), we can provide certainty here. -RD */
   if (accept)
     return ADDR_POLICY_PROBABLY_ACCEPTED;
   else

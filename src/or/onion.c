@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -29,9 +29,11 @@ typedef struct onion_queue_t {
 #define ONIONQUEUE_WAIT_CUTOFF 5
 
 /** First and last elements in the linked list of circuits waiting for CPU
- * workers, or NULL if the list is empty. */
+ * workers, or NULL if the list is empty.
+ * @{ */
 static onion_queue_t *ol_list=NULL;
 static onion_queue_t *ol_tail=NULL;
+/**@}*/
 /** Length of ol_list */
 static int ol_length=0;
 

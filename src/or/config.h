@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -22,6 +22,7 @@ const char *safe_str(const char *address);
 const char *escaped_safe_str_client(const char *address);
 const char *escaped_safe_str(const char *address);
 const char *get_version(void);
+const char *get_short_version(void);
 
 int config_get_lines(const char *string, config_line_t **result, int extended);
 void config_free_lines(config_line_t *front);
@@ -71,6 +72,8 @@ int get_first_advertised_port_by_type_af(int listener_type,
   (get_first_advertised_port_by_type_af(CONN_TYPE_OR_LISTENER, AF_INET))
 #define get_primary_dir_port() \
   (get_first_advertised_port_by_type_af(CONN_TYPE_DIR_LISTENER, AF_INET))
+
+char *get_first_listener_addrport_string(int listener_type);
 
 int options_need_geoip_info(const or_options_t *options,
                             const char **reason_out);

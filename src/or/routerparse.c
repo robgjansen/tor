@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -263,7 +263,7 @@ typedef struct token_rule_t {
 /* Argument multiplicity: exactly <b>n</b> arguments. */
 #define EQ(n)       n,n,0
 
-/** List of tokens allowable in router descriptors */
+/** List of tokens recognized in router descriptors */
 static token_rule_t routerdesc_token_table[] = {
   T0N("reject",              K_REJECT,              ARGS,    NO_OBJ ),
   T0N("accept",              K_ACCEPT,              ARGS,    NO_OBJ ),
@@ -296,7 +296,7 @@ static token_rule_t routerdesc_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowable in extra-info documents. */
+/** List of tokens recognized in extra-info documents. */
 static token_rule_t extrainfo_token_table[] = {
   T1_END( "router-signature",    K_ROUTER_SIGNATURE,    NO_ARGS, NEED_OBJ ),
   T1( "published",           K_PUBLISHED,       CONCAT_ARGS, NO_OBJ ),
@@ -333,7 +333,7 @@ static token_rule_t extrainfo_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowable in the body part of v2 and v3 networkstatus
+/** List of tokens recognized in the body part of v2 and v3 networkstatus
  * documents. */
 static token_rule_t rtrstatus_token_table[] = {
   T01("p",                   K_P,               CONCAT_ARGS, NO_OBJ ),
@@ -346,7 +346,7 @@ static token_rule_t rtrstatus_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowable in the header part of v2 networkstatus documents.
+/** List of tokens recognized in the header part of v2 networkstatus documents.
  */
 static token_rule_t netstatus_token_table[] = {
   T1( "published",           K_PUBLISHED,       CONCAT_ARGS, NO_OBJ ),
@@ -364,14 +364,14 @@ static token_rule_t netstatus_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowable in the footer of v1/v2 directory/networkstatus
+/** List of tokens recognized in the footer of v1/v2 directory/networkstatus
  * footers. */
 static token_rule_t dir_footer_token_table[] = {
   T1("directory-signature", K_DIRECTORY_SIGNATURE, EQ(1), NEED_OBJ ),
   END_OF_TABLE
 };
 
-/** List of tokens allowable in v1 directory headers/footers. */
+/** List of tokens recognized in v1 directory headers/footers. */
 static token_rule_t dir_token_table[] = {
   /* don't enforce counts; this is obsolete. */
   T( "network-status",      K_NETWORK_STATUS,      NO_ARGS, NO_OBJ ),
@@ -403,14 +403,14 @@ static token_rule_t dir_token_table[] = {
                                                      NO_ARGS,     NEED_OBJ), \
   T01("dir-address",     K_DIR_ADDRESS,              GE(1),       NO_OBJ),
 
-/** List of tokens allowable in V3 authority certificates. */
+/** List of tokens recognized in V3 authority certificates. */
 static token_rule_t dir_key_certificate_table[] = {
   CERTIFICATE_MEMBERS
   T1("fingerprint",      K_FINGERPRINT,              CONCAT_ARGS, NO_OBJ ),
   END_OF_TABLE
 };
 
-/** List of tokens allowable in rendezvous service descriptors */
+/** List of tokens recognized in rendezvous service descriptors */
 static token_rule_t desc_token_table[] = {
   T1_START("rendezvous-service-descriptor", R_RENDEZVOUS_SERVICE_DESCRIPTOR,
            EQ(1), NO_OBJ),
@@ -424,7 +424,7 @@ static token_rule_t desc_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowed in the (encrypted) list of introduction points of
+/** List of tokens recognized in the (encrypted) list of introduction points of
  * rendezvous service descriptors */
 static token_rule_t ipo_token_table[] = {
   T1_START("introduction-point", R_IPO_IDENTIFIER, EQ(1), NO_OBJ),
@@ -435,7 +435,7 @@ static token_rule_t ipo_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowed in the (possibly encrypted) list of introduction
+/** List of tokens recognized in the (possibly encrypted) list of introduction
  * points of rendezvous service descriptors */
 static token_rule_t client_keys_token_table[] = {
   T1_START("client-name", C_CLIENT_NAME, CONCAT_ARGS, NO_OBJ),
@@ -444,7 +444,7 @@ static token_rule_t client_keys_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowed in V3 networkstatus votes. */
+/** List of tokens recognized in V3 networkstatus votes. */
 static token_rule_t networkstatus_token_table[] = {
   T1_START("network-status-version", K_NETWORK_STATUS_VERSION,
                                                    GE(1),       NO_OBJ ),
@@ -472,7 +472,7 @@ static token_rule_t networkstatus_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowed in V3 networkstatus consensuses. */
+/** List of tokens recognized in V3 networkstatus consensuses. */
 static token_rule_t networkstatus_consensus_token_table[] = {
   T1_START("network-status-version", K_NETWORK_STATUS_VERSION,
                                                    GE(1),       NO_OBJ ),
@@ -498,7 +498,7 @@ static token_rule_t networkstatus_consensus_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowable in the footer of v1/v2 directory/networkstatus
+/** List of tokens recognized in the footer of v1/v2 directory/networkstatus
  * footers. */
 static token_rule_t networkstatus_vote_footer_token_table[] = {
   T01("directory-footer",    K_DIRECTORY_FOOTER,    NO_ARGS,   NO_OBJ ),
@@ -507,7 +507,7 @@ static token_rule_t networkstatus_vote_footer_token_table[] = {
   END_OF_TABLE
 };
 
-/** List of tokens allowable in detached networkstatus signature documents. */
+/** List of tokens recognized in detached networkstatus signature documents. */
 static token_rule_t networkstatus_detached_signature_token_table[] = {
   T1_START("consensus-digest", K_CONSENSUS_DIGEST, GE(1),       NO_OBJ ),
   T("additional-digest",       K_ADDITIONAL_DIGEST,GE(3),       NO_OBJ ),
@@ -519,6 +519,7 @@ static token_rule_t networkstatus_detached_signature_token_table[] = {
   END_OF_TABLE
 };
 
+/** List of tokens recognized in microdescriptors */
 static token_rule_t microdesc_token_table[] = {
   T1_START("onion-key",        K_ONION_KEY,        NO_ARGS,     NEED_KEY_1024),
   T01("family",                K_FAMILY,           ARGS,        NO_OBJ ),
@@ -682,12 +683,12 @@ router_get_networkstatus_v3_hash(const char *s, char *digest,
                               ' ', alg);
 }
 
-/** Set <b>digest</b> to the SHA-1 digest of the hash of the extrainfo
- * string in <b>s</b>.  Return 0 on success, -1 on failure. */
+/** Set <b>digest</b> to the SHA-1 digest of the hash of the <b>s_len</b>-byte
+ * extrainfo string at <b>s</b>.  Return 0 on success, -1 on failure. */
 int
-router_get_extrainfo_hash(const char *s, char *digest)
+router_get_extrainfo_hash(const char *s, size_t s_len, char *digest)
 {
-  return router_get_hash_impl(s, strlen(s), digest, "extra-info",
+  return router_get_hash_impl(s, s_len, digest, "extra-info",
                               "\nrouter-signature",'\n', DIGEST_SHA1);
 }
 
@@ -774,7 +775,7 @@ tor_version_is_obsolete(const char *myversion, const char *versionlist)
     goto done;
   }
 
-  SMARTLIST_FOREACH(version_sl, const char *, cp, {
+  SMARTLIST_FOREACH_BEGIN(version_sl, const char *, cp) {
     if (!strcmpstart(cp, "Tor "))
       cp += 4;
 
@@ -796,7 +797,7 @@ tor_version_is_obsolete(const char *myversion, const char *versionlist)
         found_older = 1;
       }
     }
-  });
+  } SMARTLIST_FOREACH_END(cp);
 
   /* We didn't find the listed version. Is it new or old? */
   if (found_any_in_series && !found_newer_in_series && found_newer) {
@@ -1262,7 +1263,7 @@ dump_distinct_digest_count(int severity)
  * s through end into the signed_descriptor_body of the resulting
  * routerinfo_t.
  *
- * If <b>end</b> is NULL, <b>s</b> must be properly NULL-terminated.
+ * If <b>end</b> is NULL, <b>s</b> must be properly NUL-terminated.
  *
  * If <b>allow_annotations</b>, it's okay to encounter annotations in <b>s</b>
  * before the router; if it's false, reject the router if it's annotated.  If
@@ -1643,7 +1644,7 @@ extrainfo_parse_entry_from_string(const char *s, const char *end,
   while (end > s+2 && *(end-1) == '\n' && *(end-2) == '\n')
     --end;
 
-  if (router_get_extrainfo_hash(s, digest) < 0) {
+  if (router_get_extrainfo_hash(s, end-s, digest) < 0) {
     log_warn(LD_DIR, "Couldn't compute router hash.");
     goto err;
   }
@@ -1835,7 +1836,7 @@ authority_cert_parse_from_string(const char *s, const char **end_of_string)
     struct in_addr in;
     char *address = NULL;
     tor_assert(tok->n_args);
-    /* XXX023 use some tor_addr parse function below instead. -RD */
+    /* XXX024 use some tor_addr parse function below instead. -RD */
     if (tor_addr_port_split(LOG_WARN, tok->args[0], &address,
                             &cert->dir_port) < 0 ||
         tor_inet_aton(address, &in) == 0) {
@@ -2821,6 +2822,7 @@ networkstatus_parse_vote_from_string(const char *s, const char **eos_out,
   int i, inorder, n_signatures = 0;
   memarea_t *area = NULL, *rs_area = NULL;
   consensus_flavor_t flav = FLAV_NS;
+  char *last_kwd=NULL;
 
   tor_assert(s);
 
@@ -2851,7 +2853,7 @@ networkstatus_parse_vote_from_string(const char *s, const char **eos_out,
     int flavor = networkstatus_parse_flavor_name(tok->args[1]);
     if (flavor < 0) {
       log_warn(LD_DIR, "Can't parse document with unknown flavor %s",
-               escaped(tok->args[2]));
+               escaped(tok->args[1]));
       goto err;
     }
     ns->flavor = flav = flavor;
@@ -2977,15 +2979,18 @@ networkstatus_parse_vote_from_string(const char *s, const char **eos_out,
 
   tok = find_opt_by_keyword(tokens, K_PARAMS);
   if (tok) {
+    int any_dups = 0;
     inorder = 1;
     ns->net_params = smartlist_new();
     for (i = 0; i < tok->n_args; ++i) {
       int ok=0;
       char *eq = strchr(tok->args[i], '=');
+      size_t eq_pos;
       if (!eq) {
         log_warn(LD_DIR, "Bad element '%s' in params", escaped(tok->args[i]));
         goto err;
       }
+      eq_pos = eq-tok->args[i];
       tor_parse_long(eq+1, 10, INT32_MIN, INT32_MAX, &ok, NULL);
       if (!ok) {
         log_warn(LD_DIR, "Bad element '%s' in params", escaped(tok->args[i]));
@@ -2995,10 +3000,22 @@ networkstatus_parse_vote_from_string(const char *s, const char **eos_out,
         log_warn(LD_DIR, "%s >= %s", tok->args[i-1], tok->args[i]);
         inorder = 0;
       }
+      if (last_kwd && eq_pos == strlen(last_kwd) &&
+          fast_memeq(last_kwd, tok->args[i], eq_pos)) {
+        log_warn(LD_DIR, "Duplicate value for %s parameter",
+                 escaped(tok->args[i]));
+        any_dups = 1;
+      }
+      tor_free(last_kwd);
+      last_kwd = tor_strndup(tok->args[i], eq_pos);
       smartlist_add(ns->net_params, tor_strdup(tok->args[i]));
     }
     if (!inorder) {
       log_warn(LD_DIR, "params not in order");
+      goto err;
+    }
+    if (any_dups) {
+      log_warn(LD_DIR, "Duplicate in parameters");
       goto err;
     }
   }
@@ -3339,6 +3356,7 @@ networkstatus_parse_vote_from_string(const char *s, const char **eos_out,
   }
   if (rs_area)
     memarea_drop_all(rs_area);
+  tor_free(last_kwd);
 
   return ns;
 }
@@ -4152,7 +4170,10 @@ _find_by_keyword(smartlist_t *s, directory_keyword keyword,
   return tok;
 }
 
-/** DOCDOC */
+/** If there are any directory_token_t entries in <b>s</b> whose keyword is
+ * <b>k</b>, return a newly allocated smartlist_t containing all such entries,
+ * in the same order in which they occur in <b>s</b>.  Otherwise return
+ * NULL. */
 static smartlist_t *
 find_all_by_keyword(smartlist_t *s, directory_keyword k)
 {
@@ -4180,6 +4201,13 @@ find_all_exitpolicy(smartlist_t *s)
   return out;
 }
 
+/** Helper function for <b>router_get_hash_impl</b>: given <b>s</b>,
+ * <b>s_len</b>, <b>start_str</b>, <b>end_str</b>, and <b>end_c</b> with the
+ * same semantics as in that function, set *<b>start_out</b> (inclusive) and
+ * *<b>end_out</b> (exclusive) to the boundaries of the string to be hashed.
+ *
+ * Return 0 on success and -1 on failure.
+ */
 static int
 router_get_hash_impl_helper(const char *s, size_t s_len,
                             const char *start_str,
@@ -4427,7 +4455,8 @@ microdescs_parse_from_string(const char *s, const char *eos,
 
 /** Return true iff this Tor version can answer directory questions
  * about microdescriptors. */
-int tor_version_supports_microdescriptors(const char *platform)
+int
+tor_version_supports_microdescriptors(const char *platform)
 {
   return tor_version_as_new_as(platform, "0.2.3.1-alpha");
 }
@@ -4886,7 +4915,7 @@ rend_decrypt_introduction_points(char **ipos_decrypted,
       if (tor_memeq(ipos_encrypted + pos, client_id,
                   REND_BASIC_AUTH_CLIENT_ID_LEN)) {
         /* Attempt to decrypt introduction points. */
-        cipher = crypto_create_init_cipher(descriptor_cookie, 0);
+        cipher = crypto_cipher_new(descriptor_cookie);
         if (crypto_cipher_decrypt(cipher, session_key, ipos_encrypted
                                   + pos + REND_BASIC_AUTH_CLIENT_ID_LEN,
                                   CIPHER_KEY_LEN) < 0) {
@@ -4895,13 +4924,13 @@ rend_decrypt_introduction_points(char **ipos_decrypted,
           return -1;
         }
         crypto_cipher_free(cipher);
-        cipher = crypto_create_init_cipher(session_key, 0);
+
         len = ipos_encrypted_size - 2 - client_entries_len - CIPHER_IV_LEN;
         dec = tor_malloc(len);
-        declen = crypto_cipher_decrypt_with_iv(cipher, dec, len,
+        declen = crypto_cipher_decrypt_with_iv(session_key, dec, len,
             ipos_encrypted + 2 + client_entries_len,
             ipos_encrypted_size - 2 - client_entries_len);
-        crypto_cipher_free(cipher);
+
         if (declen < 0) {
           log_warn(LD_REND, "Could not decrypt introduction point string.");
           tor_free(dec);
@@ -4922,7 +4951,6 @@ rend_decrypt_introduction_points(char **ipos_decrypted,
              "check your authorization for this service!");
     return -1;
   } else if (ipos_encrypted[0] == (int)REND_STEALTH_AUTH) {
-    crypto_cipher_t *cipher;
     char *dec;
     int declen;
     if (ipos_encrypted_size < CIPHER_IV_LEN + 2) {
@@ -4931,13 +4959,13 @@ rend_decrypt_introduction_points(char **ipos_decrypted,
       return -1;
     }
     dec = tor_malloc_zero(ipos_encrypted_size - CIPHER_IV_LEN - 1);
-    cipher = crypto_create_init_cipher(descriptor_cookie, 0);
-    declen = crypto_cipher_decrypt_with_iv(cipher, dec,
+
+    declen = crypto_cipher_decrypt_with_iv(descriptor_cookie, dec,
                                            ipos_encrypted_size -
                                                CIPHER_IV_LEN - 1,
                                            ipos_encrypted + 1,
                                            ipos_encrypted_size - 1);
-    crypto_cipher_free(cipher);
+
     if (declen < 0) {
       log_warn(LD_REND, "Decrypting introduction points failed!");
       tor_free(dec);
@@ -5107,7 +5135,6 @@ rend_parse_client_keys(strmap_t *parsed_clients, const char *ckstr)
   while (!strcmpstart(current_entry, "client-name ")) {
     rend_authorized_client_t *parsed_entry;
     size_t len;
-    char descriptor_cookie_base64[REND_DESC_COOKIE_LEN_BASE64+2+1];
     char descriptor_cookie_tmp[REND_DESC_COOKIE_LEN+2];
     /* Determine end of string. */
     const char *eos = strstr(current_entry, "\nclient-name ");
@@ -5172,11 +5199,11 @@ rend_parse_client_keys(strmap_t *parsed_clients, const char *ckstr)
     /* The size of descriptor_cookie_tmp needs to be REND_DESC_COOKIE_LEN+2,
      * because a base64 encoding of length 24 does not fit into 16 bytes in all
      * cases. */
-    if ((base64_decode(descriptor_cookie_tmp, REND_DESC_COOKIE_LEN+2,
-                       tok->args[0], REND_DESC_COOKIE_LEN_BASE64+2+1)
-           != REND_DESC_COOKIE_LEN)) {
+    if (base64_decode(descriptor_cookie_tmp, sizeof(descriptor_cookie_tmp),
+                      tok->args[0], strlen(tok->args[0]))
+        != REND_DESC_COOKIE_LEN) {
       log_warn(LD_REND, "Descriptor cookie contains illegal characters: "
-                        "%s", descriptor_cookie_base64);
+               "%s", escaped(tok->args[0]));
       goto err;
     }
     memcpy(parsed_entry->descriptor_cookie, descriptor_cookie_tmp,

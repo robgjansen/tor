@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -102,9 +102,11 @@ static time_unit_t cfg_unit = UNIT_MONTH;
 
 /** How many days,hours,minutes into each unit does our accounting interval
  * start? */
+/** @{ */
 static int cfg_start_day = 0,
            cfg_start_hour = 0,
            cfg_start_min = 0;
+/** @} */
 
 static void reset_accounting(time_t now);
 static int read_bandwidth_usage(void);

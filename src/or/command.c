@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -160,9 +160,11 @@ command_process_cell(cell_t *cell, or_connection_t *conn)
   if (handshaking && cell->command != CELL_VERSIONS &&
       cell->command != CELL_NETINFO) {
     log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
-           "Received unexpected cell command %d in state %s; ignoring it.",
+           "Received unexpected cell command %d in state %s; closing the "
+           "connection.",
            (int)cell->command,
            conn_state_to_string(CONN_TYPE_OR,conn->_base.state));
+    connection_mark_for_close(TO_CONN(conn));
     return;
   }
 
@@ -258,8 +260,15 @@ command_process_var_cell(var_cell_t *cell, or_connection_t *conn)
   switch (conn->_base.state)
   {
     case OR_CONN_STATE_OR_HANDSHAKING_V2:
-      if (cell->command != CELL_VERSIONS)
+      if (cell->command != CELL_VERSIONS) {
+        log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
+               "Received a cell with command %d in state %s; "
+               "closing the connection.",
+               (int)cell->command,
+               conn_state_to_string(CONN_TYPE_OR,conn->_base.state));
+        connection_mark_for_close(TO_CONN(conn));
         return;
+      }
       break;
     case OR_CONN_STATE_TLS_HANDSHAKING:
       /* If we're using bufferevents, it's entirely possible for us to
@@ -272,9 +281,10 @@ command_process_var_cell(var_cell_t *cell, or_connection_t *conn)
       if (! command_allowed_before_handshake(cell->command)) {
         log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
                "Received a cell with command %d in state %s; "
-               "ignoring it.",
+               "closing the connection.",
                (int)cell->command,
                conn_state_to_string(CONN_TYPE_OR,conn->_base.state));
+        connection_mark_for_close(TO_CONN(conn));
         return;
       } else {
         if (enter_v3_handshake_with_cell(cell, conn)<0)
@@ -591,13 +601,14 @@ command_process_destroy_cell(cell_t *cell, or_connection_t *conn)
   int reason;
 
   circ = circuit_get_by_circid_orconn(cell->circ_id, conn);
-  reason = (uint8_t)cell->payload[0];
   if (!circ) {
     log_info(LD_OR,"unknown circuit %d on connection from %s:%d. Dropping.",
              cell->circ_id, conn->_base.address, conn->_base.port);
     return;
   }
   log_debug(LD_OR,"Received for circID %d.",cell->circ_id);
+
+  reason = (uint8_t)cell->payload[0];
 
   if (!CIRCUIT_IS_ORIGIN(circ) &&
       cell->circ_id == TO_OR_CIRCUIT(circ)->p_circ_id) {
@@ -728,10 +739,9 @@ command_process_versions_cell(var_cell_t *cell, or_connection_t *conn)
     const int send_certs = !started_here || public_server_mode(get_options());
     /* If we're a relay that got a connection, ask for authentication. */
     const int send_chall = !started_here && public_server_mode(get_options());
-    /* If our certs cell will authenticate us, or if we have no intention of
-     * authenticating, send a netinfo cell right now. */
-    const int send_netinfo =
-      !(started_here && public_server_mode(get_options()));
+    /* If our certs cell will authenticate us, we can send a netinfo cell
+     * right now. */
+    const int send_netinfo = !started_here;
     const int send_any =
       send_versions || send_certs || send_chall || send_netinfo;
     tor_assert(conn->link_proto >= 3);
@@ -958,6 +968,7 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
 
   uint8_t *ptr;
   int n_certs, i;
+  int send_netinfo = 0;
 
   if (conn->_base.state != OR_CONN_STATE_OR_HANDSHAKING_V3)
     ERR("We're not doing a v3 handshake!");
@@ -1072,6 +1083,13 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
 
     conn->handshake_state->id_cert = id_cert;
     id_cert = NULL;
+
+    if (!public_server_mode(get_options())) {
+      /* If we initiated the connection and we are not a public server, we
+       * aren't planning to authenticate at all.  At this point we know who we
+       * are talking to, so we can just send a netinfo now. */
+      send_netinfo = 1;
+    }
   } else {
     if (! (id_cert && auth_cert))
       ERR("The certs we wanted were missing");
@@ -1093,6 +1111,15 @@ command_process_certs_cell(var_cell_t *cell, or_connection_t *conn)
   }
 
   conn->handshake_state->received_certs_cell = 1;
+
+  if (send_netinfo) {
+    if (connection_or_send_netinfo(conn) < 0) {
+      log_warn(LD_OR, "Couldn't send netinfo cell");
+      connection_mark_for_close(TO_CONN(conn));
+      goto err;
+    }
+  }
+
  err:
   tor_cert_free(id_cert);
   tor_cert_free(link_cert);

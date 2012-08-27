@@ -1,5 +1,5 @@
 /* Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -30,6 +30,7 @@
 #include "nodelist.h"
 #include "policies.h"
 #include "reasons.h"
+#include "rephist.h"
 #include "router.h"
 #include "routerlist.h"
 #include "routerparse.h"
@@ -110,6 +111,12 @@ static int authentication_cookie_is_set = 0;
  * read it off disk, it has permission to connect.) */
 static char authentication_cookie[AUTHENTICATION_COOKIE_LEN];
 
+#define SAFECOOKIE_SERVER_TO_CONTROLLER_CONSTANT \
+  "Tor safe cookie authentication server-to-controller hash"
+#define SAFECOOKIE_CONTROLLER_TO_SERVER_CONSTANT \
+  "Tor safe cookie authentication controller-to-server hash"
+#define SAFECOOKIE_SERVER_NONCE_LEN DIGEST256_LEN
+
 /** A sufficiently large size to record the last bootstrap phase string. */
 #define BOOTSTRAP_MSG_LEN 1024
 
@@ -129,6 +136,13 @@ typedef int event_format_t;
 static void connection_printf_to_buf(control_connection_t *conn,
                                      const char *format, ...)
   CHECK_PRINTF(2,3);
+static void send_control_event_impl(uint16_t event, event_format_t which,
+                                    const char *format, va_list ap)
+  CHECK_PRINTF(3,0);
+static int control_event_status(int type, int severity, const char *format,
+                                va_list args)
+  CHECK_PRINTF(3,0);
+
 static void send_control_done(control_connection_t *conn);
 static void send_control_event(uint16_t event, event_format_t which,
                                const char *format, ...)
@@ -806,8 +820,7 @@ handle_control_getconf(control_connection_t *conn, uint32_t body_len,
   (void) body_len; /* body is NUL-terminated; so we can ignore len. */
   smartlist_split_string(questions, body, " ",
                          SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
-  SMARTLIST_FOREACH(questions, const char *, q,
-  {
+  SMARTLIST_FOREACH_BEGIN(questions, const char *, q) {
     if (!option_is_recognized(q)) {
       smartlist_add(unrecognized, (char*) q);
     } else {
@@ -829,7 +842,7 @@ handle_control_getconf(control_connection_t *conn, uint32_t body_len,
         answer = next;
       }
     }
-  });
+  } SMARTLIST_FOREACH_END(q);
 
   if ((len = smartlist_len(unrecognized))) {
     for (i=0; i < len-1; ++i)
@@ -906,10 +919,13 @@ handle_control_loadconf(control_connection_t *conn, uint32_t len,
   return 0;
 }
 
+/** Helper structure: maps event values to their names. */
 struct control_event_t {
   uint16_t event_code;
   const char *event_name;
 };
+/** Table mapping event values to their names.  Used to implement SETEVENTS
+ * and GETINFO events/names, and to keep they in sync. */
 static const struct control_event_t control_event_table[] = {
   { EVENT_CIRCUIT_STATUS, "CIRC" },
   { EVENT_CIRCUIT_STATUS_MINOR, "CIRC_MINOR" },
@@ -1071,6 +1087,32 @@ handle_control_authenticate(control_connection_t *conn, uint32_t len,
       return 0;
     }
     used_quoted_string = 1;
+  }
+
+  if (conn->safecookie_client_hash != NULL) {
+    /* The controller has chosen safe cookie authentication; the only
+     * acceptable authentication value is the controller-to-server
+     * response. */
+
+    tor_assert(authentication_cookie_is_set);
+
+    if (password_len != DIGEST256_LEN) {
+      log_warn(LD_CONTROL,
+               "Got safe cookie authentication response with wrong length "
+               "(%d)", (int)password_len);
+      errstr = "Wrong length for safe cookie response.";
+      goto err;
+    }
+
+    if (tor_memneq(conn->safecookie_client_hash, password, DIGEST256_LEN)) {
+      log_warn(LD_CONTROL,
+               "Got incorrect safe cookie authentication response");
+      errstr = "Safe cookie response did not match expected value.";
+      goto err;
+    }
+
+    tor_free(conn->safecookie_client_hash);
+    goto ok;
   }
 
   if (!options->CookieAuthentication && !options->HashedControlPassword &&
@@ -1270,6 +1312,17 @@ handle_control_takeownership(control_connection_t *conn, uint32_t len,
   return 0;
 }
 
+/** Return true iff <b>addr</b> is unusable as a mapaddress target because of
+ * containing funny characters. */
+static int
+address_is_invalid_mapaddress_target(const char *addr)
+{
+  if (!strcmpstart(addr, "*."))
+    return address_is_invalid_destination(addr+2, 1);
+  else
+    return address_is_invalid_destination(addr, 1);
+}
+
 /** Called when we get a MAPADDRESS command; try to bind all listed addresses,
  * and report success or failure. */
 static int
@@ -1288,14 +1341,13 @@ handle_control_mapaddress(control_connection_t *conn, uint32_t len,
   reply = smartlist_new();
   smartlist_split_string(lines, body, " ",
                          SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
-  SMARTLIST_FOREACH(lines, char *, line,
-  {
+  SMARTLIST_FOREACH_BEGIN(lines, char *, line) {
     tor_strlower(line);
     smartlist_split_string(elts, line, "=", 0, 2);
     if (smartlist_len(elts) == 2) {
       const char *from = smartlist_get(elts,0);
       const char *to = smartlist_get(elts,1);
-      if (address_is_invalid_destination(to, 1)) {
+      if (address_is_invalid_mapaddress_target(to)) {
         smartlist_add_asprintf(reply,
                      "512-syntax error: invalid address '%s'", to);
         log_warn(LD_CONTROL,
@@ -1327,7 +1379,7 @@ handle_control_mapaddress(control_connection_t *conn, uint32_t len,
     }
     SMARTLIST_FOREACH(elts, char *, cp, tor_free(cp));
     smartlist_clear(elts);
-  });
+  } SMARTLIST_FOREACH_END(line);
   SMARTLIST_FOREACH(lines, char *, cp, tor_free(cp));
   smartlist_free(lines);
   smartlist_free(elts);
@@ -1365,6 +1417,9 @@ getinfo_helper_misc(control_connection_t *conn, const char *question,
     *answer = options_dump(get_options(), 1);
   } else if (!strcmp(question, "info/names")) {
     *answer = list_getinfo_options();
+  } else if (!strcmp(question, "dormant")) {
+    int dormant = rep_hist_circbuilding_dormant(time(NULL));
+    *answer = tor_strdup(dormant ? "1" : "0");
   } else if (!strcmp(question, "events/names")) {
     int i;
     smartlist_t *event_names = smartlist_new();
@@ -1420,26 +1475,9 @@ getinfo_helper_misc(control_connection_t *conn, const char *question,
       }
     #endif
   } else if (!strcmp(question, "process/descriptor-limit")) {
-    /** platform specifc limits are from the set_max_file_descriptors function
-      * of src/common/compat.c */
-    /* XXXX023 This is duplicated code from compat.c; it should turn into a
-     * function.  */
-    #ifdef HAVE_GETRLIMIT
-      struct rlimit descriptorLimit;
-
-      if (getrlimit(RLIMIT_NOFILE, &descriptorLimit) == 0) {
-        tor_asprintf(answer, U64_FORMAT,
-                     U64_PRINTF_ARG(descriptorLimit.rlim_max));
-      } else {
-        *answer = tor_strdup("-1");
-      }
-    #elif defined(CYGWIN) || defined(__CYGWIN__)
-      *answer = tor_strdup("3200");
-    #elif defined(_WIN32)
-      *answer = tor_strdup("15000");
-    #else
-      *answer = tor_strdup("15000");
-    #endif
+    int max_fds=-1;
+    set_max_file_descriptors(0, &max_fds);
+    tor_asprintf(answer, "%d", max_fds);
   } else if (!strcmp(question, "dir-usage")) {
     *answer = directory_dump_request_log();
   } else if (!strcmp(question, "fingerprint")) {
@@ -1605,8 +1643,7 @@ getinfo_helper_dir(control_connection_t *control_conn,
     routerlist_t *routerlist = router_get_routerlist();
     smartlist_t *sl = smartlist_new();
     if (routerlist && routerlist->routers) {
-      SMARTLIST_FOREACH(routerlist->routers, const routerinfo_t *, ri,
-      {
+      SMARTLIST_FOREACH_BEGIN(routerlist->routers, const routerinfo_t *, ri) {
         const char *body = signed_descriptor_get_body(&ri->cache_info);
         signed_descriptor_t *ei = extrainfo_get_by_descriptor_digest(
                                      ri->cache_info.extra_info_digest);
@@ -1617,7 +1654,7 @@ getinfo_helper_dir(control_connection_t *control_conn,
           smartlist_add(sl,
                   tor_strndup(body, ri->cache_info.signed_descriptor_len));
         }
-      });
+      } SMARTLIST_FOREACH_END(ri);
     }
     *answer = smartlist_join_strings(sl, "", 0, NULL);
     SMARTLIST_FOREACH(sl, char *, c, tor_free(c));
@@ -2106,12 +2143,13 @@ static const getinfo_item_t getinfo_items[] = {
          "Brief summary of router status by nickname (v2 directory format)."),
   PREFIX("ns/purpose/", networkstatus,
          "Brief summary of router status by purpose (v2 directory format)."),
-
   ITEM("network-status", dir,
        "Brief summary of router status (v1 directory format)"),
   ITEM("circuit-status", events, "List of current circuits originating here."),
   ITEM("stream-status", events,"List of current streams."),
   ITEM("orconn-status", events, "A list of current OR connections."),
+  ITEM("dormant", misc,
+       "Is Tor dormant (not building circuits because it's idle)?"),
   PREFIX("address-mappings/", events, NULL),
   DOC("address-mappings/all", "Current address mappings."),
   DOC("address-mappings/cache", "Current cached DNS replies."),
@@ -2410,8 +2448,7 @@ handle_control_extendcircuit(control_connection_t *conn, uint32_t len,
   smartlist_free(args);
 
   nodes = smartlist_new();
-  SMARTLIST_FOREACH(router_nicknames, const char *, n,
-  {
+  SMARTLIST_FOREACH_BEGIN(router_nicknames, const char *, n) {
     const node_t *node = node_get_by_nickname(n, 1);
     if (!node) {
       connection_printf_to_buf(conn, "552 No such router \"%s\"\r\n", n);
@@ -2422,7 +2459,7 @@ handle_control_extendcircuit(control_connection_t *conn, uint32_t len,
       goto done;
     }
     smartlist_add(nodes, (void*)node);
-  });
+  } SMARTLIST_FOREACH_END(n);
   if (!smartlist_len(nodes)) {
     connection_write_str_to_buf("512 No router names provided\r\n", conn);
     goto done;
@@ -2498,6 +2535,10 @@ handle_control_setcircuitpurpose(control_connection_t *conn,
 
   {
     const char *purp = find_element_starting_with(args,1,"PURPOSE=");
+    if (!purp) {
+      connection_write_str_to_buf("552 No purpose given\r\n", conn);
+      goto done;
+    }
     new_purpose = circuit_purpose_from_string(purp);
     if (new_purpose == CIRCUIT_PURPOSE_UNKNOWN) {
       connection_printf_to_buf(conn, "552 Unknown purpose \"%s\"\r\n", purp);
@@ -2642,8 +2683,7 @@ handle_control_postdescriptor(control_connection_t *conn, uint32_t len,
 
   smartlist_split_string(args, body, " ",
                          SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
-  SMARTLIST_FOREACH(args, char *, option,
-  {
+  SMARTLIST_FOREACH_BEGIN(args, char *, option) {
     if (!strcasecmpstart(option, "purpose=")) {
       option += strlen("purpose=");
       purpose = router_purpose_from_string(option);
@@ -2668,7 +2708,7 @@ handle_control_postdescriptor(control_connection_t *conn, uint32_t len,
         "512 Unexpected argument \"%s\" to postdescriptor\r\n", option);
       goto done;
     }
-  });
+  } SMARTLIST_FOREACH_END(option);
 
   read_escaped_data(cp, len-(cp-body), &desc);
 
@@ -2904,8 +2944,10 @@ handle_control_protocolinfo(control_connection_t *conn, uint32_t len,
       int passwd = (options->HashedControlPassword != NULL ||
                     options->HashedControlSessionPassword != NULL);
       smartlist_t *mlist = smartlist_new();
-      if (cookies)
+      if (cookies) {
         smartlist_add(mlist, (char*)"COOKIE");
+        smartlist_add(mlist, (char*)"SAFECOOKIE");
+      }
       if (passwd)
         smartlist_add(mlist, (char*)"HASHEDPASSWORD");
       if (!cookies && !passwd)
@@ -2934,6 +2976,123 @@ handle_control_protocolinfo(control_connection_t *conn, uint32_t len,
   return 0;
 }
 
+/** Called when we get an AUTHCHALLENGE command. */
+static int
+handle_control_authchallenge(control_connection_t *conn, uint32_t len,
+                             const char *body)
+{
+  const char *cp = body;
+  char *client_nonce;
+  size_t client_nonce_len;
+  char server_hash[DIGEST256_LEN];
+  char server_hash_encoded[HEX_DIGEST256_LEN+1];
+  char server_nonce[SAFECOOKIE_SERVER_NONCE_LEN];
+  char server_nonce_encoded[(2*SAFECOOKIE_SERVER_NONCE_LEN) + 1];
+
+  cp += strspn(cp, " \t\n\r");
+  if (!strcasecmpstart(cp, "SAFECOOKIE")) {
+    cp += strlen("SAFECOOKIE");
+  } else {
+    connection_write_str_to_buf("513 AUTHCHALLENGE only supports SAFECOOKIE "
+                                "authentication\r\n", conn);
+    connection_mark_for_close(TO_CONN(conn));
+    return -1;
+  }
+
+  if (!authentication_cookie_is_set) {
+    connection_write_str_to_buf("515 Cookie authentication is disabled\r\n",
+                                conn);
+    connection_mark_for_close(TO_CONN(conn));
+    return -1;
+  }
+
+  cp += strspn(cp, " \t\n\r");
+  if (*cp == '"') {
+    const char *newcp =
+      decode_escaped_string(cp, len - (cp - body),
+                            &client_nonce, &client_nonce_len);
+    if (newcp == NULL) {
+      connection_write_str_to_buf("513 Invalid quoted client nonce\r\n",
+                                  conn);
+      connection_mark_for_close(TO_CONN(conn));
+      return -1;
+    }
+    cp = newcp;
+  } else {
+    size_t client_nonce_encoded_len = strspn(cp, "0123456789ABCDEFabcdef");
+
+    client_nonce_len = client_nonce_encoded_len / 2;
+    client_nonce = tor_malloc_zero(client_nonce_len);
+
+    if (base16_decode(client_nonce, client_nonce_len,
+                      cp, client_nonce_encoded_len) < 0) {
+      connection_write_str_to_buf("513 Invalid base16 client nonce\r\n",
+                                  conn);
+      connection_mark_for_close(TO_CONN(conn));
+      tor_free(client_nonce);
+      return -1;
+    }
+
+    cp += client_nonce_encoded_len;
+  }
+
+  cp += strspn(cp, " \t\n\r");
+  if (*cp != '\0' ||
+      cp != body + len) {
+    connection_write_str_to_buf("513 Junk at end of AUTHCHALLENGE command\r\n",
+                                conn);
+    connection_mark_for_close(TO_CONN(conn));
+    tor_free(client_nonce);
+    return -1;
+  }
+
+  tor_assert(!crypto_rand(server_nonce, SAFECOOKIE_SERVER_NONCE_LEN));
+
+  /* Now compute and send the server-to-controller response, and the
+   * server's nonce. */
+  tor_assert(authentication_cookie != NULL);
+
+  {
+    size_t tmp_len = (AUTHENTICATION_COOKIE_LEN +
+                      client_nonce_len +
+                      SAFECOOKIE_SERVER_NONCE_LEN);
+    char *tmp = tor_malloc_zero(tmp_len);
+    char *client_hash = tor_malloc_zero(DIGEST256_LEN);
+    memcpy(tmp, authentication_cookie, AUTHENTICATION_COOKIE_LEN);
+    memcpy(tmp + AUTHENTICATION_COOKIE_LEN, client_nonce, client_nonce_len);
+    memcpy(tmp + AUTHENTICATION_COOKIE_LEN + client_nonce_len,
+           server_nonce, SAFECOOKIE_SERVER_NONCE_LEN);
+
+    crypto_hmac_sha256(server_hash,
+                       SAFECOOKIE_SERVER_TO_CONTROLLER_CONSTANT,
+                       strlen(SAFECOOKIE_SERVER_TO_CONTROLLER_CONSTANT),
+                       tmp,
+                       tmp_len);
+
+    crypto_hmac_sha256(client_hash,
+                       SAFECOOKIE_CONTROLLER_TO_SERVER_CONSTANT,
+                       strlen(SAFECOOKIE_CONTROLLER_TO_SERVER_CONSTANT),
+                       tmp,
+                       tmp_len);
+
+    conn->safecookie_client_hash = client_hash;
+
+    tor_free(tmp);
+  }
+
+  base16_encode(server_hash_encoded, sizeof(server_hash_encoded),
+                server_hash, sizeof(server_hash));
+  base16_encode(server_nonce_encoded, sizeof(server_nonce_encoded),
+                server_nonce, sizeof(server_nonce));
+
+  connection_printf_to_buf(conn,
+                           "250 AUTHCHALLENGE SERVERHASH=%s "
+                           "SERVERNONCE=%s\r\n",
+                           server_hash_encoded,
+                           server_nonce_encoded);
+  return 0;
+}
+
 /** Called when we get a USEFEATURE command: parse the feature list, and
  * set up the control_connection's options properly. */
 static int
@@ -2947,7 +3106,7 @@ handle_control_usefeature(control_connection_t *conn,
   args = smartlist_new();
   smartlist_split_string(args, body, " ",
                          SPLIT_SKIP_SPACE|SPLIT_IGNORE_BLANK, 0);
-  SMARTLIST_FOREACH(args, const char *, arg, {
+  SMARTLIST_FOREACH_BEGIN(args, const char *, arg) {
       if (!strcasecmp(arg, "VERBOSE_NAMES"))
         ;
       else if (!strcasecmp(arg, "EXTENDED_EVENTS"))
@@ -2958,7 +3117,7 @@ handle_control_usefeature(control_connection_t *conn,
         bad = 1;
         break;
       }
-    });
+  } SMARTLIST_FOREACH_END(arg);
 
   if (!bad) {
     send_control_done(conn);
@@ -3033,7 +3192,10 @@ is_valid_initial_command(control_connection_t *conn, const char *cmd)
   if (conn->_base.state == CONTROL_CONN_STATE_OPEN)
     return 1;
   if (!strcasecmp(cmd, "PROTOCOLINFO"))
-    return !conn->have_sent_protocolinfo;
+    return (!conn->have_sent_protocolinfo &&
+            conn->safecookie_client_hash == NULL);
+  if (!strcasecmp(cmd, "AUTHCHALLENGE"))
+    return (conn->safecookie_client_hash == NULL);
   if (!strcasecmp(cmd, "AUTHENTICATE") ||
       !strcasecmp(cmd, "QUIT"))
     return 1;
@@ -3045,6 +3207,10 @@ is_valid_initial_command(control_connection_t *conn, const char *cmd)
  * interfaces is broken. */
 #define MAX_COMMAND_LINE_LENGTH (1024*1024)
 
+/** Wrapper around peek_(evbuffer|buf)_has_control0 command: presents the same
+ * interface as those underlying functions, but takes a connection_t intead of
+ * an evbuffer or a buf_t.
+ */
 static int
 peek_connection_has_control0_command(connection_t *conn)
 {
@@ -3257,6 +3423,9 @@ connection_control_process_inbuf(control_connection_t *conn)
       return -1;
   } else if (!strcasecmp(conn->incoming_cmd, "PROTOCOLINFO")) {
     if (handle_control_protocolinfo(conn, cmd_data_len, args))
+      return -1;
+  } else if (!strcasecmp(conn->incoming_cmd, "AUTHCHALLENGE")) {
+    if (handle_control_authchallenge(conn, cmd_data_len, args))
       return -1;
   } else {
     connection_printf_to_buf(conn, "510 Unrecognized command \"%s\"\r\n",
@@ -3929,10 +4098,12 @@ control_event_buildtimeout_set(const circuit_build_times_t *cbt,
                         buildtimeout_set_event_t type)
 {
   const char *type_string = NULL;
-  double qnt = circuit_build_times_quantile_cutoff();
+  double qnt;
 
   if (!control_event_is_interesting(EVENT_BUILDTIMEOUT_SET))
     return 0;
+
+  qnt = circuit_build_times_quantile_cutoff();
 
   switch (type) {
     case BUILDTIMEOUT_SET_EVENT_COMPUTED:
@@ -4042,6 +4213,7 @@ control_event_my_descriptor_changed(void)
 static int
 control_event_status(int type, int severity, const char *format, va_list args)
 {
+  char *user_buf = NULL;
   char format_buf[160];
   const char *status, *sev;
 
@@ -4073,13 +4245,15 @@ control_event_status(int type, int severity, const char *format, va_list args)
       log_warn(LD_BUG, "Unrecognized status severity %d", severity);
       return -1;
   }
-  if (tor_snprintf(format_buf, sizeof(format_buf), "650 %s %s %s\r\n",
-                   status, sev, format)<0) {
+  if (tor_snprintf(format_buf, sizeof(format_buf), "650 %s %s",
+                   status, sev)<0) {
     log_warn(LD_BUG, "Format string too long.");
     return -1;
   }
+  tor_vasprintf(&user_buf, format, args);
 
-  send_control_event_impl(type, ALL_FORMATS, format_buf, args);
+  send_control_event(type, ALL_FORMATS, "%s %s\r\n", format_buf, user_buf);
+  tor_free(user_buf);
   return 0;
 }
 

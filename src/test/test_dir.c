@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "orconfig.h"
@@ -305,7 +305,7 @@ test_dir_versions(void)
 
 #define tt_versionstatus_op(vs1, op, vs2)                               \
   tt_assert_test_type(vs1,vs2,#vs1" "#op" "#vs2,version_status_t,       \
-                      (_val1 op _val2),"%d",TT_EXIT_TEST_FUNCTION)
+                      (val1_ op val2_),"%d",TT_EXIT_TEST_FUNCTION)
 #define test_v_i_o(val, ver, lst)                                       \
   tt_versionstatus_op(val, ==, tor_version_is_obsolete(ver, lst))
 

@@ -1,6 +1,6 @@
 /* Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /* Ordinarily defined in tor_main.c; this bit is just here to provide one
@@ -71,6 +71,9 @@ int have_failed = 0;
 /** Temporary directory (set up by setup_directory) under which we store all
  * our files during testing. */
 static char temp_dir[256];
+#ifdef _WIN32
+#define pid_t int
+#endif
 static pid_t temp_dir_setup_in_pid = 0;
 
 /** Select and create the temporary directory we'll use to run our unit tests.
@@ -88,7 +91,7 @@ setup_directory(void)
     char buf[MAX_PATH];
     const char *tmp = buf;
     /* If this fails, we're probably screwed anyway */
-    if (!GetTempPath(sizeof(buf),buf))
+    if (!GetTempPathA(sizeof(buf),buf))
       tmp = "c:\\windows\\temp";
     tor_snprintf(temp_dir, sizeof(temp_dir),
                  "%s\\tor_test_%d", tmp, (int)getpid());
@@ -128,8 +131,7 @@ rm_rf(const char *dir)
 
   elements = tor_listdir(dir);
   if (elements) {
-    SMARTLIST_FOREACH(elements, const char *, cp,
-       {
+    SMARTLIST_FOREACH_BEGIN(elements, const char *, cp) {
          char *tmp = NULL;
          tor_asprintf(&tmp, "%s"PATH_SEPARATOR"%s", dir, cp);
          if (0 == stat(tmp,&st) && (st.st_mode & S_IFDIR)) {
@@ -140,7 +142,7 @@ rm_rf(const char *dir)
            }
          }
          tor_free(tmp);
-       });
+    } SMARTLIST_FOREACH_END(cp);
     SMARTLIST_FOREACH(elements, char *, cp, tor_free(cp));
     smartlist_free(elements);
   }
@@ -1287,10 +1289,10 @@ test_rend_fns(void)
   char address3[] = "fooaddress.exit";
   char address4[] = "www.torproject.org";
 
-  test_assert(BAD_HOSTNAME == parse_extended_hostname(address1, 1));
-  test_assert(ONION_HOSTNAME == parse_extended_hostname(address2, 1));
-  test_assert(EXIT_HOSTNAME == parse_extended_hostname(address3, 1));
-  test_assert(NORMAL_HOSTNAME == parse_extended_hostname(address4, 1));
+  test_assert(BAD_HOSTNAME == parse_extended_hostname(address1));
+  test_assert(ONION_HOSTNAME == parse_extended_hostname(address2));
+  test_assert(EXIT_HOSTNAME == parse_extended_hostname(address3));
+  test_assert(NORMAL_HOSTNAME == parse_extended_hostname(address4));
 
   pk1 = pk_generate(0);
   pk2 = pk_generate(1);
@@ -1452,6 +1454,7 @@ test_geoip(void)
   *entry_stats_2 =
       "entry-stats-end 2010-08-12 13:27:30 (86400 s)\n"
       "entry-ips \n";
+  tor_addr_t addr;
 
   /* Populate the DB a bit.  Add these in order, since we can't do the final
    * 'sort' step.  These aren't very good IP addresses, but they're perfectly
@@ -1480,16 +1483,23 @@ test_geoip(void)
   get_options_mutable()->BridgeRelay = 1;
   get_options_mutable()->BridgeRecordUsageByCountry = 1;
   /* Put 9 observations in AB... */
-  for (i=32; i < 40; ++i)
-    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, i, now-7200);
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 225, now-7200);
+  for (i=32; i < 40; ++i) {
+    tor_addr_from_ipv4h(&addr, (uint32_t) i);
+    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now-7200);
+  }
+  tor_addr_from_ipv4h(&addr, (uint32_t) 225);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now-7200);
   /* and 3 observations in XY, several times. */
   for (j=0; j < 10; ++j)
-    for (i=52; i < 55; ++i)
-      geoip_note_client_seen(GEOIP_CLIENT_CONNECT, i, now-3600);
+    for (i=52; i < 55; ++i) {
+      tor_addr_from_ipv4h(&addr, (uint32_t) i);
+      geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now-3600);
+    }
   /* and 17 observations in ZZ... */
-  for (i=110; i < 127; ++i)
-    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, i, now);
+  for (i=110; i < 127; ++i) {
+    tor_addr_from_ipv4h(&addr, (uint32_t) i);
+    geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
+  }
   s = geoip_get_client_history(GEOIP_CLIENT_CONNECT);
   test_assert(s);
   test_streq("zz=24,ab=16,xy=8", s);
@@ -1528,14 +1538,16 @@ test_geoip(void)
 
   /* Start testing dirreq statistics by making sure that we don't collect
    * dirreq stats without initializing them. */
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_assert(!s);
 
   /* Initialize stats, note one connecting client, and generate the
    * dirreq-stats history string. */
   geoip_dirreq_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_streq(dirreq_stats_1, s);
   tor_free(s);
@@ -1543,14 +1555,16 @@ test_geoip(void)
   /* Stop collecting stats, add another connecting client, and ensure we
    * don't generate a history string. */
   geoip_dirreq_stats_term();
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 101, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 101);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_assert(!s);
 
   /* Re-start stats, add a connecting client, reset stats, and make sure
    * that we get an all empty history string. */
   geoip_dirreq_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_NETWORKSTATUS, &addr, now);
   geoip_reset_dirreq_stats(now);
   s = geoip_format_dirreq_stats(now + 86400);
   test_streq(dirreq_stats_2, s);
@@ -1577,14 +1591,16 @@ test_geoip(void)
 
   /* Start testing entry statistics by making sure that we don't collect
    * anything without initializing entry stats. */
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   s = geoip_format_entry_stats(now + 86400);
   test_assert(!s);
 
   /* Initialize stats, note one connecting client, and generate the
    * entry-stats history string. */
   geoip_entry_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   s = geoip_format_entry_stats(now + 86400);
   test_streq(entry_stats_1, s);
   tor_free(s);
@@ -1592,14 +1608,16 @@ test_geoip(void)
   /* Stop collecting stats, add another connecting client, and ensure we
    * don't generate a history string. */
   geoip_entry_stats_term();
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 101, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 101);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   s = geoip_format_entry_stats(now + 86400);
   test_assert(!s);
 
   /* Re-start stats, add a connecting client, reset stats, and make sure
    * that we get an all empty history string. */
   geoip_entry_stats_init(now);
-  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, 100, now);
+  tor_addr_from_ipv4h(&addr, (uint32_t) 100);
+  geoip_note_client_seen(GEOIP_CLIENT_CONNECT, &addr, now);
   geoip_reset_entry_stats(now);
   s = geoip_format_entry_stats(now + 86400);
   test_streq(entry_stats_2, s);

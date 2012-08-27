@@ -1,3 +1,5 @@
+/* Copyright (c) 2011-2012, The Tor Project, Inc. */
+/* See LICENSE for licensing information */
 
 /**
  * \file procmon.c
@@ -41,6 +43,7 @@ static void tor_process_monitor_poll_cb(evutil_socket_t unused1, short unused2,
 /* This struct may contain pointers into the original process
  * specifier string, but it should *never* contain anything which
  * needs to be freed. */
+/* DOCDOC parsed_process_specifier_t */
 struct parsed_process_specifier_t {
   pid_t pid;
 };
@@ -81,6 +84,7 @@ parse_process_specifier(const char *process_spec,
   return -1;
 }
 
+/* DOCDOC tor_process_monitor_t */
 struct tor_process_monitor_t {
   /** Log domain for warning messages. */
   log_domain_mask_t log_domain;
@@ -152,6 +156,7 @@ tor_validate_process_specifier(const char *process_spec,
 #define PERIODIC_TIMER_FLAGS (0)
 #endif
 
+/* DOCDOC poll_interval_tv */
 static struct timeval poll_interval_tv = {15, 0};
 /* Note: If you port this file to plain Libevent 2, you can make
  * poll_interval_tv const.  It has to be non-const here because in

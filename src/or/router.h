@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -53,6 +53,7 @@ int authdir_mode_publishes_statuses(const or_options_t *options);
 int authdir_mode_tests_reachability(const or_options_t *options);
 int authdir_mode_bridge(const or_options_t *options);
 
+uint16_t router_get_active_listener_port_by_type(int listener_type);
 uint16_t router_get_advertised_or_port(const or_options_t *options);
 uint16_t router_get_advertised_dir_port(const or_options_t *options,
                                         uint16_t dirport);

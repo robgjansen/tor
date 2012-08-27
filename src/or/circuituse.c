@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -746,6 +746,7 @@ circuit_predict_and_launch_new(void)
    * want, don't do another -- we want to leave a few slots open so
    * we can still build circuits preemptively as needed. */
   if (num < MAX_UNUSED_OPEN_CIRCUITS-2 &&
+      get_options()->LearnCircuitBuildTimeout &&
       circuit_build_times_needs_circuits_now(&circ_times)) {
     flags = CIRCLAUNCH_NEED_CAPACITY;
     log_info(LD_CIRC,
@@ -881,7 +882,8 @@ circuit_expire_old_circuits_clientside(void)
   tor_gettimeofday(&now);
   cutoff = now;
 
-  if (circuit_build_times_needs_circuits(&circ_times)) {
+  if (get_options()->LearnCircuitBuildTimeout &&
+      circuit_build_times_needs_circuits(&circ_times)) {
     /* Circuits should be shorter lived if we need more of them
      * for learning a good build timeout */
     cutoff.tv_sec -= IDLE_TIMEOUT_WHILE_LEARNING;
@@ -1412,7 +1414,13 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
   need_uptime = !conn->want_onehop && !conn->use_begindir &&
                 smartlist_string_num_isin(options->LongLivedPorts,
                                           conn->socks_request->port);
-  need_internal = desired_circuit_purpose != CIRCUIT_PURPOSE_C_GENERAL;
+
+  if (desired_circuit_purpose != CIRCUIT_PURPOSE_C_GENERAL)
+    need_internal = 1;
+  else if (conn->use_begindir || conn->want_onehop)
+    need_internal = 1;
+  else
+    need_internal = 0;
 
   circ = circuit_get_best(conn, 1, desired_circuit_purpose,
                           need_uptime, need_internal);
@@ -1467,7 +1475,7 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
         return -1;
       }
     } else {
-      /* XXXX023 Duplicates checks in connection_ap_handshake_attach_circuit:
+      /* XXXX024 Duplicates checks in connection_ap_handshake_attach_circuit:
        * refactor into a single function? */
       const node_t *node = node_get_by_nickname(conn->chosen_exit_name, 1);
       int opt = conn->chosen_exit_optional;
@@ -1908,7 +1916,7 @@ connection_ap_handshake_attach_circuit(entry_connection_t *conn)
     /* find the circuit that we should use, if there is one. */
     retval = circuit_get_open_circ_or_launch(
         conn, CIRCUIT_PURPOSE_C_GENERAL, &circ);
-    if (retval < 1) // XXX022 if we totally fail, this still returns 0 -RD
+    if (retval < 1) // XXX023 if we totally fail, this still returns 0 -RD
       return retval;
 
     log_debug(LD_APP|LD_CIRC,

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, The Tor Project, Inc. */
+/* Copyright (c) 2011-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -91,13 +91,8 @@
 #include "util.h"
 #include "router.h"
 
-#ifdef _WIN32
-static void set_managed_proxy_environment(LPVOID *envp,
-                                          const managed_proxy_t *mp);
-#else
-static int set_managed_proxy_environment(char ***envp,
-                                         const managed_proxy_t *mp);
-#endif
+static process_environment_t *
+create_managed_proxy_environment(const managed_proxy_t *mp);
 
 static INLINE int proxy_configuration_finished(const managed_proxy_t *mp);
 
@@ -124,13 +119,9 @@ static INLINE void free_execve_args(char **arg);
 #define PROTO_CMETHODS_DONE "CMETHODS DONE"
 #define PROTO_SMETHODS_DONE "SMETHODS DONE"
 
-/* The smallest valid managed proxy protocol line that can
-   appear. It's the size of "VERSION 1" */
-#define SMALLEST_MANAGED_LINE_SIZE 9
-
 /** Number of environment variables for managed proxy clients/servers. */
-#define ENVIRON_SIZE_CLIENT 5
-#define ENVIRON_SIZE_SERVER 8
+#define ENVIRON_SIZE_CLIENT 3
+#define ENVIRON_SIZE_SERVER 7 /* XXX known to be too high, but that's ok */
 
 /** The first and only supported - at the moment - configuration
     protocol version. */
@@ -140,12 +131,35 @@ static INLINE void free_execve_args(char **arg);
 static smartlist_t *managed_proxy_list = NULL;
 /** Number of still unconfigured proxies. */
 static int unconfigured_proxies_n = 0;
+/** Boolean: True iff we might need to restart some proxies. */
+static int check_if_restarts_needed = 0;
 
-/** Return true if there are still unconfigured managed proxies. */
+/** Return true if there are still unconfigured managed proxies, or proxies
+ * that need restarting. */
 int
 pt_proxies_configuration_pending(void)
 {
-  return !! unconfigured_proxies_n;
+  return unconfigured_proxies_n || check_if_restarts_needed;
+}
+
+/** Assert that the unconfigured_proxies_n value correctly matches the number
+ * of proxies in a state other than PT_PROTO_COMPLETE. */
+static void
+assert_unconfigured_count_ok(void)
+{
+  int n_completed = 0;
+  if (!managed_proxy_list) {
+    tor_assert(unconfigured_proxies_n == 0);
+    return;
+  }
+
+  SMARTLIST_FOREACH(managed_proxy_list, managed_proxy_t *, mp, {
+      if (mp->conf_state == PT_PROTO_COMPLETED)
+        ++n_completed;
+  });
+
+  tor_assert(n_completed + unconfigured_proxies_n ==
+             smartlist_len(managed_proxy_list));
 }
 
 /** Return true if <b>mp</b> has the same argv as <b>proxy_argv</b> */
@@ -255,6 +269,7 @@ proxy_prepare_for_restart(managed_proxy_t *mp)
 
   /* flag it as an infant proxy so that it gets launched on next tick */
   mp->conf_state = PT_PROTO_INFANT;
+  unconfigured_proxies_n++;
 }
 
 /** Launch managed proxy <b>mp</b>. */
@@ -263,38 +278,22 @@ launch_managed_proxy(managed_proxy_t *mp)
 {
   int retval;
 
+  process_environment_t *env = create_managed_proxy_environment(mp);
+
 #ifdef _WIN32
-
-  LPVOID envp=NULL;
-
-  set_managed_proxy_environment(&envp, mp);
-  tor_assert(envp);
-
   /* Passing NULL as lpApplicationName makes Windows search for the .exe */
-  retval = tor_spawn_background(NULL, (const char **)mp->argv, envp,
+  retval = tor_spawn_background(NULL,
+                                (const char **)mp->argv,
+                                env,
                                 &mp->process_handle);
-
-  tor_free(envp);
-
 #else
-
-  char **envp=NULL;
-
-  /* prepare the environment variables for the managed proxy */
-  if (set_managed_proxy_environment(&envp, mp) < 0) {
-    log_warn(LD_GENERAL, "Could not setup the environment of "
-             "the managed proxy at '%s'.", mp->argv[0]);
-    free_execve_args(envp);
-    return -1;
-  }
-
-  retval = tor_spawn_background(mp->argv[0], (const char **)mp->argv,
-                                (const char **)envp, &mp->process_handle);
-
-  /* free the memory allocated by set_managed_proxy_environment(). */
-  free_execve_args(envp);
-
+  retval = tor_spawn_background(mp->argv[0],
+                                (const char **)mp->argv,
+                                env,
+                                &mp->process_handle);
 #endif
+
+  process_environment_free(env);
 
   if (retval == PROCESS_STATUS_ERROR) {
     log_warn(LD_GENERAL, "Managed proxy at '%s' failed at launch.",
@@ -316,26 +315,33 @@ launch_managed_proxy(managed_proxy_t *mp)
 void
 pt_configure_remaining_proxies(void)
 {
+  smartlist_t *tmp = smartlist_new();
+
   log_debug(LD_CONFIG, "Configuring remaining managed proxies (%d)!",
             unconfigured_proxies_n);
-  SMARTLIST_FOREACH_BEGIN(managed_proxy_list,  managed_proxy_t *, mp) {
+
+  /* Iterate over tmp, not managed_proxy_list, since configure_proxy can
+   * remove elements from managed_proxy_list. */
+  smartlist_add_all(tmp, managed_proxy_list);
+
+  assert_unconfigured_count_ok();
+
+  SMARTLIST_FOREACH_BEGIN(tmp,  managed_proxy_t *, mp) {
     tor_assert(mp->conf_state != PT_PROTO_BROKEN ||
                mp->conf_state != PT_PROTO_FAILED_LAUNCH);
 
     if (mp->got_hup) {
       mp->got_hup = 0;
 
-    /* This proxy is marked by a SIGHUP. Check whether we need to
-       restart it. */
+      /* This proxy is marked by a SIGHUP. Check whether we need to
+         restart it. */
       if (proxy_needs_restart(mp)) {
-        log_info(LD_GENERAL, "Preparing managed proxy for restart.");
+        log_info(LD_GENERAL, "Preparing managed proxy '%s' for restart.",
+                 mp->argv[0]);
         proxy_prepare_for_restart(mp);
-        continue;
       } else { /* it doesn't need to be restarted. */
-        log_info(LD_GENERAL, "Nothing changed for managed proxy after HUP: "
-                 "not restarting.");
-        unconfigured_proxies_n--;
-        tor_assert(unconfigured_proxies_n >= 0);
+        log_info(LD_GENERAL, "Nothing changed for managed proxy '%s' after "
+                 "HUP: not restarting.", mp->argv[0]);
       }
 
       continue;
@@ -347,6 +353,10 @@ pt_configure_remaining_proxies(void)
       configure_proxy(mp);
 
   } SMARTLIST_FOREACH_END(mp);
+
+  smartlist_free(tmp);
+  check_if_restarts_needed = 0;
+  assert_unconfigured_count_ok();
 }
 
 #ifdef _WIN32
@@ -374,7 +384,8 @@ configure_proxy(managed_proxy_t *mp)
   pos = tor_read_all_handle(tor_process_get_stdout_pipe(mp->process_handle),
                             stdout_buf, sizeof(stdout_buf) - 1, NULL);
   if (pos < 0) {
-    log_notice(LD_GENERAL, "Failed to read data from managed proxy");
+    log_notice(LD_GENERAL, "Failed to read data from managed proxy '%s'.",
+               mp->argv[0]);
     mp->conf_state = PT_PROTO_BROKEN;
     goto done;
   }
@@ -436,11 +447,13 @@ configure_proxy(managed_proxy_t *mp)
     } else if (r == IO_STREAM_EAGAIN) { /* check back later */
       return;
     } else if (r == IO_STREAM_CLOSED || r == IO_STREAM_TERM) { /* snap! */
-      log_notice(LD_GENERAL, "Managed proxy stream closed. "
-                 "Most probably application stopped running");
+      log_warn(LD_GENERAL, "Our communication channel with the managed proxy "
+               "'%s' closed. Most probably application stopped running.",
+               mp->argv[0]);
       mp->conf_state = PT_PROTO_BROKEN;
     } else { /* unknown stream status */
-      log_notice(LD_GENERAL, "Unknown stream status while configuring proxy.");
+      log_warn(LD_BUG, "Unknown stream status '%d' while configuring managed "
+               "proxy '%s'.", (int)r, mp->argv[0]);
     }
 
     /* if the proxy finished configuring, exit the loop. */
@@ -465,10 +478,8 @@ register_server_proxy(managed_proxy_t *mp)
   tor_assert(mp->conf_state != PT_PROTO_COMPLETED);
   SMARTLIST_FOREACH_BEGIN(mp->transports, transport_t *, t) {
     save_transport_to_state(t->name, &t->addr, t->port);
-    /* LOG_WARN so that the bridge operator can easily find the
-       transport's port in the log file and send it to the users. */
-    log_warn(LD_GENERAL, "Registered server transport '%s' at '%s:%d'",
-             t->name, fmt_addr(&t->addr), (int)t->port);
+    log_notice(LD_GENERAL, "Registered server transport '%s' at '%s:%d'",
+               t->name, fmt_addr(&t->addr), (int)t->port);
     smartlist_add(sm_tmp, tor_strdup(t->name));
   } SMARTLIST_FOREACH_END(t);
 
@@ -575,8 +586,8 @@ handle_finished_proxy(managed_proxy_t *mp)
   case PT_PROTO_ACCEPTING_METHODS:
   case PT_PROTO_COMPLETED:
   default:
-    log_warn(LD_CONFIG, "Unexpected managed proxy state in "
-             "handle_finished_proxy().");
+    log_warn(LD_CONFIG, "Unexpected state '%d' of managed proxy '%s'.",
+             (int)mp->conf_state, mp->argv[0]);
     tor_assert(0);
   }
 
@@ -601,11 +612,13 @@ handle_methods_done(const managed_proxy_t *mp)
   tor_assert(mp->transports);
 
   if (smartlist_len(mp->transports) == 0)
-    log_notice(LD_GENERAL, "Proxy was spawned successfully, "
-               "but it didn't laucn any pluggable transport listeners!");
+    log_notice(LD_GENERAL, "Managed proxy '%s' was spawned successfully, "
+               "but it didn't launch any pluggable transport listeners!",
+               mp->argv[0]);
 
-  log_info(LD_CONFIG, "%s managed proxy configuration completed!",
-           mp->is_server ? "Server" : "Client");
+  log_info(LD_CONFIG, "%s managed proxy '%s' configuration completed!",
+           mp->is_server ? "Server" : "Client",
+           mp->argv[0]);
 }
 
 /** Handle a configuration protocol <b>line</b> received from a
@@ -613,13 +626,8 @@ handle_methods_done(const managed_proxy_t *mp)
 void
 handle_proxy_line(const char *line, managed_proxy_t *mp)
 {
-  log_debug(LD_GENERAL, "Got a line from managed proxy: %s", line);
-
-  if (strlen(line) < SMALLEST_MANAGED_LINE_SIZE) {
-    log_warn(LD_GENERAL, "Managed proxy configuration line is too small. "
-             "Discarding");
-    goto err;
-  }
+  log_info(LD_GENERAL, "Got a line from managed proxy '%s': (%s)",
+           mp->argv[0], line);
 
   if (!strcmpstart(line, PROTO_ENV_ERROR)) {
     if (mp->conf_state != PT_PROTO_LAUNCHED)
@@ -689,17 +697,30 @@ handle_proxy_line(const char *line, managed_proxy_t *mp)
 
     return;
   } else if (!strcmpstart(line, SPAWN_ERROR_MESSAGE)) {
-    log_warn(LD_GENERAL, "Could not launch managed proxy executable!");
+    /* managed proxy launch failed: parse error message to learn why. */
+    int retval, child_state, saved_errno;
+    retval = tor_sscanf(line, SPAWN_ERROR_MESSAGE "%x/%x",
+                        &child_state, &saved_errno);
+    if (retval == 2) {
+      log_warn(LD_GENERAL,
+               "Could not launch managed proxy executable at '%s' ('%s').",
+               mp->argv[0], strerror(saved_errno));
+    } else { /* failed to parse error message */
+      log_warn(LD_GENERAL,"Could not launch managed proxy executable at '%s'.",
+               mp->argv[0]);
+    }
+
     mp->conf_state = PT_PROTO_FAILED_LAUNCH;
     return;
   }
 
-  log_warn(LD_CONFIG, "Unknown line received by managed proxy. (%s)", line);
+  log_notice(LD_GENERAL, "Unknown line received by managed proxy (%s).", line);
+  return;
 
  err:
   mp->conf_state = PT_PROTO_BROKEN;
   log_warn(LD_CONFIG, "Managed proxy at '%s' failed the configuration protocol"
-           " and will be destroyed.", mp->argv ? mp->argv[0] : "");
+           " and will be destroyed.", mp->argv[0]);
 }
 
 /** Parses an ENV-ERROR <b>line</b> and warns the user accordingly. */
@@ -769,7 +790,8 @@ parse_smethod_line(const char *line, managed_proxy_t *mp)
   char *method_name=NULL;
 
   char *addrport=NULL;
-  tor_addr_t addr;
+  tor_addr_t tor_addr;
+  char *address=NULL;
   uint16_t port = 0;
 
   transport_t *transport=NULL;
@@ -793,7 +815,7 @@ parse_smethod_line(const char *line, managed_proxy_t *mp)
   }
 
   addrport = smartlist_get(items, 2);
-  if (tor_addr_port_lookup(addrport, &addr, &port)<0) {
+  if (tor_addr_port_split(LOG_PROTOCOL_WARN, addrport, &address, &port)<0) {
     log_warn(LD_CONFIG, "Error parsing transport "
              "address '%s'", addrport);
     goto err;
@@ -805,7 +827,12 @@ parse_smethod_line(const char *line, managed_proxy_t *mp)
     goto err;
   }
 
-  transport = transport_new(&addr, port, method_name, PROXY_NONE);
+  if (tor_addr_parse(&tor_addr, address) < 0) {
+    log_warn(LD_CONFIG, "Error parsing transport address '%s'", address);
+    goto err;
+  }
+
+  transport = transport_new(&tor_addr, port, method_name, PROXY_NONE);
   if (!transport)
     goto err;
 
@@ -814,7 +841,7 @@ parse_smethod_line(const char *line, managed_proxy_t *mp)
   /* For now, notify the user so that he knows where the server
      transport is listening. */
   log_info(LD_CONFIG, "Server transport %s at %s:%d.",
-           method_name, fmt_addr(&addr), (int)port);
+           method_name, address, (int)port);
 
   r=0;
   goto done;
@@ -825,6 +852,7 @@ parse_smethod_line(const char *line, managed_proxy_t *mp)
  done:
   SMARTLIST_FOREACH(items, char*, s, tor_free(s));
   smartlist_free(items);
+  tor_free(address);
   return r;
 }
 
@@ -842,7 +870,8 @@ parse_cmethod_line(const char *line, managed_proxy_t *mp)
   int socks_ver=PROXY_NONE;
 
   char *addrport=NULL;
-  tor_addr_t addr;
+  tor_addr_t tor_addr;
+  char *address=NULL;
   uint16_t port = 0;
 
   transport_t *transport=NULL;
@@ -878,7 +907,7 @@ parse_cmethod_line(const char *line, managed_proxy_t *mp)
   }
 
   addrport = smartlist_get(items, 3);
-  if (tor_addr_port_lookup(addrport, &addr, &port)<0) {
+  if (tor_addr_port_split(LOG_PROTOCOL_WARN, addrport, &address, &port)<0) {
     log_warn(LD_CONFIG, "Error parsing transport "
              "address '%s'", addrport);
     goto err;
@@ -890,7 +919,12 @@ parse_cmethod_line(const char *line, managed_proxy_t *mp)
     goto err;
   }
 
-  transport = transport_new(&addr, port, method_name, socks_ver);
+  if (tor_addr_parse(&tor_addr, address) < 0) {
+    log_warn(LD_CONFIG, "Error parsing transport address '%s'", address);
+    goto err;
+  }
+
+  transport = transport_new(&tor_addr, port, method_name, socks_ver);
   if (!transport)
     goto err;
 
@@ -898,7 +932,7 @@ parse_cmethod_line(const char *line, managed_proxy_t *mp)
 
   log_info(LD_CONFIG, "Transport %s at %s:%d with SOCKS %d. "
            "Attached to managed proxy.",
-           method_name, fmt_addr(&addr), (int)port, socks_ver);
+           method_name, address, (int)port, socks_ver);
 
   r=0;
   goto done;
@@ -909,6 +943,7 @@ parse_cmethod_line(const char *line, managed_proxy_t *mp)
  done:
   SMARTLIST_FOREACH(items, char*, s, tor_free(s));
   smartlist_free(items);
+  tor_free(address);
   return r;
 }
 
@@ -941,174 +976,88 @@ get_bindaddr_for_server_proxy(const managed_proxy_t *mp)
   return bindaddr_result;
 }
 
-#ifdef _WIN32
-
-/** Prepare the environment <b>envp</b> of managed proxy <b>mp</b>.
- *  <b>envp</b> is allocated on the heap and should be freed by the
- *  caller after its use. */
-static void
-set_managed_proxy_environment(LPVOID *envp, const managed_proxy_t *mp)
+/** Return a newly allocated process_environment_t * for <b>mp</b>'s
+ * process. */
+static process_environment_t *
+create_managed_proxy_environment(const managed_proxy_t *mp)
 {
-  const or_options_t *options = get_options();
-
-  char *tmp=NULL;
-  char *state_tmp=NULL;
-  char *state_env=NULL;
-  char *transports_to_launch=NULL;
-  char *transports_env=NULL;
-  char *bindaddr_tmp=NULL;
-  char *bindaddr_env=NULL;
-  char *orport_env=NULL;
-
-  char version_env[31]; /* XXX temp */
-  char extended_env[43]; /* XXX temp */
-
-  int env_size = 0;
-
-  /* A smartlist carrying all the env. variables that the managed
-     proxy should inherit. */
+  /* Environment variables to be added to or set in mp's environment. */
   smartlist_t *envs = smartlist_new();
+  /* XXXX The next time someone touches this code, shorten the name of
+   * set_environment_variable_in_smartlist, add a
+   * set_env_var_in_smartlist_asprintf function, and get rid of the
+   * silly extra envs smartlist. */
 
-  /* Copy the whole environment of the Tor process.
-     It should also copy PATH and HOME of the Tor process.*/
-  char **environ_tmp = environ;
-  while (*environ_tmp)
-    smartlist_add(envs, *environ_tmp++);
+  /* The final environment to be passed to mp. */
+  smartlist_t *merged_env_vars = get_current_process_environment_variables();
 
-  /* Create the TOR_PT_* environment variables. */
-  state_tmp = get_datadir_fname("pt_state/"); /* XXX temp */
-  tor_asprintf(&state_env, "TOR_PT_STATE_LOCATION=%s", state_tmp);
+  process_environment_t *env;
 
-  strcpy(version_env, "TOR_PT_MANAGED_TRANSPORT_VER=1");
-
-  transports_to_launch =
-    smartlist_join_strings(mp->transports_to_launch, ",", 0, NULL);
-
-  tor_asprintf(&transports_env,
-               mp->is_server ?
-               "TOR_PT_SERVER_TRANSPORTS=%s" : "TOR_PT_CLIENT_TRANSPORTS=%s",
-               transports_to_launch);
-
-  smartlist_add(envs, state_env);
-  smartlist_add(envs, version_env);
-  smartlist_add(envs, transports_env);
-
-  if (mp->is_server) {
-    tor_asprintf(&orport_env, "TOR_PT_ORPORT=127.0.0.1:%s",
-                 options->ORPort->value);
-
-    bindaddr_tmp = get_bindaddr_for_server_proxy(mp);
-    tor_asprintf(&bindaddr_env, "TOR_PT_SERVER_BINDADDR=%s", bindaddr_tmp);
-
-    strcpy(extended_env, "TOR_PT_EXTENDED_SERVER_PORT=127.0.0.1:4200");
-
-    smartlist_add(envs, orport_env);
-    smartlist_add(envs, extended_env);
-    smartlist_add(envs, bindaddr_env);
+  {
+    char *state_tmp = get_datadir_fname("pt_state/"); /* XXX temp */
+    smartlist_add_asprintf(envs, "TOR_PT_STATE_LOCATION=%s", state_tmp);
+    tor_free(state_tmp);
   }
 
-  /* It seems like some versions of Windows need a sorted lpEnvironment
-     block. */
-  smartlist_sort_strings(envs);
+  smartlist_add(envs, tor_strdup("TOR_PT_MANAGED_TRANSPORT_VER=1"));
 
-  /* An environment block consists of a null-terminated block of
-     null-terminated strings: */
+  {
+    char *transports_to_launch =
+      smartlist_join_strings(mp->transports_to_launch, ",", 0, NULL);
 
-  /* Calculate the block's size. */
-  SMARTLIST_FOREACH(envs, const char *, s,
-                    env_size += strlen(s) + 1);
-  env_size += 1; /* space for last NUL */
+    smartlist_add_asprintf(envs,
+                           mp->is_server ?
+                           "TOR_PT_SERVER_TRANSPORTS=%s" :
+                           "TOR_PT_CLIENT_TRANSPORTS=%s",
+                           transports_to_launch);
 
-  *envp = tor_malloc(env_size);
-  tmp = *envp;
+    tor_free(transports_to_launch);
+  }
 
-  /* Create the block. */
-  SMARTLIST_FOREACH_BEGIN(envs, const char *, s) {
-    memcpy(tmp, s, strlen(s)); /* copy the env. variable string */
-    tmp += strlen(s);
-    memset(tmp, '\0', 1); /* append NUL at the end of the string */
-    tmp += 1;
-  } SMARTLIST_FOREACH_END(s);
-  memset(tmp, '\0', 1); /* last NUL */
+  if (mp->is_server) {
+    {
+      char *orport_tmp =
+        get_first_listener_addrport_string(CONN_TYPE_OR_LISTENER);
+      smartlist_add_asprintf(envs, "TOR_PT_ORPORT=%s", orport_tmp);
+      tor_free(orport_tmp);
+    }
 
-  /* Finally, free the whole mess. */
-  tor_free(state_tmp);
-  tor_free(state_env);
-  tor_free(transports_to_launch);
-  tor_free(transports_env);
-  tor_free(bindaddr_tmp);
-  tor_free(bindaddr_env);
-  tor_free(orport_env);
+    {
+      char *bindaddr_tmp = get_bindaddr_for_server_proxy(mp);
+      smartlist_add_asprintf(envs, "TOR_PT_SERVER_BINDADDR=%s", bindaddr_tmp);
+      tor_free(bindaddr_tmp);
+    }
+
+    /* XXX024 Remove the '=' here once versions of obfsproxy which
+     * assert that this env var exists are sufficiently dead.
+     *
+     * (If we remove this line entirely, some joker will stick this
+     * variable in Tor's environment and crash PTs that try to parse
+     * it even when not run in server mode.) */
+    smartlist_add(envs, tor_strdup("TOR_PT_EXTENDED_SERVER_PORT="));
+  }
+
+  SMARTLIST_FOREACH_BEGIN(envs, const char *, env_var) {
+    set_environment_variable_in_smartlist(merged_env_vars, env_var,
+                                          _tor_free, 1);
+  } SMARTLIST_FOREACH_END(env_var);
+
+  env = process_environment_make(merged_env_vars);
 
   smartlist_free(envs);
+
+  SMARTLIST_FOREACH(merged_env_vars, void *, x, tor_free(x));
+  smartlist_free(merged_env_vars);
+
+  return env;
 }
-
-#else /* _WIN32 */
-
-/** Prepare the environment <b>envp</b> of managed proxy <b>mp</b>.
- *  <b>envp</b> is allocated on the heap and should be freed by the
- *  caller after its use. */
-static int
-set_managed_proxy_environment(char ***envp, const managed_proxy_t *mp)
-{
-  const or_options_t *options = get_options();
-  char **tmp=NULL;
-  char *state_loc=NULL;
-  char *transports_to_launch=NULL;
-  char *bindaddr=NULL;
-  char *home_env=NULL;
-  char *path_env=NULL;
-
-  int r = -1;
-  int n_envs = mp->is_server ? ENVIRON_SIZE_SERVER : ENVIRON_SIZE_CLIENT;
-
-  /* allocate enough space for our env. vars and a NULL pointer */
-  *envp = tor_malloc(sizeof(char*)*(n_envs+1));
-  tmp = *envp;
-
-  state_loc = get_datadir_fname("pt_state/"); /* XXX temp */
-  transports_to_launch =
-    smartlist_join_strings(mp->transports_to_launch, ",", 0, NULL);
-
-  home_env = getenv("HOME");
-  path_env = getenv("PATH");
-  if (!home_env || !path_env)
-    goto done;
-
-  tor_asprintf(tmp++, "HOME=%s", home_env);
-  tor_asprintf(tmp++, "PATH=%s", path_env);
-  tor_asprintf(tmp++, "TOR_PT_STATE_LOCATION=%s", state_loc);
-  tor_asprintf(tmp++, "TOR_PT_MANAGED_TRANSPORT_VER=1"); /* temp */
-  if (mp->is_server) {
-    bindaddr = get_bindaddr_for_server_proxy(mp);
-
-    /* XXX temp */
-    tor_asprintf(tmp++, "TOR_PT_ORPORT=127.0.0.1:%d",
-                 router_get_advertised_or_port(options));
-    tor_asprintf(tmp++, "TOR_PT_SERVER_BINDADDR=%s", bindaddr);
-    tor_asprintf(tmp++, "TOR_PT_SERVER_TRANSPORTS=%s", transports_to_launch);
-    /* XXX temp*/
-    tor_asprintf(tmp++, "TOR_PT_EXTENDED_SERVER_PORT=127.0.0.1:4200");
-  } else {
-    tor_asprintf(tmp++, "TOR_PT_CLIENT_TRANSPORTS=%s", transports_to_launch);
-  }
-  *tmp = NULL;
-
-  r = 0;
-
- done:
-  tor_free(state_loc);
-  tor_free(transports_to_launch);
-  tor_free(bindaddr);
-
-  return r;
-}
-
-#endif /* _WIN32 */
 
 /** Create and return a new managed proxy for <b>transport</b> using
- *  <b>proxy_argv</b>. If <b>is_server</b> is true, it's a server
- *  managed proxy. */
+ *  <b>proxy_argv</b>.  Also, add it to the global managed proxy list. If
+ *  <b>is_server</b> is true, it's a server managed proxy.  Takes ownership of
+ *  <b>proxy_argv</b>.
+ *
+ * Requires that proxy_argv have at least one element. */
 static managed_proxy_t *
 managed_proxy_create(const smartlist_t *transport_list,
                      char **proxy_argv, int is_server)
@@ -1129,18 +1078,30 @@ managed_proxy_create(const smartlist_t *transport_list,
   smartlist_add(managed_proxy_list, mp);
   unconfigured_proxies_n++;
 
+  assert_unconfigured_count_ok();
+
   return mp;
 }
 
 /** Register proxy with <b>proxy_argv</b>, supporting transports in
  *  <b>transport_list</b>, to the managed proxy subsystem.
- *  If <b>is_server</b> is true, then the proxy is a server proxy. */
+ *  If <b>is_server</b> is true, then the proxy is a server proxy.
+ *
+ * Takes ownership of proxy_argv.
+ *
+ * Requires that proxy_argv be a NULL-terminated array of command-line
+ * elements, containing at least one element.
+ **/
 void
 pt_kickstart_proxy(const smartlist_t *transport_list,
                    char **proxy_argv, int is_server)
 {
   managed_proxy_t *mp=NULL;
   transport_t *old_transport = NULL;
+
+  if (!proxy_argv || !proxy_argv[0]) {
+    return;
+  }
 
   mp = get_managed_proxy_by_argv_and_type(proxy_argv, is_server);
 
@@ -1158,7 +1119,7 @@ pt_kickstart_proxy(const smartlist_t *transport_list,
          it. */
       if (mp->marked_for_removal) {
         mp->marked_for_removal = 0;
-        unconfigured_proxies_n++;
+        check_if_restarts_needed = 1;
       }
 
       SMARTLIST_FOREACH_BEGIN(transport_list, const char *, transport) {
@@ -1197,9 +1158,11 @@ pt_prepare_proxy_list_for_config_read(void)
   if (!managed_proxy_list)
     return;
 
+  assert_unconfigured_count_ok();
   SMARTLIST_FOREACH_BEGIN(managed_proxy_list, managed_proxy_t *, mp) {
     /* Destroy unconfigured proxies. */
     if (mp->conf_state != PT_PROTO_COMPLETED) {
+      SMARTLIST_DEL_CURRENT(managed_proxy_list, mp);
       managed_proxy_destroy(mp, 1);
       unconfigured_proxies_n--;
       continue;
@@ -1213,6 +1176,8 @@ pt_prepare_proxy_list_for_config_read(void)
     smartlist_clear(mp->transports_to_launch);
   } SMARTLIST_FOREACH_END(mp);
 
+  assert_unconfigured_count_ok();
+
   tor_assert(unconfigured_proxies_n == 0);
 }
 
@@ -1225,13 +1190,14 @@ sweep_proxy_list(void)
 {
   if (!managed_proxy_list)
     return;
-
+  assert_unconfigured_count_ok();
   SMARTLIST_FOREACH_BEGIN(managed_proxy_list, managed_proxy_t *, mp) {
     if (mp->marked_for_removal) {
       SMARTLIST_DEL_CURRENT(managed_proxy_list, mp);
       managed_proxy_destroy(mp, 1);
     }
   } SMARTLIST_FOREACH_END(mp);
+  assert_unconfigured_count_ok();
 }
 
 /** Release all storage held by the pluggable transports subsystem. */
@@ -1243,8 +1209,10 @@ pt_free_all(void)
        transports and it's the duty of the circuitbuild.c subsystem to
        free them. Otherwise, it hasn't registered its transports yet
        and we should free them here. */
-    SMARTLIST_FOREACH(managed_proxy_list, managed_proxy_t *, mp,
-                      managed_proxy_destroy(mp, 1));
+    SMARTLIST_FOREACH(managed_proxy_list, managed_proxy_t *, mp, {
+        SMARTLIST_DEL_CURRENT(managed_proxy_list, mp);
+        managed_proxy_destroy(mp, 1);
+    });
 
     smartlist_free(managed_proxy_list);
     managed_proxy_list=NULL;

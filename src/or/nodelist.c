@@ -1,7 +1,7 @@
 /* Copyright (c) 2001 Matej Pfajfar.
  * Copyright (c) 2001-2004, Roger Dingledine.
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #include "or.h"
@@ -689,8 +689,7 @@ node_get_prim_orport(const node_t *node, tor_addr_port_t *ap_out)
 {
   if (node->ri) {
     router_get_prim_orport(node->ri, ap_out);
-  }
-  else if (node->rs) {
+  } else if (node->rs) {
     tor_addr_from_ipv4h(&ap_out->addr, node->rs->addr);
     ap_out->port = node->rs->or_port;
   }

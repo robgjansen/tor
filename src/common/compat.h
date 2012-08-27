@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 #ifndef _TOR_COMPAT_H
@@ -9,11 +9,8 @@
 #include "orconfig.h"
 #include "torint.h"
 #ifdef _WIN32
-#ifndef WIN32_WINNT
-#define WIN32_WINNT 0x400
-#endif
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x400
+#define _WIN32_WINNT 0x0501
 #endif
 #define WIN32_LEAN_AND_MEAN
 #if defined(_MSC_VER) && (_MSC_VER < 1300)
@@ -22,6 +19,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #endif
+#endif
+#ifdef HAVE_SYS_PARAM_H
+#include <sys/param.h>
 #endif
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
@@ -250,7 +250,6 @@ typedef struct tor_mmap_t {
   size_t mapping_size; /**< Size of the actual mapping. (This is this file
                         * size, rounded up to the nearest page.) */
 #elif defined _WIN32
-  HANDLE file_handle;
   HANDLE mmap_handle;
 #endif
 
@@ -262,11 +261,12 @@ void tor_munmap_file(tor_mmap_t *handle) ATTR_NONNULL((1));
 int tor_snprintf(char *str, size_t size, const char *format, ...)
   CHECK_PRINTF(3,4) ATTR_NONNULL((1,3));
 int tor_vsnprintf(char *str, size_t size, const char *format, va_list args)
-  ATTR_NONNULL((1,3));
+  CHECK_PRINTF(3,0) ATTR_NONNULL((1,3));
 
 int tor_asprintf(char **strp, const char *fmt, ...)
   CHECK_PRINTF(2,3);
-int tor_vasprintf(char **strp, const char *fmt, va_list args);
+int tor_vasprintf(char **strp, const char *fmt, va_list args)
+  CHECK_PRINTF(2,0);
 
 const void *tor_memmem(const void *haystack, size_t hlen, const void *needle,
                        size_t nlen) ATTR_NONNULL((1,3));
@@ -500,6 +500,8 @@ int network_init(void);
  * the actual errno after a socket operation fails.
  */
 #if defined(_WIN32)
+/** Expands to WSA<b>e</b> on Windows, and to <b>e</b> elsewhere. */
+#define SOCK_ERRNO(e) WSA##e
 /** Return true if e is EAGAIN or the local equivalent. */
 #define ERRNO_IS_EAGAIN(e)           ((e) == EAGAIN || (e) == WSAEWOULDBLOCK)
 /** Return true if e is EINPROGRESS or the local equivalent. */
@@ -520,6 +522,7 @@ int network_init(void);
 int tor_socket_errno(tor_socket_t sock);
 const char *tor_socket_strerror(int e);
 #else
+#define SOCK_ERRNO(e) e
 #define ERRNO_IS_EAGAIN(e)           ((e) == EAGAIN)
 #define ERRNO_IS_EINPROGRESS(e)      ((e) == EINPROGRESS)
 #define ERRNO_IS_CONN_EINPROGRESS(e) ((e) == EINPROGRESS)
@@ -580,6 +583,8 @@ char *get_user_homedir(const char *username);
 
 int get_parent_directory(char *fname);
 char *make_path_absolute(char *fname);
+
+char **get_environment(void);
 
 int spawn_func(void (*func)(void *), void *data);
 void spawn_exit(void) ATTR_NORETURN;

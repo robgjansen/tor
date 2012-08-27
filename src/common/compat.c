@@ -1,6 +1,6 @@
 /* Copyright (c) 2003-2004, Roger Dingledine
  * Copyright (c) 2004-2006, Roger Dingledine, Nick Mathewson.
- * Copyright (c) 2007-2011, The Tor Project, Inc. */
+ * Copyright (c) 2007-2012, The Tor Project, Inc. */
 /* See LICENSE for licensing information */
 
 /**
@@ -15,8 +15,12 @@
 /* This is required on rh7 to make strptime not complain.
  * We also need it to make memmem get defined (where available)
  */
-/* XXXX023 We should just use AC_USE_SYSTEM_EXTENSIONS in our autoconf,
- * and get this (and other important stuff!) automatically */
+/* XXXX024 We should just  use AC_USE_SYSTEM_EXTENSIONS in our autoconf,
+ * and get this (and other important stuff!) automatically. Once we do that,
+ * make sure to also change the extern char **environ detection in
+ * configure.in, because whether that is declared or not depends on whether
+ * we have _GNU_SOURCE defined! Maybe that means that once we take this out,
+ * we can also take out the configure check. */
 #define _GNU_SOURCE
 
 #include "compat.h"
@@ -50,6 +54,9 @@
 #endif
 #ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
+#endif
+#ifdef HAVE_CRT_EXTERNS_H
+#include <crt_externs.h>
 #endif
 
 #ifndef HAVE_GETTIMEOFDAY
@@ -116,19 +123,28 @@
 int
 tor_open_cloexec(const char *path, int flags, unsigned mode)
 {
+  int fd;
 #ifdef O_CLOEXEC
-  return open(path, flags|O_CLOEXEC, mode);
-#else
-  int fd = open(path, flags, mode);
+  fd = open(path, flags|O_CLOEXEC, mode);
+  if (fd >= 0)
+    return fd;
+  /* If we got an error, see if it is EINVAL. EINVAL might indicate that,
+   * even though we were built on a system with O_CLOEXEC support, we
+   * are running on one without. */
+  if (errno != EINVAL)
+    return -1;
+#endif
+
+  fd = open(path, flags, mode);
 #ifdef FD_CLOEXEC
   if (fd >= 0)
         fcntl(fd, F_SETFD, FD_CLOEXEC);
 #endif
   return fd;
-#endif
 }
 
-/** DOCDOC */
+/** As fopen(path,mode), but ensures that the O_CLOEXEC bit is set on the
+ * underlying file handle. */
 FILE *
 tor_fopen_cloexec(const char *path, const char *mode)
 {
@@ -140,7 +156,7 @@ tor_fopen_cloexec(const char *path, const char *mode)
   return result;
 }
 
-#ifdef HAVE_SYS_MMAN_H
+#if defined(HAVE_SYS_MMAN_H) || defined(RUNNING_DOXYGEN)
 /** Try to create a memory mapping for <b>filename</b> and return it.  On
  * failure, return NULL.  Sets errno properly, using ERANGE to mean
  * "empty file". */
@@ -212,40 +228,48 @@ tor_mmap_file(const char *filename)
   TCHAR tfilename[MAX_PATH]= {0};
   tor_mmap_t *res = tor_malloc_zero(sizeof(tor_mmap_t));
   int empty = 0;
-  res->file_handle = INVALID_HANDLE_VALUE;
+  HANDLE file_handle = INVALID_HANDLE_VALUE;
+  DWORD size_low, size_high;
+  uint64_t real_size;
   res->mmap_handle = NULL;
 #ifdef UNICODE
   mbstowcs(tfilename,filename,MAX_PATH);
 #else
   strlcpy(tfilename,filename,MAX_PATH);
 #endif
-  res->file_handle = CreateFile(tfilename,
-                                GENERIC_READ, FILE_SHARE_READ,
-                                NULL,
-                                OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL,
-                                0);
+  file_handle = CreateFile(tfilename,
+                           GENERIC_READ, FILE_SHARE_READ,
+                           NULL,
+                           OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL,
+                           0);
 
-  if (res->file_handle == INVALID_HANDLE_VALUE)
+  if (file_handle == INVALID_HANDLE_VALUE)
     goto win_err;
 
-  res->size = GetFileSize(res->file_handle, NULL);
+  size_low = GetFileSize(file_handle, &size_high);
 
-  if (res->size == 0) {
+  if (size_low == INVALID_FILE_SIZE && GetLastError() != NO_ERROR) {
+    log_warn(LD_FS,"Error getting size of \"%s\".",filename);
+    goto win_err;
+  }
+  if (size_low == 0 && size_high == 0) {
     log_info(LD_FS,"File \"%s\" is empty. Ignoring.",filename);
     empty = 1;
     goto err;
   }
+  real_size = (((uint64_t)size_high)<<32) | size_low;
+  if (real_size > SIZE_MAX) {
+    log_warn(LD_FS,"File \"%s\" is too big to map; not trying.",filename);
+    goto err;
+  }
+  res->size = real_size;
 
-  res->mmap_handle = CreateFileMapping(res->file_handle,
+  res->mmap_handle = CreateFileMapping(file_handle,
                                        NULL,
                                        PAGE_READONLY,
-#if SIZEOF_SIZE_T > 4
-                                       (res->base.size >> 32),
-#else
-                                       0,
-#endif
-                                       (res->size & 0xfffffffful),
+                                       size_high,
+                                       size_low,
                                        NULL);
   if (res->mmap_handle == NULL)
     goto win_err;
@@ -255,6 +279,7 @@ tor_mmap_file(const char *filename)
   if (!res->data)
     goto win_err;
 
+  CloseHandle(file_handle);
   return res;
  win_err: {
     DWORD e = GetLastError();
@@ -271,6 +296,8 @@ tor_mmap_file(const char *filename)
  err:
   if (empty)
     errno = ERANGE;
+  if (file_handle != INVALID_HANDLE_VALUE)
+    CloseHandle(file_handle);
   tor_munmap_file(res);
   return NULL;
 }
@@ -284,8 +311,6 @@ tor_munmap_file(tor_mmap_t *handle)
 
   if (handle->mmap_handle != NULL)
     CloseHandle(handle->mmap_handle);
-  if (handle->file_handle != INVALID_HANDLE_VALUE)
-    CloseHandle(handle->file_handle);
   tor_free(handle);
 }
 #else
@@ -484,10 +509,13 @@ tor_memmem(const void *_haystack, size_t hlen,
 #endif
 }
 
-/* Tables to implement ctypes-replacement TOR_IS*() functions.  Each table
+/**
+ * Tables to implement ctypes-replacement TOR_IS*() functions.  Each table
  * has 256 bits to look up whether a character is in some set or not.  This
  * fails on non-ASCII platforms, but it is hard to find a platform whose
  * character set is not a superset of ASCII nowadays. */
+
+/**@{*/
 const uint32_t TOR_ISALPHA_TABLE[8] =
   { 0, 0, 0x7fffffe, 0x7fffffe, 0, 0, 0, 0 };
 const uint32_t TOR_ISALNUM_TABLE[8] =
@@ -500,8 +528,10 @@ const uint32_t TOR_ISPRINT_TABLE[8] =
   { 0, 0xffffffff, 0xffffffff, 0x7fffffff, 0, 0, 0, 0x0 };
 const uint32_t TOR_ISUPPER_TABLE[8] = { 0, 0, 0x7fffffe, 0, 0, 0, 0, 0 };
 const uint32_t TOR_ISLOWER_TABLE[8] = { 0, 0, 0, 0x7fffffe, 0, 0, 0, 0 };
-/* Upper-casing and lowercasing tables to map characters to upper/lowercase
- * equivalents. */
+
+/** Upper-casing and lowercasing tables to map characters to upper/lowercase
+ * equivalents.  Used by tor_toupper() and tor_tolower(). */
+/**@{*/
 const char TOR_TOUPPER_TABLE[256] = {
   0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
   16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
@@ -538,6 +568,22 @@ const char TOR_TOLOWER_TABLE[256] = {
   224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
   240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,
 };
+/**@}*/
+
+/** Helper for tor_strtok_r_impl: Advances cp past all characters in
+ * <b>sep</b>, and returns its new value. */
+static char *
+strtok_helper(char *cp, const char *sep)
+{
+  if (sep[1]) {
+    while (*cp && strchr(sep, *cp))
+      ++cp;
+  } else {
+    while (*cp && *cp == *sep)
+      ++cp;
+  }
+  return cp;
+}
 
 /** Implementation of strtok_r for platforms whose coders haven't figured out
  * how to write one.  Hey guys!  You can use this code here for free! */
@@ -545,19 +591,22 @@ char *
 tor_strtok_r_impl(char *str, const char *sep, char **lasts)
 {
   char *cp, *start;
-  if (str)
-    start = cp = *lasts = str;
-  else if (!*lasts)
-    return NULL;
-  else
-    start = cp = *lasts;
-
   tor_assert(*sep);
+  if (str) {
+    str = strtok_helper(str, sep);
+    if (!*str)
+      return NULL;
+    start = cp = *lasts = str;
+  } else if (!*lasts || !**lasts) {
+    return NULL;
+  } else {
+    start = cp = *lasts;
+  }
+
   if (sep[1]) {
     while (*cp && !strchr(sep, *cp))
       ++cp;
   } else {
-    tor_assert(strlen(sep) == 1);
     cp = strchr(cp, *sep);
   }
 
@@ -565,7 +614,7 @@ tor_strtok_r_impl(char *str, const char *sep, char **lasts)
     *lasts = NULL;
   } else {
     *cp++ = '\0';
-    *lasts = cp;
+    *lasts = strtok_helper(cp, sep);
   }
   return start;
 }
@@ -961,19 +1010,31 @@ tor_open_socket(int domain, int type, int protocol)
 {
   tor_socket_t s;
 #ifdef SOCK_CLOEXEC
-#define LINUX_CLOEXEC_OPEN_SOCKET
-  type |= SOCK_CLOEXEC;
-#endif
+  s = socket(domain, type|SOCK_CLOEXEC, protocol);
+  if (SOCKET_OK(s))
+    goto socket_ok;
+  /* If we got an error, see if it is EINVAL. EINVAL might indicate that,
+   * even though we were built on a system with SOCK_CLOEXEC support, we
+   * are running on one without. */
+  if (errno != EINVAL)
+    return s;
+#endif /* SOCK_CLOEXEC */
+
   s = socket(domain, type, protocol);
-  if (SOCKET_OK(s)) {
-#if !defined(LINUX_CLOEXEC_OPEN_SOCKET) && defined(FD_CLOEXEC)
-    fcntl(s, F_SETFD, FD_CLOEXEC);
+  if (! SOCKET_OK(s))
+    return s;
+
+#if defined(FD_CLOEXEC)
+  fcntl(s, F_SETFD, FD_CLOEXEC);
 #endif
-    socket_accounting_lock();
-    ++n_sockets_open;
-    mark_socket_open(s);
-    socket_accounting_unlock();
-  }
+
+  goto socket_ok; /* So that socket_ok will not be unused. */
+
+ socket_ok:
+  socket_accounting_lock();
+  ++n_sockets_open;
+  mark_socket_open(s);
+  socket_accounting_unlock();
   return s;
 }
 
@@ -983,20 +1044,32 @@ tor_accept_socket(tor_socket_t sockfd, struct sockaddr *addr, socklen_t *len)
 {
   tor_socket_t s;
 #if defined(HAVE_ACCEPT4) && defined(SOCK_CLOEXEC)
-#define LINUX_CLOEXEC_ACCEPT
   s = accept4(sockfd, addr, len, SOCK_CLOEXEC);
-#else
+  if (SOCKET_OK(s))
+    goto socket_ok;
+  /* If we got an error, see if it is ENOSYS. ENOSYS indicates that,
+   * even though we were built on a system with accept4 support, we
+   * are running on one without. Also, check for EINVAL, which indicates that
+   * we are missing SOCK_CLOEXEC support. */
+  if (errno != EINVAL && errno != ENOSYS)
+    return s;
+#endif
+
   s = accept(sockfd, addr, len);
+  if (!SOCKET_OK(s))
+    return s;
+
+#if defined(FD_CLOEXEC)
+  fcntl(s, F_SETFD, FD_CLOEXEC);
 #endif
-  if (SOCKET_OK(s)) {
-#if !defined(LINUX_CLOEXEC_ACCEPT) && defined(FD_CLOEXEC)
-    fcntl(s, F_SETFD, FD_CLOEXEC);
-#endif
-    socket_accounting_lock();
-    ++n_sockets_open;
-    mark_socket_open(s);
-    socket_accounting_unlock();
-  }
+
+  goto socket_ok; /* So that socket_ok will not be unused. */
+
+ socket_ok:
+  socket_accounting_lock();
+  ++n_sockets_open;
+  mark_socket_open(s);
+  socket_accounting_unlock();
   return s;
 }
 
@@ -1047,29 +1120,43 @@ tor_socketpair(int family, int type, int protocol, tor_socket_t fd[2])
 //don't use win32 socketpairs (they are always bad)
 #if defined(HAVE_SOCKETPAIR) && !defined(_WIN32)
   int r;
+
 #ifdef SOCK_CLOEXEC
-  type |= SOCK_CLOEXEC;
+  r = socketpair(family, type|SOCK_CLOEXEC, protocol, fd);
+  if (r == 0)
+    goto sockets_ok;
+  /* If we got an error, see if it is EINVAL. EINVAL might indicate that,
+   * even though we were built on a system with SOCK_CLOEXEC support, we
+   * are running on one without. */
+  if (errno != EINVAL)
+    return -errno;
 #endif
+
   r = socketpair(family, type, protocol, fd);
-  if (r == 0) {
-#if !defined(SOCK_CLOEXEC) && defined(FD_CLOEXEC)
-    if (SOCKET_OK(fd[0]))
-      fcntl(fd[0], F_SETFD, FD_CLOEXEC);
-    if (SOCKET_OK(fd[1]))
-      fcntl(fd[1], F_SETFD, FD_CLOEXEC);
+  if (r < 0)
+    return -errno;
+
+#if defined(FD_CLOEXEC)
+  if (SOCKET_OK(fd[0]))
+    fcntl(fd[0], F_SETFD, FD_CLOEXEC);
+  if (SOCKET_OK(fd[1]))
+    fcntl(fd[1], F_SETFD, FD_CLOEXEC);
 #endif
-    socket_accounting_lock();
-    if (SOCKET_OK(fd[0])) {
-      ++n_sockets_open;
-      mark_socket_open(fd[0]);
-    }
-    if (SOCKET_OK(fd[1])) {
-      ++n_sockets_open;
-      mark_socket_open(fd[1]);
-    }
-    socket_accounting_unlock();
+  goto sockets_ok; /* So that sockets_ok will not be unused. */
+
+ sockets_ok:
+  socket_accounting_lock();
+  if (SOCKET_OK(fd[0])) {
+    ++n_sockets_open;
+    mark_socket_open(fd[0]);
   }
-  return r < 0 ? -errno : r;
+  if (SOCKET_OK(fd[1])) {
+    ++n_sockets_open;
+    mark_socket_open(fd[1]);
+  }
+  socket_accounting_unlock();
+
+  return 0;
 #else
     /* This socketpair does not work when localhost is down. So
      * it's really not the same thing at all. But it's close enough
@@ -1171,12 +1258,15 @@ tor_socketpair(int family, int type, int protocol, tor_socket_t fd[2])
  * tell Tor it's allowed to use. */
 #define ULIMIT_BUFFER 32 /* keep 32 extra fd's beyond _ConnLimit */
 
-/** Learn the maximum allowed number of file descriptors. (Some systems
- * have a low soft limit.
+/** Learn the maximum allowed number of file descriptors, and tell the system
+ * we want to use up to that number. (Some systems have a low soft limit, and
+ * let us set it higher.)
  *
  * We compute this by finding the largest number that we can use.
  * If we can't find a number greater than or equal to <b>limit</b>,
  * then we fail: return -1.
+ *
+ * If <b>limit</b> is 0, then do not adjust the current maximum.
  *
  * Otherwise, return 0 and store the maximum we found inside <b>max_out</b>.*/
 int
@@ -1210,14 +1300,20 @@ set_max_file_descriptors(rlim_t limit, int *max_out)
   limit = MAX_CONNECTIONS;
 #else /* HAVE_GETRLIMIT */
   struct rlimit rlim;
-  tor_assert(limit > 0);
 
   if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
     log_warn(LD_NET, "Could not get maximum number of file descriptors: %s",
              strerror(errno));
     return -1;
   }
-
+  if (limit == 0) {
+    /* If limit == 0, return the maximum value without setting it. */
+    limit = rlim.rlim_max;
+    if (limit > INT_MAX)
+      limit = INT_MAX;
+    *max_out = (int)limit - ULIMIT_BUFFER;
+    return 0;
+  }
   if (rlim.rlim_max < limit) {
     log_warn(LD_CONFIG,"We need %lu file descriptors available, and we're "
              "limited to %lu. Please change your ulimit -n.",
@@ -1584,7 +1680,11 @@ get_user_homedir(const char *username)
 }
 #endif
 
-/** Modify <b>fname</b> to contain the name of the directory */
+/** Modify <b>fname</b> to contain the name of its parent directory.  Doesn't
+ * actually examine the filesystem; does a purely syntactic modification.
+ *
+ * The parent of the root director is considered to be iteself.
+ * */
 int
 get_parent_directory(char *fname)
 {
@@ -1606,13 +1706,18 @@ get_parent_directory(char *fname)
    */
   cp = fname + strlen(fname);
   at_end = 1;
-  while (--cp > fname) {
+  while (--cp >= fname) {
     int is_sep = (*cp == '/'
 #ifdef _WIN32
                   || *cp == '\\'
 #endif
                   );
     if (is_sep) {
+      if (cp == fname) {
+        /* This is the first separator in the file name; don't remove it! */
+        cp[1] = '\0';
+        return 0;
+      }
       *cp = '\0';
       if (! at_end)
         return 0;
@@ -1622,6 +1727,39 @@ get_parent_directory(char *fname)
   }
   return -1;
 }
+
+#ifndef _WIN32
+/** Return a newly allocated string containing the output of getcwd(). Return
+ * NULL on failure. (We can't just use getcwd() into a PATH_MAX buffer, since
+ * Hurd hasn't got a PATH_MAX.)
+ */
+static char *
+alloc_getcwd(void)
+{
+    int saved_errno = errno;
+/* We use this as a starting path length. Not too large seems sane. */
+#define START_PATH_LENGTH 128
+/* Nobody has a maxpath longer than this, as far as I know.  And if they
+ * do, they shouldn't. */
+#define MAX_SANE_PATH_LENGTH 4096
+    size_t path_length = START_PATH_LENGTH;
+    char *path = tor_malloc(path_length);
+
+    errno = 0;
+    while (getcwd(path, path_length) == NULL) {
+      if (errno == ERANGE && path_length < MAX_SANE_PATH_LENGTH) {
+        path_length*=2;
+        path = tor_realloc(path, path_length);
+      } else {
+        tor_free(path);
+        path = NULL;
+        break;
+      }
+    }
+    errno = saved_errno;
+    return path;
+}
+#endif
 
 /** Expand possibly relative path <b>fname</b> to an absolute path.
  * Return a newly allocated string, possibly equal to <b>fname</b>. */
@@ -1638,24 +1776,50 @@ make_path_absolute(char *fname)
 
   return absfname;
 #else
-  char path[PATH_MAX+1];
-  char *absfname = NULL;
+  char *absfname = NULL, *path = NULL;
 
   tor_assert(fname);
 
   if (fname[0] == '/') {
     absfname = tor_strdup(fname);
   } else {
-    if (getcwd(path, PATH_MAX) != NULL) {
+    path = alloc_getcwd();
+    if (path) {
       tor_asprintf(&absfname, "%s/%s", path, fname);
+      tor_free(path);
     } else {
       /* If getcwd failed, the best we can do here is keep using the
        * relative path.  (Perhaps / isn't readable by this UID/GID.) */
+      log_warn(LD_GENERAL, "Unable to find current working directory: %s",
+               strerror(errno));
       absfname = tor_strdup(fname);
     }
   }
-
   return absfname;
+#endif
+}
+
+#ifndef HAVE__NSGETENVIRON
+#ifndef HAVE_EXTERN_ENVIRON_DECLARED
+/* Some platforms declare environ under some circumstances, others don't. */
+#ifndef RUNNING_DOXYGEN
+extern char **environ;
+#endif
+#endif
+#endif
+
+/** Return the current environment. This is a portable replacement for
+ * 'environ'. */
+char **
+get_environment(void)
+{
+#ifdef HAVE__NSGETENVIRON
+  /* This is for compatibility between OSX versions.  Otherwise (for example)
+   * when we do a mostly-static build on OSX 10.7, the resulting binary won't
+   * work on OSX 10.6. */
+  return *_NSGetEnviron();
+#else
+  return environ;
 #endif
 }
 
@@ -1937,8 +2101,7 @@ get_uname(void)
 #ifdef HAVE_UNAME
     if (uname(&u) != -1) {
       /* (Linux says 0 is success, Solaris says 1 is success) */
-      tor_snprintf(uname_result, sizeof(uname_result), "%s %s",
-               u.sysname, u.machine);
+      strlcpy(uname_result, u.sysname, sizeof(uname_result));
     } else
 #endif
       {
@@ -1946,8 +2109,6 @@ get_uname(void)
         OSVERSIONINFOEX info;
         int i;
         const char *plat = NULL;
-        const char *extra = NULL;
-        char acsd[MAX_PATH] = {0};
         static struct {
           unsigned major; unsigned minor; const char *version;
         } win_version_table[] = {
@@ -1972,20 +2133,11 @@ get_uname(void)
           uname_result_is_set = 1;
           return uname_result;
         }
-#ifdef UNICODE
-        wcstombs(acsd, info.szCSDVersion, MAX_PATH);
-#else
-        strlcpy(acsd, info.szCSDVersion, sizeof(acsd));
-#endif
         if (info.dwMajorVersion == 4 && info.dwMinorVersion == 0) {
           if (info.dwPlatformId == VER_PLATFORM_WIN32_NT)
             plat = "Windows NT 4.0";
           else
             plat = "Windows 95";
-          if (acsd[1] == 'B')
-            extra = "OSR2 (B)";
-          else if (acsd[1] == 'C')
-            extra = "OSR2 (C)";
         } else {
           for (i=0; win_version_table[i].major>0; ++i) {
             if (win_version_table[i].major == info.dwMajorVersion &&
@@ -1995,39 +2147,25 @@ get_uname(void)
             }
           }
         }
-        if (plat && !strcmp(plat, "Windows 98")) {
-          if (acsd[1] == 'A')
-            extra = "SE (A)";
-          else if (acsd[1] == 'B')
-            extra = "SE (B)";
-        }
         if (plat) {
-          if (!extra)
-            extra = acsd;
-          tor_snprintf(uname_result, sizeof(uname_result), "%s %s",
-                       plat, extra);
+          strlcpy(uname_result, plat, sizeof(uname_result));
         } else {
           if (info.dwMajorVersion > 6 ||
               (info.dwMajorVersion==6 && info.dwMinorVersion>2))
             tor_snprintf(uname_result, sizeof(uname_result),
-                      "Very recent version of Windows [major=%d,minor=%d] %s",
-                      (int)info.dwMajorVersion,(int)info.dwMinorVersion,
-                      acsd);
+                         "Very recent version of Windows [major=%d,minor=%d]",
+                         (int)info.dwMajorVersion,(int)info.dwMinorVersion);
           else
             tor_snprintf(uname_result, sizeof(uname_result),
-                      "Unrecognized version of Windows [major=%d,minor=%d] %s",
-                      (int)info.dwMajorVersion,(int)info.dwMinorVersion,
-                      acsd);
+                         "Unrecognized version of Windows [major=%d,minor=%d]",
+                         (int)info.dwMajorVersion,(int)info.dwMinorVersion);
         }
 #if !defined (WINCE)
-#ifdef VER_SUITE_BACKOFFICE
-        if (info.wProductType == VER_NT_DOMAIN_CONTROLLER) {
-          strlcat(uname_result, " [domain controller]", sizeof(uname_result));
-        } else if (info.wProductType == VER_NT_SERVER) {
-          strlcat(uname_result, " [server]", sizeof(uname_result));
-        } else if (info.wProductType == VER_NT_WORKSTATION) {
-          strlcat(uname_result, " [workstation]", sizeof(uname_result));
-        }
+#ifdef VER_NT_SERVER
+      if (info.wProductType == VER_NT_SERVER ||
+          info.wProductType == VER_NT_DOMAIN_CONTROLLER) {
+        strlcat(uname_result, " [server]", sizeof(uname_result));
+      }
 #endif
 #endif
 #else
@@ -2243,6 +2381,12 @@ tor_gettimeofday(struct timeval *timeval)
 #define TIME_FNS_NEED_LOCKS
 #endif
 
+/** Helper: Deal with confused or out-of-bounds values from localtime_r and
+ * friends.  (On some platforms, they can give out-of-bounds values or can
+ * return NULL.)  If <b>islocal</b>, this is a localtime result; otherwise
+ * it's from gmtime.  The function returned <b>r</b>, when given <b>timep</b>
+ * as its input. If we need to store new results, store them in
+ * <b>resultbuf</b>. */
 static struct tm *
 correct_tm(int islocal, const time_t *timep, struct tm *resultbuf,
            struct tm *r)
@@ -2911,27 +3055,36 @@ format_win32_error(DWORD err)
 {
   TCHAR *str = NULL;
   char *result;
+  DWORD n;
 
   /* Somebody once decided that this interface was better than strerror(). */
-  FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+  n = FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
                  FORMAT_MESSAGE_FROM_SYSTEM |
                  FORMAT_MESSAGE_IGNORE_INSERTS,
                  NULL, err,
                  MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                (LPVOID)&str,
+                 (LPVOID)&str,
                  0, NULL);
 
-  if (str) {
+  if (str && n) {
 #ifdef UNICODE
-    char abuf[1024] = {0};
-    wcstombs(abuf,str,1024);
-    result = tor_strdup(abuf);
+    size_t len;
+    if (n > 128*1024)
+      len = (128 * 1024) * 2 + 1; /* This shouldn't be possible, but let's
+                                   * make sure. */
+    else
+      len = n * 2 + 1;
+    result = tor_malloc(len);
+    wcstombs(result,str,len);
+    result[len-1] = '\0';
 #else
     result = tor_strdup(str);
 #endif
-    LocalFree(str); /* LocalFree != free() */
   } else {
     result = tor_strdup("<unformattable error>");
+  }
+  if (str) {
+    LocalFree(str); /* LocalFree != free() */
   }
   return result;
 }
