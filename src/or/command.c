@@ -428,7 +428,7 @@ command_process_create_cell(cell_t *cell, or_connection_t *conn)
         log_warn(LD_GENERAL,"Failed to hand off onionskin. Closing.%s",m);
         tor_free(m);
       }
-      circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+      circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_RESOURCELIMIT);
       return;
     }
     log_debug(LD_OR,"success: handed off onionskin.");
@@ -649,6 +649,7 @@ enter_v3_handshake_with_cell(var_cell_t *cell, or_connection_t *conn)
            "Received a cell while TLS-handshaking, not in "
            "OR_HANDSHAKING_V3, on a connection we originated.");
   }
+  connection_or_block_renegotiation(conn);
   conn->_base.state = OR_CONN_STATE_OR_HANDSHAKING_V3;
   if (connection_init_or_handshake_state(conn, started_here) < 0) {
     connection_mark_for_close(TO_CONN(conn));
@@ -716,6 +717,15 @@ command_process_versions_cell(var_cell_t *cell, or_connection_t *conn)
     log_fn(LOG_PROTOCOL_WARN, LD_OR,
            "Negotiated link protocol 2 or lower after doing a v3 TLS "
            "handshake. Closing connection.");
+    connection_mark_for_close(TO_CONN(conn));
+    return;
+  } else if (highest_supported_version != 2 &&
+             conn->_base.state == OR_CONN_STATE_OR_HANDSHAKING_V2) {
+    /* XXXX This should eventually be a log_protocol_warn */
+    log_fn(LOG_WARN, LD_OR,
+           "Negotiated link with non-2 protocol after doing a v2 TLS "
+           "handshake with %s. Closing connection.",
+           fmt_addr(&conn->_base.addr));
     connection_mark_for_close(TO_CONN(conn));
     return;
   }
