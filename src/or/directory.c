@@ -2646,7 +2646,8 @@ directory_handle_command_get(dir_connection_t *conn, const char *headers,
   if ((header = http_get_header(headers, "If-Modified-Since: "))) {
     struct tm tm;
     if (parse_http_time(header, &tm) == 0) {
-      if_modified_since = tor_timegm(&tm);
+      if (tor_timegm(&tm, &if_modified_since)<0)
+        if_modified_since = 0;
     }
     /* The correct behavior on a malformed If-Modified-Since header is to
      * act as if no If-Modified-Since header had been given. */
@@ -3177,6 +3178,7 @@ directory_handle_command_get(dir_connection_t *conn, const char *headers,
   }
 
   if (options->HidServDirectoryV2 &&
+      connection_dir_is_encrypted(conn) &&
        !strcmpstart(url,"/tor/rendezvous2/")) {
     /* Handle v2 rendezvous descriptor fetch request. */
     const char *descp;
@@ -3363,6 +3365,7 @@ directory_handle_command_post(dir_connection_t *conn, const char *headers,
 
   /* Handle v2 rendezvous service publish request. */
   if (options->HidServDirectoryV2 &&
+      connection_dir_is_encrypted(conn) &&
       !strcmpstart(url,"/tor/rendezvous2/publish")) {
     switch (rend_cache_store_v2_desc_as_dir(body)) {
       case -2:
@@ -3732,7 +3735,7 @@ download_status_reset(download_status_t *dls)
   const int *schedule;
   size_t schedule_len;
 
-  find_dl_schedule_and_len(dls, get_options()->DirPort != NULL,
+  find_dl_schedule_and_len(dls, get_options()->DirPort_set,
                            &schedule, &schedule_len);
 
   dls->n_download_failures = 0;

@@ -2607,6 +2607,23 @@ typedef struct circuit_t {
  * circuit. */
 #define MAX_RELAY_EARLY_CELLS_PER_CIRCUIT 8
 
+/**
+ * Describes the circuit building process in simplified terms based
+ * on the path bias accounting state for a circuit. Created to prevent
+ * overcounting due to unknown cases of circuit reuse. See Bug #6475.
+ */
+typedef enum {
+    /** This circuit is "new". It has not yet completed a first hop
+     * or been counted by the path bias code. */
+    PATH_STATE_NEW_CIRC = 0,
+    /** This circuit has completed a first hop, and has been counted by
+     * the path bias logic. */
+    PATH_STATE_DID_FIRST_HOP = 1,
+    /** This circuit has been completely built, and has been counted as
+     * successful by the path bias logic. */
+    PATH_STATE_SUCCEEDED = 2,
+} path_state_t;
+
 /** An origin_circuit_t holds data necessary to build and use a circuit.
  */
 typedef struct origin_circuit_t {
@@ -2639,6 +2656,10 @@ typedef struct origin_circuit_t {
   /** Set if this circuit has already been opened. Used to detect
    * cannibalized circuits. */
   unsigned int has_opened : 1;
+
+  /** Kludge to help us prevent the warn in bug #6475 and eventually
+   * debug why we are not seeing first hops in some cases. */
+  path_state_t path_state : 2;
 
   /** Set iff this is a hidden-service circuit which has timed out
    * according to our current circuit-build timeout, but which has
@@ -3019,23 +3040,46 @@ typedef struct {
   config_line_t *RecommendedVersions;
   config_line_t *RecommendedClientVersions;
   config_line_t *RecommendedServerVersions;
-  /** Whether dirservers refuse router descriptors with private IPs. */
+  /** Whether dirservers allow router descriptors with private IPs. */
   int DirAllowPrivateAddresses;
+  /** Whether routers accept EXTEND cells to routers with private IPs. */
+  int ExtendAllowPrivateAddresses;
   char *User; /**< Name of user to run Tor as. */
   char *Group; /**< Name of group to run Tor as. */
-  config_line_t *ORPort; /**< Ports to listen on for OR connections. */
-  config_line_t *SocksPort; /**< Ports to listen on for SOCKS connections. */
+  config_line_t *ORPort_lines; /**< Ports to listen on for OR connections. */
+  /** Ports to listen on for SOCKS connections. */
+  config_line_t *SocksPort_lines;
   /** Ports to listen on for transparent pf/netfilter connections. */
-  config_line_t *TransPort;
-  config_line_t *NATDPort; /**< Ports to listen on for transparent natd
+  config_line_t *TransPort_lines;
+  config_line_t *NATDPort_lines; /**< Ports to listen on for transparent natd
                             * connections. */
-  config_line_t *ControlPort; /**< Port to listen on for control
+  config_line_t *ControlPort_lines; /**< Ports to listen on for control
                                * connections. */
   config_line_t *ControlSocket; /**< List of Unix Domain Sockets to listen on
                                  * for control connections. */
+
   int ControlSocketsGroupWritable; /**< Boolean: Are control sockets g+rw? */
-  config_line_t *DirPort; /**< Port to listen on for directory connections. */
-  config_line_t *DNSPort; /**< Port to listen on for DNS requests. */
+  /** Ports to listen on for directory connections. */
+  config_line_t *DirPort_lines;
+  config_line_t *DNSPort_lines; /**< Ports to listen on for DNS requests. */
+
+  /** @name port booleans
+   *
+   * Derived booleans: True iff there is a non-listener port on an AF_INET or
+   * AF_INET6 address of the given type configured in one of the _lines
+   * options above.
+   *
+   * @{
+   */
+  unsigned int ORPort_set : 1;
+  unsigned int SocksPort_set : 1;
+  unsigned int TransPort_set : 1;
+  unsigned int NATDPort_set : 1;
+  unsigned int ControlPort_set : 1;
+  unsigned int DirPort_set : 1;
+  unsigned int DNSPort_set : 1;
+  /**@}*/
+
   int AssumeReachable; /**< Whether to publish our descriptor regardless. */
   int AuthoritativeDir; /**< Boolean: is this an authoritative directory? */
   int V1AuthoritativeDir; /**< Boolean: is this an authoritative directory
@@ -4249,14 +4293,17 @@ typedef struct rend_intro_point_t {
   time_t time_expiring;
 } rend_intro_point_t;
 
+#define REND_PROTOCOL_VERSION_BITMASK_WIDTH 16
+
 /** Information used to connect to a hidden service.  Used on both the
  * service side and the client side. */
 typedef struct rend_service_descriptor_t {
   crypto_pk_t *pk; /**< This service's public key. */
   int version; /**< Version of the descriptor format: 0 or 2. */
   time_t timestamp; /**< Time when the descriptor was generated. */
-  uint16_t protocols; /**< Bitmask: which rendezvous protocols are supported?
-                       * (We allow bits '0', '1', and '2' to be set.) */
+  /** Bitmask: which rendezvous protocols are supported?
+   * (We allow bits '0', '1', and '2' to be set.) */
+  int protocols : REND_PROTOCOL_VERSION_BITMASK_WIDTH;
   /** List of the service's introduction points.  Elements are removed if
    * introduction attempts fail. */
   smartlist_t *intro_nodes;

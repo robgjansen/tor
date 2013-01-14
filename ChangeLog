@@ -1,3 +1,280 @@
+Changes in version 0.2.3.25 - 2012-11-19
+  The Tor 0.2.3 release series is dedicated to the memory of Len "rabbi"
+  Sassaman (1980-2011), a long-time cypherpunk, anonymity researcher,
+  Mixmaster maintainer, Pynchon Gate co-designer, CodeCon organizer,
+  programmer, and friend. Unstinting in his dedication to the cause of
+  freedom, he inspired and helped many of us as we began our work on
+  anonymity, and inspires us still. Please honor his memory by writing
+  software to protect people's freedoms, and by helping others to do so.
+
+  Tor 0.2.3.25, the first stable release in the 0.2.3 branch, features
+  significantly reduced directory overhead (via microdescriptors),
+  enormous crypto performance improvements for fast relays on new
+  enough hardware, a new v3 TLS handshake protocol that can better
+  resist fingerprinting, support for protocol obfuscation plugins (aka
+  pluggable transports), better scalability for hidden services, IPv6
+  support for bridges, performance improvements like allowing clients
+  to skip the first round-trip on the circuit ("optimistic data") and
+  refilling token buckets more often, a new "stream isolation" design
+  to isolate different applications on different circuits, and many
+  stability, security, and privacy fixes.
+
+  o Major bugfixes:
+    - Tor tries to wipe potentially sensitive data after using it, so
+      that if some subsequent security failure exposes Tor's memory,
+      the damage will be limited. But we had a bug where the compiler
+      was eliminating these wipe operations when it decided that the
+      memory was no longer visible to a (correctly running) program,
+      hence defeating our attempt at defense in depth. We fix that
+      by using OpenSSL's OPENSSL_cleanse() operation, which a compiler
+      is unlikely to optimize away. Future versions of Tor may use
+      a less ridiculously heavy approach for this. Fixes bug 7352.
+      Reported in an article by Andrey Karpov.
+
+  o Minor bugfixes:
+    - Fix a harmless bug when opting against publishing a relay descriptor
+      because DisableNetwork is set. Fixes bug 7464; bugfix on
+      0.2.3.9-alpha.
+
+
+Changes in version 0.2.3.24-rc - 2012-10-25
+  Tor 0.2.3.24-rc fixes two important security vulnerabilities that
+  could lead to remotely triggerable relay crashes, and fixes
+  a major bug that was preventing clients from choosing suitable exit
+  nodes.
+
+  o Major bugfixes (security):
+    - Fix a group of remotely triggerable assertion failures related to
+      incorrect link protocol negotiation. Found, diagnosed, and fixed
+      by "some guy from France". Fix for CVE-2012-2250; bugfix on
+      0.2.3.6-alpha.
+    - Fix a denial of service attack by which any directory authority
+      could crash all the others, or by which a single v2 directory
+      authority could crash everybody downloading v2 directory
+      information. Fixes bug 7191; bugfix on 0.2.0.10-alpha.
+
+  o Major bugfixes:
+    - When parsing exit policy summaries from microdescriptors, we had
+      previously been ignoring the last character in each one, so that
+      "accept 80,443,8080" would be treated by clients as indicating
+      a node that allows access to ports 80, 443, and 808. That would
+      lead to clients attempting connections that could never work,
+      and ignoring exit nodes that would support their connections. Now
+      clients parse these exit policy summaries correctly. Fixes bug 7192;
+      bugfix on 0.2.3.1-alpha.
+
+  o Minor bugfixes:
+    - Clients now consider the ClientRejectInternalAddresses config option
+      when using a microdescriptor consensus stanza to decide whether
+      an exit relay would allow exiting to an internal address. Fixes
+      bug 7190; bugfix on 0.2.3.1-alpha.
+
+
+Changes in version 0.2.3.23-rc - 2012-10-20
+  Tor 0.2.3.23-rc adds a new v3 directory authority, fixes a privacy
+  vulnerability introduced by a change in OpenSSL, and fixes a variety
+  of smaller bugs in preparation for the release.
+
+  o New directory authorities:
+    - Add Faravahar (run by Sina Rabbani) as the ninth v3 directory
+      authority. Closes ticket 5749.
+
+  o Major bugfixes (security/privacy):
+    - Disable TLS session tickets. OpenSSL's implementation was giving
+      our TLS session keys the lifetime of our TLS context objects, when
+      perfect forward secrecy would want us to discard anything that
+      could decrypt a link connection as soon as the link connection
+      was closed. Fixes bug 7139; bugfix on all versions of Tor linked
+      against OpenSSL 1.0.0 or later. Found by Florent Daignière.
+    - Discard extraneous renegotiation attempts once the V3 link
+      protocol has been initiated. Failure to do so left us open to
+      a remotely triggerable assertion failure. Fixes CVE-2012-2249;
+      bugfix on 0.2.3.6-alpha. Reported by "some guy from France".
+
+  o Major bugfixes:
+    - Fix a possible crash bug when checking for deactivated circuits
+      in connection_or_flush_from_first_active_circuit(). Fixes bug 6341;
+      bugfix on 0.2.2.7-alpha. Bug report and fix received pseudonymously.
+
+  o Minor bugfixes (on 0.2.3.x):
+    - Fix two cases in src/or/transports.c where we were calling
+      fmt_addr() twice in a parameter list. Bug found by David
+      Fifield. Fixes bug 7014; bugfix on 0.2.3.9-alpha.
+    - Convert an assert in the pathbias code to a log message. The assert
+      appears to only be triggerable by Tor2Web mode. Fixes bug 6866;
+      bugfix on 0.2.3.17-beta.
+    - Fix memory leaks whenever we logged any message about the "path
+      bias" detection. Fixes bug 7022; bugfix on 0.2.3.21-rc.
+
+  o Minor bugfixes (on 0.2.2.x and earlier):
+    - Don't serve or accept v2 hidden service descriptors over a relay's
+      DirPort. It's never correct to do so, and disabling it might
+      make it more annoying to exploit any bugs that turn up in the
+      descriptor-parsing code. Fixes bug 7149.
+    - When relays refuse a "create" cell because their queue of pending
+      create cells is too big (typically because their cpu can't keep up
+      with the arrival rate), send back reason "resource limit" rather
+      than reason "internal", so network measurement scripts can get a
+      more accurate picture. Bugfix on 0.1.1.11-alpha; fixes bug 7037.
+    - Correct file sizes when reading binary files on Cygwin, to avoid
+      a bug where Tor would fail to read its state file. Fixes bug 6844;
+      bugfix on 0.1.2.7-alpha.
+    - Avoid undefined behaviour when parsing the list of supported
+      rendezvous/introduction protocols in a hidden service descriptor.
+      Previously, Tor would have confused (as-yet-unused) protocol version
+      numbers greater than 32 with lower ones on many platforms. Fixes
+      bug 6827; bugfix on 0.2.0.10-alpha. Found by George Kadianakis.
+
+  o Documentation fixes:
+    - Clarify that hidden services are TCP only. Fixes bug 6024.
+
+
+Changes in version 0.2.3.22-rc - 2012-09-11
+  Tor 0.2.3.22-rc fixes another opportunity for a remotely triggerable
+  assertion.
+
+  o Security fixes:
+    - Fix an assertion failure in tor_timegm() that could be triggered
+      by a badly formatted directory object. Bug found by fuzzing with
+      Radamsa. Fixes bug 6811; bugfix on 0.2.0.20-rc.
+
+  o Minor bugfixes:
+    - Avoid segfault when starting up having run with an extremely old
+      version of Tor and parsing its state file. Fixes bug 6801; bugfix
+      on 0.2.2.23-alpha.
+
+
+Changes in version 0.2.2.39 - 2012-09-11
+  Tor 0.2.2.39 fixes two more opportunities for remotely triggerable
+  assertions.
+
+  o Security fixes:
+    - Fix an assertion failure in tor_timegm() that could be triggered
+      by a badly formatted directory object. Bug found by fuzzing with
+      Radamsa. Fixes bug 6811; bugfix on 0.2.0.20-rc.
+    - Do not crash when comparing an address with port value 0 to an
+      address policy. This bug could have been used to cause a remote
+      assertion failure by or against directory authorities, or to
+      allow some applications to crash clients. Fixes bug 6690; bugfix
+      on 0.2.1.10-alpha.
+
+
+Changes in version 0.2.3.21-rc - 2012-09-05
+  Tor 0.2.3.21-rc is the fourth release candidate for the Tor 0.2.3.x
+  series. It fixes a trio of potential security bugs, fixes a bug where
+  we were leaving some of the fast relays out of the microdescriptor
+  consensus, resumes interpreting "ORPort 0" and "DirPort 0" correctly,
+  and cleans up other smaller issues.
+
+  o Major bugfixes (security):
+    - Tear down the circuit if we get an unexpected SENDME cell. Clients
+      could use this trick to make their circuits receive cells faster
+      than our flow control would have allowed, or to gum up the network,
+      or possibly to do targeted memory denial-of-service attacks on
+      entry nodes. Fixes bug 6252. Bugfix on the 54th commit on Tor --
+      from July 2002, before the release of Tor 0.0.0. We had committed
+      this patch previously, but we had to revert it because of bug 6271.
+      Now that 6271 is fixed, this patch appears to work.
+    - Reject any attempt to extend to an internal address. Without
+      this fix, a router could be used to probe addresses on an internal
+      network to see whether they were accepting connections. Fixes bug
+      6710; bugfix on 0.0.8pre1.
+    - Do not crash when comparing an address with port value 0 to an
+      address policy. This bug could have been used to cause a remote
+      assertion failure by or against directory authorities, or to
+      allow some applications to crash clients. Fixes bug 6690; bugfix
+      on 0.2.1.10-alpha.
+
+  o Major bugfixes:
+    - Remove the upper bound on microdescriptor length. We were hitting
+      the limit for routers with complex exit policies or family
+      declarations, causing clients to not use them. Fixes the first
+      piece of bug 6404; fix on 0.2.2.6-alpha.
+    - Detect "ORPort 0" as meaning, uniformly, that we're not running
+      as a relay. Previously, some of our code would treat the presence
+      of any ORPort line as meaning that we should act like a relay,
+      even though our new listener code would correctly not open any
+      ORPorts for ORPort 0. Similar bugs in other Port options are also
+      fixed. Fixes the first half of bug 6507; bugfix on 0.2.3.3-alpha.
+
+  o Minor bugfixes:
+    - Avoid a pair of double-free and use-after-mark bugs that can
+      occur with certain timings in canceled and re-received DNS
+      requests. Fixes bug 6472; bugfix on 0.0.7rc1.
+    - Fix build and 64-bit compile warnings from --enable-openbsd-malloc.
+      Fixes bug 6379. Bugfix on 0.2.0.20-rc.
+    - Allow one-hop directory fetching circuits the full "circuit build
+      timeout" period, rather than just half of it, before failing them
+      and marking the relay down. This fix should help reduce cases where
+      clients declare relays (or worse, bridges) unreachable because
+      the TLS handshake takes a few seconds to complete. Fixes bug 6743;
+      bugfix on 0.2.2.2-alpha, where we changed the timeout from a static
+      30 seconds.
+    - Authorities no longer include any router in their microdescriptor
+      consensuses for which they couldn't generate or agree on a
+      microdescriptor. Fixes the second piece of bug 6404; fix on
+      0.2.2.6-alpha.
+    - Detect and reject attempts to specify both "FooPort" and
+      "FooPort 0" in the same configuration domain. (It's still okay
+      to have a FooPort in your configuration file, and use "FooPort 0"
+      on the command line to disable it.) Fixes the second half of bug
+      6507; bugfix on 0.2.3.3-alpha.
+    - Make wildcarded addresses (that is, ones beginning with "*.") work
+      when provided via the controller's MapAddress command. Previously,
+      they were accepted, but we never actually noticed that they were
+      wildcards. Fixes bug 6244; bugfix on 0.2.3.9-alpha.
+    - Avoid crashing on a malformed state file where EntryGuardPathBias
+      precedes EntryGuard. Fixes bug 6774; bugfix on 0.2.3.17-beta.
+    - Add a (probably redundant) memory clear between iterations of
+      the router status voting loop, to prevent future coding errors
+      where data might leak between iterations of the loop. Resolves
+      ticket 6514.
+
+  o Minor bugfixes (log messages):
+    - Downgrade "set buildtimeout to low value" messages to "info"
+      severity; they were never an actual problem, there was never
+      anything reasonable to do about them, and they tended to spam logs
+      from time to time. Fixes bug 6251; bugfix on 0.2.2.2-alpha.
+    - Downgrade path-bias warning messages to "info". We'll try to get
+      them working better in 0.2.4. Add internal circuit construction
+      state to protect against the noisy warn message "Unexpectedly high
+      circuit_successes". Also add some additional rate-limited notice
+      messages to help determine the root cause of the warn. Fixes bug
+      6475. Bugfix against 0.2.3.17-beta.
+    - Move log message when unable to find a microdesc in a routerstatus
+      entry to parse time. Previously we'd spam this warning every time
+      we tried to figure out which microdescriptors to download. Fixes
+      the third piece of bug 6404; fix on 0.2.3.18-rc.
+
+  o Minor features:
+    - Consider new, removed or changed IPv6 OR ports a non-cosmetic
+      change when the authority is deciding whether to accept a newly
+      uploaded descriptor. Implements ticket 6423.
+    - Add missing documentation for consensus and microdesc files.
+      Resolves ticket 6732.
+
+
+Changes in version 0.2.2.38 - 2012-08-12
+  Tor 0.2.2.38 fixes a remotely triggerable crash bug, and fixes a timing
+  attack that could in theory leak path information.
+
+  o Security fixes:
+    - Avoid an uninitialized memory read when reading a vote or consensus
+      document that has an unrecognized flavor name. This read could
+      lead to a remote crash bug. Fixes bug 6530; bugfix on 0.2.2.6-alpha.
+    - Try to leak less information about what relays a client is
+      choosing to a side-channel attacker. Previously, a Tor client would
+      stop iterating through the list of available relays as soon as it
+      had chosen one, thus finishing a little earlier when it picked
+      a router earlier in the list. If an attacker can recover this
+      timing information (nontrivial but not proven to be impossible),
+      they could learn some coarse-grained information about which relays
+      a client was picking (middle nodes in particular are likelier to
+      be affected than exits). The timing attack might be mitigated by
+      other factors (see bug 6537 for some discussion), but it's best
+      not to take chances. Fixes bug 6537; bugfix on 0.0.8rc1.
+
+
 Changes in version 0.2.3.20-rc - 2012-08-05
   Tor 0.2.3.20-rc is the third release candidate for the Tor 0.2.3.x
   series. It fixes a pair of code security bugs and a potential anonymity
@@ -316,7 +593,7 @@ Changes in version 0.2.3.16-alpha - 2012-06-05
       indefinitely. Fixes bug 5380; bugfix on 0.2.1.14-rc.
     - When fetching a bridge descriptor from a bridge authority,
       always do so anonymously, whether we have been able to open
-      circuits or not. Partial fix for bug 1938; bugfix on 2.0.7-alpha.
+      circuits or not. Partial fix for bug 1938; bugfix on 0.2.0.7-alpha.
       This behavior makes it *safer* to use UpdateBridgesFromAuthority,
       but we'll need to wait for bug 6010 before it's actually usable.
 
