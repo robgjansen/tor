@@ -680,7 +680,7 @@ connection_or_update_token_buckets(smartlist_t *conns,
  */
 static smartlist_t *
 connection_or_get_active_unthrottled_clients(smartlist_t *conns) {
-  smartlist_t* or_conns = smartlist_create();
+  smartlist_t* or_conns = smartlist_new();
   SMARTLIST_FOREACH(conns, connection_t *, conn,
   {
 	if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
