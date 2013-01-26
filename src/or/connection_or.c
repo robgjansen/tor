@@ -692,7 +692,7 @@ _connection_or_refresh_compare(const void **a, const void **b) {
  */
 static smartlist_t *
 connection_or_get_active_nonrelay(smartlist_t *conns) {
-  smartlist_t* or_conns = smartlist_create();
+  smartlist_t* or_conns = smartlist_new();
   SMARTLIST_FOREACH(conns, connection_t *, conn,
   {
 	if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
