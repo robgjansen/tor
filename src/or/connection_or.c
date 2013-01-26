@@ -669,7 +669,7 @@ connection_or_update_token_buckets(smartlist_t *conns,
 
 void
 connection_or_throttle_bitsplitting(smartlist_t *conns, or_options_t *options) {
-  smartlist_t* or_conns = smartlist_create();
+  smartlist_t* or_conns = smartlist_new();
   SMARTLIST_FOREACH(conns, connection_t *, conn,
   {
 	if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
