@@ -994,12 +994,14 @@ typedef struct pc_throttle_t {
 } pc_throttle_t;
 
 typedef struct pcbw_globals_t {
+  int isInitialized; /* MUST be first item in struct */
   /* track ewma cell counts per connection */
   unsigned int perconn_ewma_enabled;
   double perconn_ewma_scale_factor;
   unsigned int perconn_ewma_last_recalibrated;
   /* do the fingerprinting algorithm where we try to throttle only bulk flows */
   unsigned int fingerprint_throttling_enabled;
+  cell_ewma_t fingerprint_ewma;
 } pc_throttle_globals_t;
 
 /** Description of a connection to another host or process, and associated
@@ -3263,6 +3265,7 @@ typedef struct {
       between "high" and "low" bandwidth clusters is > than this threshold */
   double PerConnBWFingerprintPenalty; /** stop throttling when EWMA falls below
    	  this fraction of what my EWMA was when throttling began */
+  unsigned int PerConnBWFingerprintCluster; /* 1 if we should use clustering */
   unsigned int PerConnBWFingerprintVerbose; /** log cluster stats and throttled
    	  connection IPs if non-zero */
 

@@ -374,6 +374,7 @@ static config_var_t _option_vars[] = {
   V(PerConnBWFingerprintRate,    MEMUNIT,     "0"),
   V(PerConnBWFingerprintThreshold,   DOUBLE,     "0.0"),
   V(PerConnBWFingerprintPenalty, DOUBLE,   "0.0"),
+  V(PerConnBWFingerprintCluster, BOOL,     "0"),
   V(PerConnBWFingerprintVerbose, BOOL,     "0"),
   V(PidFile,                     STRING,   NULL),
   V(TestingTorNetwork,           BOOL,     "0"),
