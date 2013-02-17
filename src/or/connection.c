@@ -2485,7 +2485,7 @@ connection_bucket_refill(int milliseconds_elapsed, time_t now)
    * PCBW values to throttle the refill rate of the PerConn token buckets. */
   pc_throttle_globals_t *pct = get_pc_throttle_globals();
   if(pct->fingerprint_throttling_enabled) {
-	connection_or_throttle_fingerprint(conns, options);
+	connection_or_throttle_fingerprint(conns, options, milliseconds_elapsed);
   }
 
   /* check if we want to track the per-conn cell counts */

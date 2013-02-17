@@ -87,7 +87,7 @@ void var_cell_free(var_cell_t *cell);
 
 pc_throttle_globals_t* get_pc_throttle_globals();
 void connection_or_throttle_fingerprint(smartlist_t *conns,
-										or_options_t *options);
+										or_options_t *options, int milliseconds_elapsed);
 void connection_or_log_cell_counts(smartlist_t *conns);
 
 #endif

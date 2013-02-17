@@ -838,7 +838,7 @@ connection_or_cluster(smartlist_t *conns, double* partition_out,
  * @param options global options for this relay
  */
 void
-connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options) {
+connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, int milliseconds_elapsed) {
   pc_throttle_globals_t *pct = get_pc_throttle_globals();
 
   /* the following is not used in clustering mode */
@@ -846,7 +846,7 @@ connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options) {
     double conn_len = ((double)smartlist_len(conns));
     if(conn_len < 0)
       return;
-    double rate = (double)options->BandwidthRate / (1000/options->TokenBucketRefillInterval);
+    double rate = (double)(options->BandwidthRate / 1000 * milliseconds_elapsed);
     double cell_share_increment = rate / conn_len / CELL_NETWORK_SIZE;
     pct->fingerprint_ewma.cell_count += cell_share_increment;
     scale_single_cell_ewma(&pct->fingerprint_ewma,
