@@ -34,6 +34,7 @@
 #include "rendcommon.h"
 #include "rephist.h"
 #include "router.h"
+#include "routerlist.h"
 #include "routerparse.h"
 
 #ifdef USE_BUFFEREVENTS
@@ -487,6 +488,9 @@ _connection_free(connection_t *conn)
   tor_free(conn->address);
 
   if (connection_speaks_cells(conn)) {
+    if(get_kqtime()) {
+      kqtime_deregister(get_kqtime(), conn->s);
+    }
     or_connection_t *or_conn = TO_OR_CONN(conn);
     tor_tls_free(or_conn->tls);
     or_conn->tls = NULL;
@@ -3900,6 +3904,32 @@ connection_finished_flushing(connection_t *conn)
   }
 }
 
+static void
+connection_register_kqtime_fd(connection_t *conn) {
+  char fd_name[256];
+  memset(fd_name, 0, 256);
+
+  /* only log real address if its a known router */
+  const routerinfo_t* ri = router_get_by_id_digest(TO_OR_CONN(conn)->identity_digest);
+  if(ri) {
+    /* this is a known public router, its ok to log its info */
+    char fingerprint[FINGERPRINT_LEN+1];
+    memset(fingerprint, 0, FINGERPRINT_LEN+1);
+    crypto_pk_get_fingerprint(ri->identity_pkey, fingerprint, 0);
+
+    tor_snprintf(fd_name, 256, "name=%s,address=%s,or_port=%d,fp=%s,"
+        "read_tokens=%d,write_tokens=%d,bw_rate=%d,bw_burst=%d,bw_cap=%d",
+        ri->nickname, ri->address, (int)ri->or_port,
+        fingerprint, TO_OR_CONN(conn)->read_bucket, TO_OR_CONN(conn)->write_bucket,
+        (int)ri->bandwidthrate, (int)ri->bandwidthburst, (int)ri->bandwidthcapacity);
+  } else {
+    /* be safe and dont log the unknown peer */
+    tor_snprintf(fd_name, 256, "unknown");
+  }
+
+  kqtime_register(get_kqtime(), conn->s, fd_name);
+}
+
 /** Called when our attempt to connect() to another server has just
  * succeeded.
  *
@@ -3921,6 +3951,9 @@ connection_finished_connecting(connection_t *conn)
   switch (conn->type)
     {
     case CONN_TYPE_OR:
+      if(get_kqtime()) {
+        connection_register_kqtime_fd(conn);
+      }
       return connection_or_finished_connecting(TO_OR_CONN(conn));
     case CONN_TYPE_EXIT:
       return connection_edge_finished_connecting(TO_EDGE_CONN(conn));

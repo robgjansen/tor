@@ -163,6 +163,8 @@ int can_complete_circuit=0;
  */
 int quiet_level = 0;
 
+KQTime* global_kqtime = NULL;
+
 /********* END VARIABLES ************/
 
 /****************************************************************************
@@ -171,6 +173,10 @@ int quiet_level = 0;
 * variables (which are global within this file and unavailable outside it).
 *
 ****************************************************************************/
+
+KQTime* get_kqtime() {
+  return global_kqtime;
+}
 
 #if 0 && defined(USE_BUFFEREVENTS)
 static void
@@ -1939,6 +1945,10 @@ do_main_loop(void)
   }
 #endif
 
+  if(get_options()->KQTimeLogFile) {
+    global_kqtime = kqtime_new(get_options()->KQTimeLogFile, 1, 1, 1);
+  }
+
   for (;;) {
     if (nt_service_is_stopping())
       return 0;
@@ -2457,6 +2467,9 @@ tor_free_all(int postfork)
   }
   /* stuff in main.c */
 
+  if(global_kqtime) {
+    kqtime_free(global_kqtime);
+  }
   smartlist_free(connection_array);
   smartlist_free(closeable_connection_lst);
   smartlist_free(active_linked_connection_lst);

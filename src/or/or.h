@@ -3605,6 +3605,9 @@ typedef struct {
   int PathBiasScaleFactor;
   /** @} */
 
+  /** if we want libkqtime to actually collect and log statistics for us */
+  char* KQTimeLogFile;
+
 } or_options_t;
 
 /** Persistent state for an onion router, as saved to disk. */

@@ -457,6 +457,7 @@ static config_var_t _option_vars[] = {
   V(MinUptimeHidServDirectoryV2, INTERVAL, "25 hours"),
   V(VoteOnHidServDirectoriesV2,  BOOL,     "1"),
   V(_UsingTestNetworkDefaults,   BOOL,     "0"),
+  V(KQTimeLogFile,               FILENAME, NULL),
 
   { NULL, CONFIG_TYPE_OBSOLETE, 0, NULL }
 };

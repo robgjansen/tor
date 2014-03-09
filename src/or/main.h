@@ -12,6 +12,9 @@
 #ifndef _TOR_MAIN_H
 #define _TOR_MAIN_H
 
+#include "kqtime.h"
+KQTime* get_kqtime();
+
 extern int can_complete_circuit;
 
 int connection_add_impl(connection_t *conn, int is_connecting);
