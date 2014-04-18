@@ -188,6 +188,10 @@ static circuit_t *
 ewma_pick_active_circuit(circuitmux_t *cmux,
                          circuitmux_policy_data_t *pol_data);
 
+static double
+ewma_get_next_priority(circuitmux_t *cmux,
+    circuitmux_policy_data_t *pol_data);
+
 /*** EWMA global variables ***/
 
 /** The per-tick scale factor to be used when computing cell-count EWMA
@@ -209,7 +213,8 @@ circuitmux_policy_t ewma_policy = {
   /*.notify_circ_inactive =*/ ewma_notify_circ_inactive,
   /*.notify_set_n_cells =*/ NULL, /* EWMA doesn't need this */
   /*.notify_xmit_cells =*/ ewma_notify_xmit_cells,
-  /*.pick_active_circuit =*/ ewma_pick_active_circuit
+  /*.pick_active_circuit =*/ ewma_pick_active_circuit,
+  ewma_get_next_priority
 };
 
 /*** EWMA method implementations using the below EWMA helper functions ***/
@@ -680,5 +685,35 @@ pop_first_cell_ewma(ewma_policy_data_t *pol)
   return smartlist_pqueue_pop(pol->active_circuit_pqueue,
                               compare_cell_ewma_counts,
                               STRUCT_OFFSET(cell_ewma_t, heap_index));
+}
+
+static double
+ewma_get_next_priority(circuitmux_t *cmux,
+    circuitmux_policy_data_t *pol_data) {
+  cell_ewma_t *cell_ewma = NULL;
+  ewma_policy_data_t *pol = NULL;
+  unsigned int tick;
+  double fractional_tick;
+  /* The current (hi-res) time */
+  struct timeval now_hires;
+
+  pol = TO_EWMA_POL_DATA(pol_data);
+
+  /* Rescale the EWMAs if needed */
+  tor_gettimeofday_cached(&now_hires);
+  tick = cell_ewma_tick_from_timeval(&now_hires, &fractional_tick);
+
+  if (tick != pol->active_circuit_pqueue_last_recalibrated) {
+    scale_active_circuits(pol, tick);
+  }
+
+  if (smartlist_len(pol->active_circuit_pqueue) > 0) {
+    /* Get the head of the queue */
+    cell_ewma = smartlist_get(pol->active_circuit_pqueue, 0);
+//    circ = cell_ewma_to_circuit(cell_ewma);
+    return cell_ewma->cell_count;
+  } else {
+    return -1.0;
+  }
 }
 

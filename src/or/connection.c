@@ -3660,7 +3660,8 @@ connection_outbuf_too_full(connection_t *conn)
  * return 0.
  */
 static int
-connection_handle_write_impl(connection_t *conn, int force)
+connection_handle_write_impl(connection_t *conn, int force,
+    size_t ceiling, size_t* n_written_out)
 {
   int e;
   socklen_t len=(socklen_t)sizeof(e);
@@ -3721,6 +3722,20 @@ connection_handle_write_impl(connection_t *conn, int force)
 
   max_to_write = force ? (ssize_t)conn->outbuf_flushlen
     : connection_bucket_write_limit(conn, now);
+  if(force) {
+    max_to_write = (ssize_t)conn->outbuf_flushlen;
+  } else {
+    max_to_write = connection_bucket_write_limit(conn, now);
+    if(ceiling > 0 && (max_to_write > ((ssize_t)ceiling))) {
+      max_to_write = (ssize_t)ceiling;
+    }
+  }
+
+  log_info(LD_NET, "conn write limits conn=%i flushlen="U64_FORMAT" max_to_write="I64_FORMAT" ceiling="U64_FORMAT,
+      (int)conn->s,
+      (long long unsigned int)conn->outbuf_flushlen,
+      (long long int)max_to_write,
+      (long long unsigned int)ceiling);
 
   if (connection_speaks_cells(conn) &&
       conn->state > OR_CONN_STATE_PROXY_HANDSHAKING) {
@@ -3828,6 +3843,10 @@ connection_handle_write_impl(connection_t *conn, int force)
     n_written = (size_t) result;
   }
 
+  if(n_written_out) {
+    *n_written_out = n_written;
+  }
+
   if (n_written && conn->type == CONN_TYPE_AP) {
     edge_connection_t *edge_conn = TO_EDGE_CONN(conn);
     circuit_t *circ = circuit_get_by_edge_conn(edge_conn);
@@ -3902,12 +3921,13 @@ connection_handle_write_impl(connection_t *conn, int force)
 
 /* DOCDOC connection_handle_write */
 int
-connection_handle_write(connection_t *conn, int force)
+connection_handle_write(connection_t *conn, int force,
+    size_t ceiling, size_t* n_written)
 {
     int res;
     tor_gettimeofday_cache_clear();
     conn->in_connection_handle_write = 1;
-    res = connection_handle_write_impl(conn, force);
+    res = connection_handle_write_impl(conn, force, ceiling, n_written);
     conn->in_connection_handle_write = 0;
     return res;
 }
@@ -3928,7 +3948,7 @@ connection_flush(connection_t *conn)
       int r = bufferevent_flush(conn->bufev, EV_WRITE, BEV_FLUSH);
       return (r < 0) ? -1 : 0;
   });
-  return connection_handle_write(conn, 1);
+  return connection_handle_write(conn, 1, 0, NULL);
 }
 
 /** Append <b>len</b> bytes of <b>string</b> onto <b>conn</b>'s
@@ -4012,7 +4032,7 @@ connection_write_to_buf_impl_,(const char *string, size_t len,
     conn->outbuf_flushlen += len;
 
     /* Should we try flushing the outbuf now? */
-    if (conn->in_flushed_some) {
+    if (conn->in_flushed_some || get_options()->AutotuneWriteUSec) {
       /* Don't flush the outbuf when the reason we're writing more stuff is
        * _because_ we flushed the outbuf.  That's unfair. */
       return;
@@ -4026,7 +4046,7 @@ connection_write_to_buf_impl_,(const char *string, size_t len,
     } else
       return; /* no need to try flushing */
 
-    if (connection_handle_write(conn, 0) < 0) {
+    if (connection_handle_write(conn, 0, 0, NULL) < 0) {
       if (!conn->marked_for_close) {
         /* this connection is broken. remove it. */
         log_warn(LD_BUG, "unhandled error on write for "
@@ -4617,9 +4637,13 @@ assert_connection_ok(connection_t *conn, time_t now)
   if (conn->outbuf_flushlen > 0) {
     /* With optimistic data, we may have queued data in
      * EXIT_CONN_STATE_RESOLVING while the conn is not yet marked to writing.
+     *
+     * With global circuit scheduling, we may have data in the outbuf while
+     * not writing because we are delaying the write event.
      * */
     tor_assert((conn->type == CONN_TYPE_EXIT &&
                 conn->state == EXIT_CONN_STATE_RESOLVING) ||
+               get_options()->GlobalSchedulerUSec ||
                connection_is_writing(conn) ||
                conn->write_blocked_on_bw ||
                (CONN_IS_EDGE(conn) &&

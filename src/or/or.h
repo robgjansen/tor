@@ -1520,6 +1520,22 @@ typedef struct or_connection_t {
   /** Last emptied write token bucket in msec since midnight; only used if
    * TB_EMPTY events are enabled. */
   uint32_t write_emptied_time;
+
+  int globalSchedulePending;
+  struct {
+    /* most recent and current socket stats information
+     * FIXME these are not freed! */
+    struct socket_stats_t* prevstats;
+    struct socket_stats_t* currstats;
+    //    smartlist_t* expected_acks;
+    //    ssize_t predicted_acks_coming_soon;
+    /* the number of bytes the kernel would be willing to immediately flush if we sent it */
+    size_t kernel_would_flush;
+    /* the number of bytes tor should write to the kernel from this conn */
+    size_t remaining;
+    size_t written_to_kernel;
+    size_t rttmin_nsec;
+  } autotune;
 } or_connection_t;
 
 /** Subtype of connection_t for an "edge connection" -- that is, an entry (ap)
@@ -4175,6 +4191,17 @@ typedef struct {
   double PathBiasExtremeUseRate;
   int PathBiasScaleUseThreshold;
   /** @} */
+
+  unsigned int GlobalSchedulerUSec;
+  /* when autotuning, how often we try to write to kernel */
+  unsigned int AutotuneWriteUSec;
+  /* when autotuning, how often we add to our bucket */
+  unsigned int AutotuneRefillUSec;
+  /* when autotuning, our bucket size is how much we can send in this time */
+  unsigned int AutotuneFillLimitUSec;
+  /* if set, use this as the node's bandwidth instead of auto-detecting it
+   * in bytes/sercond */
+  uint64_t AutotuneWriteBWOverride;
 
   int IPv6Exit; /**< Do we support exiting to IPv6 addresses? */
 

@@ -464,6 +464,11 @@ static config_var_t option_vars_[] = {
   V(TestingCertMaxDownloadTries, UINT, "8"),
   V(TestingDirAuthVoteGuard, ROUTERSET, NULL),
   VAR("___UsingTestNetworkDefaults", BOOL, UsingTestNetworkDefaults_, "0"),
+  V(GlobalSchedulerUSec,         UINT,     "0"),
+  V(AutotuneWriteUSec,           UINT,     "0"),
+  V(AutotuneRefillUSec,          UINT,     "0"),
+  V(AutotuneFillLimitUSec,       UINT,     "0"),
+  V(AutotuneWriteBWOverride,     MEMUNIT,  "0"),
 
   { NULL, CONFIG_TYPE_OBSOLETE, 0, NULL }
 };

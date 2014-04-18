@@ -127,7 +127,8 @@ int connection_fetch_from_buf_http(connection_t *conn,
 
 int connection_wants_to_flush(connection_t *conn);
 int connection_outbuf_too_full(connection_t *conn);
-int connection_handle_write(connection_t *conn, int force);
+int connection_handle_write(connection_t *conn, int force,
+    size_t ceiling, size_t* n_written);
 int connection_flush(connection_t *conn);
 
 MOCK_DECL(void, connection_write_to_buf_impl_,

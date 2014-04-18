@@ -31,6 +31,7 @@ endif
 
 LIBTOR_A_SOURCES = \
 	src/or/addressmap.c				\
+	src/or/autotune.c				\
 	src/or/buffers.c				\
 	src/or/channel.c				\
 	src/or/channeltls.c				\
@@ -132,6 +133,7 @@ endif
 
 ORHEADERS = \
 	src/or/addressmap.h				\
+	src/or/autotune.h				\
 	src/or/buffers.h				\
 	src/or/channel.h				\
 	src/or/channeltls.h				\

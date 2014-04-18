@@ -57,6 +57,8 @@ struct circuitmux_policy_s {
   /* Choose a circuit */
   circuit_t * (*pick_active_circuit)(circuitmux_t *cmux,
                                      circuitmux_policy_data_t *pol_data);
+  double (*get_next_priority)(circuitmux_t *cmux,
+                                       circuitmux_policy_data_t *pol_data);
 };
 
 /*
@@ -142,6 +144,8 @@ void circuitmux_append_destroy_cell(channel_t *chan,
                                     uint8_t reason);
 void circuitmux_mark_destroyed_circids_usable(circuitmux_t *cmux,
                                               channel_t *chan);
+
+channel_tls_t *circuitmux_choose_channel(smartlist_t *orconn_filter);
 
 #endif /* TOR_CIRCUITMUX_H */
 

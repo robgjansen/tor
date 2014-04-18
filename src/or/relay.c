@@ -15,6 +15,7 @@
 #include "addressmap.h"
 #include "buffers.h"
 #include "channel.h"
+#include "channeltls.h"
 #include "circpathbias.h"
 #include "circuitbuild.h"
 #include "circuitlist.h"
@@ -2620,7 +2621,12 @@ append_cell_to_circuit_queue(circuit_t *circ, channel_t *chan,
     log_debug(LD_GENERAL, "Made a circuit active.");
   }
 
-  if (!channel_has_queued_writes(chan)) {
+  if(get_options()->GlobalSchedulerUSec) {
+    if(!connection_is_writing(TO_CONN(TLS_CHAN_TO_ORCONN(BASE_CHAN_TO_TLS(chan))))) {
+      /* autotuning, libevent will tell us to add to pending queue */
+      connection_start_writing(TO_CONN(TLS_CHAN_TO_ORCONN(BASE_CHAN_TO_TLS(chan))));
+    }
+  } else if (!channel_has_queued_writes(chan)) {
     /* There is no data at all waiting to be sent on the outbuf.  Add a
      * cell, so that we can notice when it gets flushed, flushed_some can
      * get called, and we can start putting more data onto the buffer then.

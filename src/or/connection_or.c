@@ -587,6 +587,10 @@ connection_or_process_inbuf(or_connection_t *conn)
 int
 connection_or_flushed_some(or_connection_t *conn)
 {
+  if(get_options()->GlobalSchedulerUSec) {
+    return 0;
+  }
+
   size_t datalen, temp;
   ssize_t n, flushed;
   size_t cell_network_size = get_cell_network_size(conn->wide_circ_ids);

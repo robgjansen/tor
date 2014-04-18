@@ -311,6 +311,14 @@ channel_tls_to_base(channel_tls_t *tlschan)
   return &(tlschan->base_);
 }
 
+or_connection_t *
+channel_tls_to_orconn(channel_tls_t *tlschan)
+{
+  if (!tlschan) return NULL;
+
+  return tlschan->conn;
+}
+
 /**
  * Cast a channel_t to a channel_tls_t, with appropriate type-checking
  * asserts.

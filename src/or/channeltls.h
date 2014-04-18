@@ -14,6 +14,7 @@
 
 #define BASE_CHAN_TO_TLS(c) (channel_tls_from_base((c)))
 #define TLS_CHAN_TO_BASE(c) (channel_tls_to_base((c)))
+#define TLS_CHAN_TO_ORCONN(c) (channel_tls_to_orconn((c)))
 
 #define TLS_CHAN_MAGIC 0x8a192427U
 
@@ -36,6 +37,7 @@ channel_t * channel_tls_handle_incoming(or_connection_t *orconn);
 
 /* Casts */
 
+or_connection_t * channel_tls_to_orconn(channel_tls_t *tlschan);
 channel_t * channel_tls_to_base(channel_tls_t *tlschan);
 channel_tls_t * channel_tls_from_base(channel_t *chan);
 

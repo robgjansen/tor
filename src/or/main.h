@@ -43,6 +43,7 @@ int connection_is_writing(connection_t *conn);
 MOCK_DECL(void,connection_stop_writing,(connection_t *conn));
 MOCK_DECL(void,connection_start_writing,(connection_t *conn));
 
+size_t write_to_connection(connection_t *conn, size_t ceiling, int* has_error);
 void connection_stop_reading_from_linked_conn(connection_t *conn);
 
 void directory_all_unreachable(time_t now);

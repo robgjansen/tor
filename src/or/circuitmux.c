@@ -8,6 +8,7 @@
 
 #include "or.h"
 #include "channel.h"
+#include "channeltls.h"
 #include "circuitlist.h"
 #include "circuitmux.h"
 #include "relay.h"
@@ -1488,6 +1489,30 @@ circuitmux_get_first_active_circuit(circuitmux_t *cmux,
   }
 
   return circ;
+}
+
+#include <float.h>
+channel_tls_t *circuitmux_choose_channel(smartlist_t *orconn_filter) {
+  channel_tls_t *chosen = NULL;
+  double chosen_p = DBL_MAX;
+
+  SMARTLIST_FOREACH(orconn_filter, or_connection_t *, orconn, {
+    if(orconn && orconn->chan) {
+      circuitmux_t* next = TLS_CHAN_TO_BASE(orconn->chan)->cmux;
+      double next_p = DBL_MAX;
+      if (next && next->policy && next->policy->get_next_priority) {
+        next_p = next->policy->get_next_priority(next, next->policy_data);
+      } else {
+        next_p = DBL_MAX;
+      }
+      if(!chosen || next_p < chosen_p) {
+        chosen_p = next_p;
+        chosen = orconn->chan;
+      }
+    }
+  });
+
+  return chosen;
 }
 
 /**

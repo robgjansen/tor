@@ -12,6 +12,7 @@ LIBS = ..\..\..\build-alpha\lib\libevent.lib \
 
 LIBTOR_OBJECTS = \
   addressmap.obj \
+  autotune.obj \
   buffers.obj \
   channel.obj \
   channeltls.obj \
