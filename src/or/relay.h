@@ -73,7 +73,7 @@ const uint8_t *decode_address_from_payload(tor_addr_t *addr_out,
                                         int payload_len);
 
 void set_perconn_halflife(const or_options_t *options);
-void scale_single_perconn_ewma(cell_ewma_t *ewma, unsigned cur_tick, double factor);
+double perconn_ewma_get_increment();
 
 void circuit_clear_cell_queue(circuit_t *circ, channel_t *chan);
 

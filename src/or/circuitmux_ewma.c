@@ -415,8 +415,6 @@ ewma_notify_xmit_cells(circuitmux_t *cmux,
   /* Do the adjustment */
   cell_ewma = &(cdata->cell_ewma);
   cell_ewma->cell_count += ewma_increment;
-  // ROB
-
 
   /*
    * Since we just sent on this circuit, it should be at the head of

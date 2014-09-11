@@ -988,9 +988,7 @@ connection_or_throttle_fingerprint(smartlist_t *conns, const or_options_t *optio
 
     double rate = (double)(options->BandwidthRate / 1000 * milliseconds_elapsed);
     double cell_share_increment = rate / conn_len / get_cell_network_size(0);
-    pct->fingerprint_ewma.cell_count += cell_share_increment;
-    scale_single_perconn_ewma(&pct->fingerprint_ewma,
-        pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
+    pct->fingerprint_ewma.cell_count += (cell_share_increment * perconn_ewma_get_increment());
 
     if(options->PerConnBWFingerprintVerbose) {
       log_notice(LD_OR, "PerConnBW fingerprint ewma incremented by %f, scaled to %f",

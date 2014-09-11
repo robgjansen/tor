@@ -2359,56 +2359,47 @@ set_perconn_halflife(const or_options_t *options){
   }
 }
 
-static INLINE double
-get_perconn_scale_factor(unsigned from_tick, unsigned to_tick, double scale_factor)
-{
-  /* This math can wrap around, but that's okay: unsigned overflow is
-     well-defined */
-  int diff = (int)(to_tick - from_tick);
-  return pow(scale_factor, diff);
-}
-
-static void
-scale_or_connections(smartlist_t *conns, unsigned cur_tick) {
-  pc_throttle_globals_t *pct = get_pc_throttle_globals();
-  double factor = get_perconn_scale_factor(pct->perconn_ewma_last_recalibrated, cur_tick,
-      pct->perconn_ewma_scale_factor);
-  SMARTLIST_FOREACH(conns, connection_t *, conn,
-  {
-    if (connection_speaks_cells(conn)) {
-      or_connection_t *or_conn = TO_OR_CONN(conn);
-    tor_assert(or_conn->throttle.ewma.last_adjusted_tick ==
-        pct->perconn_ewma_last_recalibrated);
-    or_conn->throttle.ewma.cell_count *= factor;
-    or_conn->throttle.ewma.last_adjusted_tick = cur_tick;
-    }
-  });
-  pct->perconn_ewma_last_recalibrated = cur_tick;
-}
-
-static double
+double
 perconn_ewma_get_increment() {
   pc_throttle_globals_t *pct = get_pc_throttle_globals();
   double pc_ewma_increment = -1;
+
   if (pct->perconn_ewma_enabled) {
     struct timeval now_hires;
-    unsigned tick;
-    double fractional_tick;
     tor_gettimeofday_cached(&now_hires);
-    tick = cell_ewma_tick_from_timeval(&now_hires, &fractional_tick);
+
+    double fractional_tick;
+    unsigned tick = cell_ewma_tick_from_timeval(&now_hires, &fractional_tick);
+
+    /* check if the tick changed and we should scale everything */
     if(tick != pct->perconn_ewma_last_recalibrated) {
-      scale_or_connections(get_connection_array(), tick);
+      /* we need to scale */
+      int diff = (int)(tick - pct->perconn_ewma_last_recalibrated);
+      double factor = pow(pct->perconn_ewma_scale_factor, diff);
+
+      /* scale our global fair ewma */
+      pct->fingerprint_ewma.cell_count *= factor;
+
+      /* scale all conns */
+      SMARTLIST_FOREACH(get_connection_array(), connection_t *, conn,
+      {
+        if (connection_speaks_cells(conn)) {
+          or_connection_t *or_conn = TO_OR_CONN(conn);
+          tor_assert(or_conn->throttle.ewma.last_adjusted_tick == pct->perconn_ewma_last_recalibrated);
+          or_conn->throttle.ewma.cell_count *= factor;
+          or_conn->throttle.ewma.last_adjusted_tick = tick;
+        }
+      });
+
+      /* we are now current with tick */
+      pct->perconn_ewma_last_recalibrated = tick;
     }
+
+    /* handle being part way to the next tick, or it will be 1 if we are at tick */
     pc_ewma_increment = pow(pct->perconn_ewma_scale_factor, -fractional_tick);
   }
-  return pc_ewma_increment;
-}
 
-void
-scale_single_perconn_ewma(cell_ewma_t *ewma, unsigned cur_tick, double factor)
-{
-  ewma->cell_count *= factor;
-  ewma->last_adjusted_tick = cur_tick;
+  return pc_ewma_increment;
 }
 
 /** Pull as many cells as possible (but no more than <b>max</b>) from the
@@ -2506,9 +2497,8 @@ channel_flush_from_first_active_circuit(channel_t *chan, int max)
       channel_tls_t *tlschan = BASE_CHAN_TO_TLS(chan);
       tor_assert(tlschan);
       or_connection_t *conn = tlschan->conn;
+
       conn->throttle.ewma.cell_count += pc_ewma_increment;
-      scale_single_perconn_ewma(&conn->throttle.ewma,
-          pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
     }
 
     /* Is the cell queue low enough to unblock all the streams that are waiting
