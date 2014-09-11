@@ -798,7 +798,7 @@ connection_or_get_active_unthrottled_clients(smartlist_t *conns) {
 	if (connection_speaks_cells(conn) && conn->state == OR_CONN_STATE_OPEN) {
 		or_connection_t* or_conn = TO_OR_CONN(conn);
 		if(!connection_or_digest_is_known_relay(or_conn->identity_digest) &&
-		/*if(or_conn->is_connection_with_client && /* client */
+//		if(or_conn->is_connection_with_client && /* client */
 				or_conn->throttle.ewma.cell_count > 100.0 && /* truely active */
 				or_conn->throttle.cell_count_penalty < 0.0) { /* unthrottled */
 		  smartlist_add(or_conns, TO_OR_CONN(conn));
@@ -813,7 +813,7 @@ connection_or_get_active_unthrottled_clients(smartlist_t *conns) {
  * caller must free list.
  */
 static smartlist_t *
-connection_or_get_active_nonrelay(smartlist_t *conns) {
+connection_or_get_open_nonrelay(smartlist_t *conns) {
   smartlist_t* or_conns = smartlist_new();
   SMARTLIST_FOREACH(conns, connection_t *, conn,
   {
@@ -933,6 +933,32 @@ connection_or_cluster(smartlist_t *conns, double* partition_out,
   tor_free(rd);
 }
 
+char* get_display_string(smartlist_t* addresses) {
+  char* display_str = tor_calloc(1, 120*smartlist_len(addresses));
+  size_t offset = 0;
+
+  SMARTLIST_FOREACH(addresses, in_addr_t *, addr, {
+    struct sockaddr_in sai;
+    memset(&sai, 0, sizeof(struct sockaddr_in));
+    sai.sin_addr.s_addr = *addr;
+
+    getnameinfo((const struct sockaddr *)&sai, (socklen_t)sizeof(struct sockaddr_in),
+        &(display_str[offset]), 100, NULL, 0, 0);
+    offset += strlen(&(display_str[offset]));
+
+    tor_snprintf(&(display_str[offset]), 1, ",");
+    offset += 1;
+
+    tor_inet_ntop(AF_INET, addr, &(display_str[offset]), 17);
+    offset += strlen(&(display_str[offset]));
+
+    tor_snprintf(&(display_str[offset]), 1, ";");
+    offset += 1;
+  });
+
+  return display_str;
+}
+
 /**
  * Throttle connections using statistical fingerprinting, using only the
  * statistical properties of the connection to avoid privacy risks.
@@ -946,19 +972,22 @@ connection_or_cluster(smartlist_t *conns, double* partition_out,
  * @param options global options for this relay
  */
 void
-connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, int milliseconds_elapsed) {
+connection_or_throttle_fingerprint(smartlist_t *conns, const or_options_t *options, int milliseconds_elapsed) {
   pc_throttle_globals_t *pct = get_pc_throttle_globals();
 
   /* the following is not used in clustering mode */
   if(!options->PerConnBWFingerprintCluster) {
     double conn_len = ((double)smartlist_len(conns));
-    if(conn_len < 0)
+    if(conn_len <= 0) {
       return;
+    }
+
     double rate = (double)(options->BandwidthRate / 1000 * milliseconds_elapsed);
     double cell_share_increment = rate / conn_len / get_cell_network_size(0);
     pct->fingerprint_ewma.cell_count += cell_share_increment;
     scale_single_perconn_ewma(&pct->fingerprint_ewma,
         pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
+
     log_info(LD_OR, "fingerprint ewma incremented by %f, scaled to %f",
           cell_share_increment, pct->fingerprint_ewma.cell_count);
   }
@@ -968,13 +997,13 @@ connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, in
   if(options->PerConnBWFingerprintCluster) {
     client_conns = connection_or_get_active_unthrottled_clients(conns);
   } else {
-    client_conns = connection_or_get_active_nonrelay(conns);
+    client_conns = connection_or_get_open_nonrelay(conns);
   }
 
   /* make sure we have client connections */
-  int n = smartlist_len(client_conns);
-  if(n <= 0)
+  if(smartlist_len(client_conns) <= 0) {
     return;
+  }
 
   /* compute the 1-d 2-cluster. connections above partition are in the "high"
    * bandwidth class, and below are in the "low" bandwidth class. we also
@@ -985,12 +1014,11 @@ connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, in
   }
 
   /* log throttling information if option is set */
-  int throttled_addresses_len;
-  char* throttled_addresses;
+  smartlist_t* flagged_clients = NULL;
+  smartlist_t* unflagged_clients = NULL;
   if(options->PerConnBWFingerprintVerbose) {
-	throttled_addresses_len = 10;
-	throttled_addresses = tor_malloc_zero(throttled_addresses_len);
-    tor_snprintf(throttled_addresses, throttled_addresses_len, "throttled");
+    flagged_clients = smartlist_new();
+    unflagged_clients = smartlist_new();
   }
 
   SMARTLIST_FOREACH(client_conns, or_connection_t *, orc,
@@ -1036,31 +1064,49 @@ connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, in
             options->PerConnBWFingerprintPenalty;
         }
 
-        /* track the addresses we are throttling
-         * TODO: there is a much better way to do this */
+        /* track the addresses we are throttling */
         if(options->PerConnBWFingerprintVerbose) {
-          throttled_addresses_len += 20;
-          char* extended = tor_malloc_zero(throttled_addresses_len);
-          tor_snprintf(extended, throttled_addresses_len, "%s %s",
-              throttled_addresses, orc->base_.address);
-          tor_free(throttled_addresses);
-          throttled_addresses = extended;
-          extended = NULL;
+          in_addr_t* addr = tor_calloc(1, sizeof(in_addr_t));
+          *addr = orc->base_.addr.addr.in_addr.s_addr;
+          if(orc->throttle.bandwidthrate >= 0) {
+            smartlist_add(flagged_clients, addr);
+          } else {
+            smartlist_add(unflagged_clients, addr);
+          }
         }
       }
     }
 
-	/* need to update the token buckets if our throttle rate changed */
+  /* need to update the token buckets if our throttle rate changed */
 	if(orc->throttle.bandwidthrate != old_rate) {
 	  connection_or_update_token_buckets_helper(orc, 0, options);
 	}
   });
 
   if(options->PerConnBWFingerprintVerbose) {
-    log_notice(LD_OR,"is_clustering_enabled %u partition-count %f intra-dist %f inter-dist %f %s",
-        options->PerConnBWFingerprintCluster,
-    		partition_count, intracd, intercd, throttled_addresses);
-    tor_free(throttled_addresses);
+    if(options->PerConnBWFingerprintCluster) {
+      log_notice(LD_OR,"PerConnBW cluster partition-count %f intra-dist %f inter-dist %f",
+          partition_count, intracd, intercd);
+    }
+
+    char* flagged_clients_string = get_display_string(flagged_clients);
+    char* unflagged_clients_string = get_display_string(unflagged_clients);
+
+    log_notice(LD_OR,"PerConnBW flagged %i %s unflagged %i %s",
+              smartlist_len(flagged_clients), flagged_clients_string,
+              smartlist_len(unflagged_clients), unflagged_clients_string);
+
+    tor_free(flagged_clients_string);
+    tor_free(unflagged_clients_string);
+
+    SMARTLIST_FOREACH(flagged_clients, tor_addr_t *, addr, {
+      tor_free(addr);
+    });
+    smartlist_free(flagged_clients);
+    SMARTLIST_FOREACH(unflagged_clients, tor_addr_t *, addr, {
+      tor_free(addr);
+    });
+    smartlist_free(unflagged_clients);
   }
 
   smartlist_free(client_conns);
@@ -1068,18 +1114,36 @@ connection_or_throttle_fingerprint(smartlist_t *conns, or_options_t *options, in
 
 void
 connection_or_log_cell_counts(smartlist_t *conns) {
-  /* get all active connections to non-relays */
-  smartlist_t* or_conns = connection_or_get_active_unthrottled_clients(conns);
+  smartlist_t* client_conns = NULL;
+  if(get_options()->PerConnBWFingerprintCluster) {
+    client_conns = connection_or_get_active_unthrottled_clients(conns);
+  } else {
+    client_conns = connection_or_get_open_nonrelay(conns);
+  }
+
+  /* make sure we have client connections */
+  if(smartlist_len(client_conns) <= 0) {
+    return;
+  }
 
   /* print out cell counts for each */
-  SMARTLIST_FOREACH(or_conns, or_connection_t *, or_conn,
+  SMARTLIST_FOREACH(client_conns, or_connection_t *, or_conn,
   {
-	  log_notice(LD_OR,"cell count %f for connection %lu to %s:%u",
-			or_conn->throttle.ewma.cell_count, or_conn->base_.global_identifier,
-			or_conn->base_.address, or_conn->base_.port);
+    struct sockaddr_in sai;
+    memset(&sai, 0, sizeof(struct sockaddr_in));
+    sai.sin_addr.s_addr = or_conn->base_.addr.addr.in_addr.s_addr;
+
+    char name[100];
+    memset(&name[0], 0, (size_t)100);
+    getnameinfo((const struct sockaddr *)&sai, (socklen_t)sizeof(struct sockaddr_in),
+        name, 100, NULL, 0, 0);
+
+	  log_notice(LD_OR,"PerConnBW rate %i cell count %f for connection %lu to %s (%s:%u)",
+	      or_conn->throttle.bandwidthrate, or_conn->throttle.ewma.cell_count,
+	      or_conn->base_.global_identifier, name, or_conn->base_.address, or_conn->base_.port);
   });
 
-  smartlist_free(or_conns);
+  smartlist_free(client_conns);
 }
 
 /** If we don't necessarily know the router we're connecting to, but we
