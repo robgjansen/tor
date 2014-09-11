@@ -938,7 +938,8 @@ char* get_display_string(smartlist_t* addresses) {
     return NULL;
   }
 
-  char* display_str = tor_calloc(1, 120*smartlist_len(addresses));
+  size_t len = (size_t)(120*smartlist_len(addresses));
+  char* display_str = tor_calloc(1, len);
   size_t offset = 0;
 
   SMARTLIST_FOREACH(addresses, in_addr_t *, addr, {
@@ -946,18 +947,17 @@ char* get_display_string(smartlist_t* addresses) {
     memset(&sai, 0, sizeof(struct sockaddr_in));
     sai.sin_addr.s_addr = *addr;
 
+    char hostname[100];
     getnameinfo((const struct sockaddr *)&sai, (socklen_t)sizeof(struct sockaddr_in),
-        &(display_str[offset]), 100, NULL, 0, 0);
-    offset += strlen(&(display_str[offset]));
+        hostname, 100, NULL, 0, 0);
 
-    tor_snprintf(&(display_str[offset]), 1, ",");
-    offset += 1;
+    struct in_addr ia;
+    ia.s_addr = *addr;
+    char ip[20];
+    tor_inet_ntoa(&ia, ip, 20);
 
-    tor_inet_ntop(AF_INET, addr, &(display_str[offset]), 17);
-    offset += strlen(&(display_str[offset]));
-
-    tor_snprintf(&(display_str[offset]), 1, ";");
-    offset += 1;
+    tor_snprintf(&(display_str[offset]), len-offset, "%s,%s;", hostname, ip);
+    offset += strnlen(&(display_str[offset]), len-offset);
   });
 
   return display_str;
