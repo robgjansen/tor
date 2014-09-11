@@ -934,6 +934,10 @@ connection_or_cluster(smartlist_t *conns, double* partition_out,
 }
 
 char* get_display_string(smartlist_t* addresses) {
+  if(smartlist_len(addresses) <= 0) {
+    return NULL;
+  }
+
   char* display_str = tor_calloc(1, 120*smartlist_len(addresses));
   size_t offset = 0;
 
@@ -988,8 +992,10 @@ connection_or_throttle_fingerprint(smartlist_t *conns, const or_options_t *optio
     scale_single_perconn_ewma(&pct->fingerprint_ewma,
         pct->perconn_ewma_last_recalibrated, pct->perconn_ewma_scale_factor);
 
-    log_info(LD_OR, "fingerprint ewma incremented by %f, scaled to %f",
+    if(options->PerConnBWFingerprintVerbose) {
+      log_notice(LD_OR, "PerConnBW fingerprint ewma incremented by %f, scaled to %f",
           cell_share_increment, pct->fingerprint_ewma.cell_count);
+    }
   }
 
   /* get new list of only active client connections */
@@ -1063,24 +1069,24 @@ connection_or_throttle_fingerprint(smartlist_t *conns, const or_options_t *optio
           orc->throttle.cell_count_penalty = pct->fingerprint_ewma.cell_count *
             options->PerConnBWFingerprintPenalty;
         }
-
-        /* track the addresses we are throttling */
-        if(options->PerConnBWFingerprintVerbose) {
-          in_addr_t* addr = tor_calloc(1, sizeof(in_addr_t));
-          *addr = orc->base_.addr.addr.in_addr.s_addr;
-          if(orc->throttle.bandwidthrate >= 0) {
-            smartlist_add(flagged_clients, addr);
-          } else {
-            smartlist_add(unflagged_clients, addr);
-          }
-        }
       }
     }
 
-  /* need to update the token buckets if our throttle rate changed */
-	if(orc->throttle.bandwidthrate != old_rate) {
-	  connection_or_update_token_buckets_helper(orc, 0, options);
-	}
+    /* need to update the token buckets if our throttle rate changed */
+    if(orc->throttle.bandwidthrate != old_rate) {
+      connection_or_update_token_buckets_helper(orc, 0, options);
+    }
+
+    /* track the addresses we are throttling */
+    if(options->PerConnBWFingerprintVerbose) {
+      in_addr_t* addr = tor_calloc(1, sizeof(in_addr_t));
+      *addr = orc->base_.addr.addr.in_addr.s_addr;
+      if(orc->throttle.bandwidthrate >= 0) {
+        smartlist_add(flagged_clients, addr);
+      } else {
+        smartlist_add(unflagged_clients, addr);
+      }
+    }
   });
 
   if(options->PerConnBWFingerprintVerbose) {
@@ -1096,8 +1102,12 @@ connection_or_throttle_fingerprint(smartlist_t *conns, const or_options_t *optio
               smartlist_len(flagged_clients), flagged_clients_string,
               smartlist_len(unflagged_clients), unflagged_clients_string);
 
-    tor_free(flagged_clients_string);
-    tor_free(unflagged_clients_string);
+    if(flagged_clients_string) {
+      tor_free(flagged_clients_string);
+    }
+    if(unflagged_clients_string) {
+      tor_free(unflagged_clients_string);
+    }
 
     SMARTLIST_FOREACH(flagged_clients, tor_addr_t *, addr, {
       tor_free(addr);
