@@ -43,6 +43,7 @@
 #include "nodelist.h"
 #include "ntmain.h"
 #include "onion.h"
+#include "peerflow.h"
 #include "policies.h"
 #include "transports.h"
 #include "relay.h"
@@ -1712,6 +1713,12 @@ second_elapsed_callback(periodic_timer_t *timer, void *arg)
   control_event_circ_bandwidth_used();
   control_event_circuit_cell_stats();
 
+  // this should probably move to tor_main, and then
+  // peerflow_relay_check_init called whenever PeerFlowEnabled gets set
+  if(public_server_mode(options) && options->PeerFlowEnabled) {
+    peerflow_relay_check_report();
+  }
+
   if (server_mode(options) &&
       !net_is_disabled() &&
       seconds_elapsed > 0 &&
@@ -2612,6 +2619,8 @@ tor_free_all(int postfork)
   if (!postfork) {
     evdns_shutdown(1);
   }
+  peerflow_relay_check_free();
+  peerflow_auth_check_free();
   geoip_free_all();
   dirvote_free_all();
   routerlist_free_all();

@@ -19,6 +19,7 @@
 #include "microdesc.h"
 #include "networkstatus.h"
 #include "nodelist.h"
+#include "peerflow.h"
 #include "policies.h"
 #include "rendclient.h"
 #include "rendcommon.h"
@@ -128,6 +129,7 @@ purpose_needs_anonymity(uint8_t dir_purpose, uint8_t router_purpose)
     return 1; /* if no circuits yet, this might break bootstrapping, but it's
                * needed to be safe. */
   if (dir_purpose == DIR_PURPOSE_UPLOAD_DIR ||
+      dir_purpose == DIR_PURPOSE_UPLOAD_PEERFLOW_BW ||
       dir_purpose == DIR_PURPOSE_UPLOAD_VOTE ||
       dir_purpose == DIR_PURPOSE_UPLOAD_SIGNATURES ||
       dir_purpose == DIR_PURPOSE_FETCH_STATUS_VOTE ||
@@ -169,6 +171,8 @@ dir_conn_purpose_to_string(int purpose)
     {
     case DIR_PURPOSE_UPLOAD_DIR:
       return "server descriptor upload";
+    case DIR_PURPOSE_UPLOAD_PEERFLOW_BW:
+      return "peerflow bw upload";
     case DIR_PURPOSE_UPLOAD_VOTE:
       return "server vote upload";
     case DIR_PURPOSE_UPLOAD_SIGNATURES:
@@ -1240,6 +1244,13 @@ directory_send_command(dir_connection_t *conn,
       }
       break;
     }
+    case DIR_PURPOSE_UPLOAD_PEERFLOW_BW: {
+      tor_assert(!resource);
+      tor_assert(payload);
+      httpcommand = "POST";
+      url = tor_strdup("/tor/post/peerflow");
+      break;
+    }
     case DIR_PURPOSE_UPLOAD_VOTE:
       tor_assert(!resource);
       tor_assert(payload);
@@ -2039,6 +2050,28 @@ connection_dir_client_reached_eof(dir_connection_t *conn)
      * dirservers down just because they don't like us. */
   }
 
+  if(conn->base_.purpose == DIR_PURPOSE_UPLOAD_PEERFLOW_BW) {
+    switch (status_code) {
+    case 200: {
+      log_notice(LD_DIR,"Uploaded a peerflow bw report to dirserver %s:%d",
+                 conn->base_.address, conn->base_.port);
+      }
+      break;
+    case 400:
+      log_warn(LD_DIR,"http status 400 (%s) response after uploading "
+               "peerflow bw report to dirserver '%s:%d'.",
+               escaped(reason), conn->base_.address, conn->base_.port);
+      break;
+    default:
+      log_warn(LD_GENERAL,
+           "http status %d (%s) reason unexpected while uploading "
+           "peerflow bw report to server '%s:%d').",
+           status_code, escaped(reason), conn->base_.address,
+           conn->base_.port);
+      break;
+    }
+  }
+
   if (conn->base_.purpose == DIR_PURPOSE_UPLOAD_VOTE) {
     switch (status_code) {
       case 200: {
@@ -2392,6 +2425,7 @@ note_client_request(int purpose, int compressed, size_t bytes)
     case DIR_PURPOSE_FETCH_SERVERDESC:    kind = "dl/server"; break;
     case DIR_PURPOSE_FETCH_EXTRAINFO:     kind = "dl/extra"; break;
     case DIR_PURPOSE_UPLOAD_DIR:          kind = "dl/ul-dir"; break;
+    case DIR_PURPOSE_UPLOAD_PEERFLOW_BW:  kind = "dl/ul-peerflow"; break;
     case DIR_PURPOSE_UPLOAD_VOTE:         kind = "dl/ul-vote"; break;
     case DIR_PURPOSE_UPLOAD_SIGNATURES:   kind = "dl/ul-sig"; break;
     case DIR_PURPOSE_FETCH_RENDDESC_V2:   kind = "dl/rend2"; break;
@@ -3226,6 +3260,21 @@ directory_handle_command_post(dir_connection_t *conn, const char *headers,
                "(\"%s\").",
                conn->base_.address, msg);
       write_http_status_line(conn, 400, msg);
+    }
+    goto done;
+  }
+
+  if (authdir_mode_v3(options) &&
+      !strcmp(url,"/tor/post/peerflow")) { /* peerflow bw report */
+    const char *msg = "OK";
+    int status;
+    if (peerflow_auth_notify_report_received(body, &msg, &status)) {
+      write_http_status_line(conn, status, msg);
+    } else {
+      tor_assert(msg);
+      log_warn(LD_DIRSERV, "Rejected peerflow report from %s (\"%s\").",
+               conn->base_.address, msg);
+      write_http_status_line(conn, status, msg);
     }
     goto done;
   }

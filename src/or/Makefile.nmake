@@ -50,6 +50,9 @@ LIBTOR_OBJECTS = \
   onion_fast.obj \
   onion_ntor.obj \
   onion_tap.obj \
+  peerflow_auth.obj \
+  peerflow_relay.obj \
+  peerflow_report.obj \
   policies.obj \
   reasons.obj \
   relay.obj \

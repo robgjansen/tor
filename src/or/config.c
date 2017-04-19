@@ -333,6 +333,11 @@ static config_var_t option_vars_[] = {
   V(PathBiasScaleUseThreshold,      INT,      "-1"),
 
   V(PathsNeededToBuildCircuits,  DOUBLE,   "-1"),
+
+  V(PeerFlowEnabled,             BOOL,  "0"),
+  V(PeerFlowReportPeriod,        INTERVAL,  "5 minutes"),
+  V(PeerFlowLaplaceScale,        DOUBLE,    "0.0"),
+
   V(PerConnBWBurst,              MEMUNIT,  "0"),
   V(PerConnBWRate,               MEMUNIT,  "0"),
   V(PidFile,                     STRING,   NULL),

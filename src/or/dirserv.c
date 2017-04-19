@@ -21,6 +21,7 @@
 #include "microdesc.h"
 #include "networkstatus.h"
 #include "nodelist.h"
+#include "peerflow.h"
 #include "policies.h"
 #include "rephist.h"
 #include "router.h"
@@ -2380,6 +2381,7 @@ dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
    * Do this so dirserv_compute_performance_thresholds() and
    * set_routerstatus_from_routerinfo() see up-to-date bandwidth info.
    */
+  /* RGJ: I'm not sure why this ifelse is needed here since it's already below... */
   if (options->V3BandwidthsFile) {
     dirserv_read_measured_bandwidths(options->V3BandwidthsFile, NULL);
   } else {
@@ -2468,6 +2470,10 @@ dirserv_generate_networkstatus_vote_obj(crypto_pk_t *private_key,
     if (dirserv_get_measured_bw_cache_size() > 0) {
       dirserv_clear_measured_bw_cache();
     }
+  }
+
+  if (options->PeerFlowEnabled) {
+    peerflow_auth_process_measurements_for_consensus(routerstatuses);
   }
 
   v3_out = tor_malloc_zero(sizeof(networkstatus_t));

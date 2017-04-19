@@ -61,6 +61,9 @@ LIBTOR_A_SOURCES = \
 	src/or/onion_fast.c				\
 	src/or/onion_tap.c				\
 	src/or/transports.c				\
+	src/or/peerflow_auth.c				\
+	src/or/peerflow_relay.c				\
+	src/or/peerflow_report.c			\
 	src/or/policies.c				\
 	src/or/reasons.c				\
 	src/or/relay.c					\

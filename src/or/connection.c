@@ -38,6 +38,7 @@
 #include "ext_orport.h"
 #include "geoip.h"
 #include "main.h"
+#include "peerflow.h"
 #include "policies.h"
 #include "reasons.h"
 #include "relay.h"
@@ -3423,6 +3424,10 @@ connection_read_to_buf(connection_t *conn, ssize_t *max_to_read,
     }
   }
 
+  if((n_written || n_read) &&
+      public_server_mode(get_options()) && get_options()->PeerFlowEnabled) {
+    peerflow_relay_notify_bytes_observed(conn, n_read, n_written);
+  }
   connection_buckets_decrement(conn, approx_time(), n_read, n_written);
 
   if (more_to_read && result == at_most) {
@@ -3897,6 +3902,10 @@ connection_handle_write_impl(connection_t *conn, int force)
       conn->n_written_conn_bw = UINT32_MAX;
   }
 
+  if((n_written || n_read) &&
+      public_server_mode(get_options()) && get_options()->PeerFlowEnabled) {
+    peerflow_relay_notify_bytes_observed(conn, n_read, n_written);
+  }
   connection_buckets_decrement(conn, approx_time(), n_read, n_written);
 
   if (result > 0) {

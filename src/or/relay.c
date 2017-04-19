@@ -32,6 +32,7 @@
 #include "networkstatus.h"
 #include "nodelist.h"
 #include "onion.h"
+#include "peerflow.h"
 #include "policies.h"
 #include "reasons.h"
 #include "relay.h"
@@ -2695,6 +2696,10 @@ channel_flush_from_first_active_circuit, (channel_t *chan, int max))
 
     /* Update the counter */
     ++n_flushed;
+
+    if(public_server_mode(get_options()) && get_options()->PeerFlowEnabled) {
+      peerflow_relay_notify_cell_sent(chan, circ);
+    }
 
     /*
      * Now update the cmux; tell it we've just sent a cell, and how many

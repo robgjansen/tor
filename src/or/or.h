@@ -411,6 +411,8 @@ typedef enum {
 #define DIR_PURPOSE_FETCH_EXTRAINFO 7
 /** A connection to a directory server: upload a server descriptor. */
 #define DIR_PURPOSE_UPLOAD_DIR 8
+/** A connection to a directory server: upload a peerflow bw report. */
+#define DIR_PURPOSE_UPLOAD_PEERFLOW_BW 9
 /** A connection to a directory server: upload a v3 networkstatus vote. */
 #define DIR_PURPOSE_UPLOAD_VOTE 10
 /** A connection to a directory server: upload a v3 consensus signature */
@@ -444,6 +446,7 @@ typedef enum {
  * directory server. */
 #define DIR_PURPOSE_IS_UPLOAD(p)                \
   ((p)==DIR_PURPOSE_UPLOAD_DIR ||               \
+   (p)==DIR_PURPOSE_UPLOAD_PEERFLOW_BW ||       \
    (p)==DIR_PURPOSE_UPLOAD_VOTE ||              \
    (p)==DIR_PURPOSE_UPLOAD_SIGNATURES)
 
@@ -4238,6 +4241,17 @@ typedef struct {
   double PathBiasExtremeUseRate;
   int PathBiasScaleUseThreshold;
   /** @} */
+
+  /** should we use the peerflow secure bandwidth measurement system */
+  int PeerFlowEnabled;
+
+  /** in peerflow, how often a relay sends bandwidth reports
+   * about its peers to the authority, in seconds */
+  int PeerFlowReportPeriod;
+
+  /* the scale to use to obfuscate peerflow relay reports before sending
+   * the the bandwidth authority. If 0.0, no obfuscation is done. */
+  double PeerFlowLaplaceScale;
 
   int IPv6Exit; /**< Do we support exiting to IPv6 addresses? */
 

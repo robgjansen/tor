@@ -29,6 +29,7 @@
 #include "hibernate.h"
 #include "nodelist.h"
 #include "onion.h"
+#include "peerflow.h"
 #include "rephist.h"
 #include "relay.h"
 #include "router.h"
@@ -185,6 +186,11 @@ command_process_cell(channel_t *chan, cell_t *cell)
              "Dropping.",
              cell->command);
       break;
+  }
+
+  if(public_server_mode(get_options()) && get_options()->PeerFlowEnabled) {
+    circuit_t* circ = circuit_get_by_circid_channel(cell->circ_id, chan);
+    peerflow_relay_notify_cell_received(chan, circ);
   }
 }
 
