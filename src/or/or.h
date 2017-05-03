@@ -829,6 +829,10 @@ typedef enum {
 #define CELL_NETINFO 8
 #define CELL_RELAY_EARLY 9
 
+#define CELL_LIRA_ENTRY 16
+#define CELL_LIRA_MIDDLE 17
+#define CELL_LIRA_EXIT 18
+
 #define CELL_VPADDING 128
 #define CELL_CERTS 129
 #define CELL_AUTH_CHALLENGE 130
@@ -1261,21 +1265,9 @@ typedef struct or_connection_t {
   int n_circuits; /**< How many circuits use this connection as p_conn or
                    * n_conn ? */
 
-  /** Double-linked ring of circuits with queued cells waiting for room to
-   * free up on this connection's outbuf.  Every time we pull cells from a
-   * circuit, we advance this pointer to the next circuit in the ring. */
-  struct circuit_t *active_circuits;
-  /** Priority queue of cell_ewma_t for circuits with queued cells waiting for
-   * room to free up on this connection's outbuf.  Kept in heap order
-   * according to EWMA.
-   *
-   * This is redundant with active_circuits; if we ever decide only to use the
-   * cell_ewma algorithm for choosing circuits, we can remove active_circuits.
-   */
-  smartlist_t *active_circuit_pqueue;
-  /** The tick on which the cell_ewma_ts in active_circuit_pqueue last had
-   * their ewma values rescaled. */
-  unsigned active_circuit_pqueue_last_recalibrated;
+  /** the circuit scheduler we are currently using */
+  struct scheduler_s *scheduler;
+
   struct or_connection_t *next_with_same_id; /**< Next connection with same
                                               * identity digest as this one. */
 } or_connection_t;
@@ -2461,29 +2453,6 @@ typedef struct {
   time_t expiry_time;
 } cpath_build_state_t;
 
-/**
- * The cell_ewma_t structure keeps track of how many cells a circuit has
- * transferred recently.  It keeps an EWMA (exponentially weighted moving
- * average) of the number of cells flushed from the circuit queue onto a
- * connection in connection_or_flush_from_first_active_circuit().
- */
-typedef struct {
-  /** The last 'tick' at which we recalibrated cell_count.
-   *
-   * A cell sent at exactly the start of this tick has weight 1.0. Cells sent
-   * since the start of this tick have weight greater than 1.0; ones sent
-   * earlier have less weight. */
-  unsigned last_adjusted_tick;
-  /** The EWMA of the cell count. */
-  double cell_count;
-  /** True iff this is the cell count for a circuit's previous
-   * connection. */
-  unsigned int is_for_p_conn : 1;
-  /** The position of the circuit within the OR connection's priority
-   * queue. */
-  int heap_index;
-} cell_ewma_t;
-
 #define ORIGIN_CIRCUIT_MAGIC 0x35315243u
 #define OR_CIRCUIT_MAGIC 0x98ABC04Fu
 
@@ -2574,23 +2543,15 @@ typedef struct circuit_t {
   const char *marked_for_close_file; /**< For debugging: in which file was this
                                       * circuit marked for close? */
 
-  /** Next circuit in the doubly-linked ring of circuits waiting to add
-   * cells to n_conn.  NULL if we have no cells pending, or if we're not
-   * linked to an OR connection. */
-  struct circuit_t *next_active_on_n_conn;
-  /** Previous circuit in the doubly-linked ring of circuits waiting to add
-   * cells to n_conn.  NULL if we have no cells pending, or if we're not
-   * linked to an OR connection. */
-  struct circuit_t *prev_active_on_n_conn;
   struct circuit_t *next; /**< Next circuit in linked list of all circuits. */
 
   /** Unique ID for measuring tunneled network status requests. */
   uint64_t dirreq_id;
 
-  /** The EWMA count for the number of cells flushed from the
-   * n_conn_cells queue.  Used to determine which circuit to flush from next.
+  /** Contains the state needed for our currently enabled scheduler to make its
+   * scheduling decisions. NULL if we're not linked to an OR connection.
    */
-  cell_ewma_t n_cell_ewma;
+  struct scheduleritem_s *scheduler_state;
 } circuit_t;
 
 /** Largest number of relay_early cells that we can send on a given
@@ -2722,6 +2683,10 @@ typedef struct origin_circuit_t {
   /** Global identifier for the first stream attached here; used by
    * ISO_STREAM. */
   uint64_t associated_isolated_stream_global_id;
+
+  unsigned int sent_lira;
+  int64_t cells_before_next_lira;
+
   /**@}*/
 
 } origin_circuit_t;
@@ -2730,15 +2695,6 @@ typedef struct origin_circuit_t {
  * OR. */
 typedef struct or_circuit_t {
   circuit_t _base;
-
-  /** Next circuit in the doubly-linked ring of circuits waiting to add
-   * cells to p_conn.  NULL if we have no cells pending, or if we're not
-   * linked to an OR connection. */
-  struct circuit_t *next_active_on_p_conn;
-  /** Previous circuit in the doubly-linked ring of circuits waiting to add
-   * cells to p_conn.  NULL if we have no cells pending, or if we're not
-   * linked to an OR connection. */
-  struct circuit_t *prev_active_on_p_conn;
 
   /** The circuit_id used in the previous (backward) hop of this circuit. */
   circid_t p_circ_id;
@@ -2802,10 +2758,6 @@ typedef struct or_circuit_t {
    * exit-ward queues of this circuit; reset every time when writing
    * buffer stats to disk. */
   uint64_t total_cell_waiting_time;
-
-  /** The EWMA count for the number of cells flushed from the
-   * p_conn_cells queue. */
-  cell_ewma_t p_cell_ewma;
 } or_circuit_t;
 
 /** Convert a circuit subtype to a circuit_t. */
@@ -3500,6 +3452,36 @@ typedef struct {
   /** If true, SIGHUP should reload the torrc.  Sometimes controllers want
    * to make this false. */
   int ReloadTorrcOnSIGHUP;
+
+  /** The circuit scheduler we should currently use
+   * 1 for RR, 2 for EWMA, 3 for PDD,
+   * anything else for the default defined in scheduler.h
+   * These values should match the 'enum scheduler_type' values in scheduler.h
+   */
+  int CircuitScheduler;
+
+  /**
+   * Parameter for tuning the Proportional Delay Differentiation (PDD)
+   * scheduler. In PDD, traffic is categorized by service classes. The scheduler
+   * computes the proportional average delay (PAD) of each service class, and
+   * the waiting time priority (WTP) of the longest waiting cell in each class.
+   * The class priority is then a weighted combination of PAD and WTP. This
+   * parameter specifies the weight as a fraction F, such that:
+   *   priority = (F * PAD) + ((1-F) * WTP)
+   * Therefore, F=0 reduces to pure WTP scheduling, and F=1 reduces to pure PAD
+   * scheduling. It is recommended to keep 0 < F < 1 to take advantage of both
+   * scheduling approaches, in order to maintain the delay differentiation
+   * ratios in both short and long timescales.
+   * @see scheduler_pdd.c
+   */
+  double CircuitPriorityPDDWeight;
+
+  /** Lira params */
+  unsigned int LiraPaid;
+  double LiraGuessingProbability;
+  double LiraWeight;
+  double LiraFactor;
+  uint64_t LiraConstant;
 
   /* The main parameter for picking circuits within a connection.
    *

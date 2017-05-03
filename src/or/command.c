@@ -30,6 +30,7 @@
 #include "relay.h"
 #include "router.h"
 #include "routerlist.h"
+#include "scheduler.h"
 
 /** How many CELL_PADDING cells have we received, ever? */
 uint64_t stats_n_padding_cells_processed = 0;
@@ -73,6 +74,7 @@ static void command_process_authenticate_cell(var_cell_t *cell,
                                           or_connection_t *conn);
 static int enter_v3_handshake_with_cell(var_cell_t *cell,
                                         or_connection_t *conn);
+static void command_process_lira_cell(cell_t *cell, or_connection_t *conn);
 
 #ifdef KEEP_TIMING_STATS
 /** This is a wrapper function around the actual function that processes the
@@ -152,6 +154,12 @@ command_process_cell(cell_t *cell, or_connection_t *conn)
 #define PROCESS_CELL(tp, cl, cn) command_process_ ## tp ## _cell(cl, cn)
 #endif
 
+  /* need to count incoming cells for origin circuits */
+  circuit_t *circ = circuit_get_by_circid_orconn(cell->circ_id, conn);
+  if(circ && CIRCUIT_IS_ORIGIN(circ)) {
+    circuit_consider_sending_lira(TO_ORIGIN_CIRCUIT(circ));
+  }
+
   if (conn->_base.marked_for_close)
     return;
 
@@ -199,6 +207,12 @@ command_process_cell(cell_t *cell, or_connection_t *conn)
     case CELL_NETINFO:
       ++stats_n_netinfo_cells_processed;
       PROCESS_CELL(netinfo, cell, conn);
+      break;
+    case CELL_LIRA_ENTRY:
+    case CELL_LIRA_MIDDLE:
+    case CELL_LIRA_EXIT:
+      ++stats_n_netinfo_cells_processed;
+      PROCESS_CELL(lira, cell, conn);
       break;
     default:
       log_fn(LOG_INFO, LD_PROTOCOL,
@@ -336,6 +350,48 @@ command_process_var_cell(var_cell_t *cell, or_connection_t *conn)
                "Variable-length cell of unknown type (%d) received.",
                cell->command);
       break;
+  }
+}
+
+static void command_process_lira_cell(cell_t *cell, or_connection_t *conn) {
+  tor_assert(cell);
+  circuit_t *circ = circuit_get_by_circid_orconn(cell->circ_id, conn);
+
+  if (!circ) {
+    log_info(LD_OR,
+             "(circID %d) unknown circ (probably got a destroy earlier). "
+             "Dropping.", cell->circ_id);
+    return;
+  }
+
+  int offset = (cell->command == CELL_LIRA_ENTRY) ? 4 :
+               (cell->command == CELL_LIRA_MIDDLE) ? 5 :
+               (cell->command == CELL_LIRA_EXIT) ? 6 : -1;
+
+  if(offset < 0) {
+    log_info(LD_OR, "(circID %d) received unknown LIRA cell %d. Dropping.",
+             cell->circ_id, cell->command);
+    return;
+  }
+
+  uint32_t n = ntohl(get_uint32(&(cell->payload[0])));
+  uint8_t p = (uint8_t) cell->payload[offset];
+
+  scheduler_configure_priority(conn->scheduler, circ->scheduler_state,
+      (int)p, (size_t)n);
+
+  /* if not exit, update and send to next hop */
+  if(cell->command == CELL_LIRA_ENTRY || cell->command == CELL_LIRA_MIDDLE) {
+    cell->command = (cell->command == CELL_LIRA_ENTRY) ?
+                                      CELL_LIRA_MIDDLE : CELL_LIRA_EXIT;
+    if(!circ->n_conn) {
+      log_notice(LD_OR, "(next circID %d) no outgoing circuit for lira cell. "
+          "Dropping.", circ->n_circ_id);
+      return;
+    }
+    cell->circ_id = circ->n_circ_id;
+    append_cell_to_circuit_queue(circ, circ->n_conn, cell,
+                                 CELL_DIRECTION_OUT, 0);
   }
 }
 

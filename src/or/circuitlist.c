@@ -26,6 +26,7 @@
 #include "rendcommon.h"
 #include "rephist.h"
 #include "routerlist.h"
+#include "scheduler.h"
 #include "ht.h"
 
 /********* START VARIABLES **********/
@@ -103,13 +104,13 @@ circuit_set_circid_orconn_helper(circuit_t *circ, int direction,
   if (direction == CELL_DIRECTION_OUT) {
     conn_ptr = &circ->n_conn;
     circid_ptr = &circ->n_circ_id;
-    was_active = circ->next_active_on_n_conn != NULL;
+    was_active = scheduleritem_is_active_outward(circ->scheduler_state);
     make_active = circ->n_conn_cells.n > 0;
   } else {
     or_circuit_t *c = TO_OR_CIRCUIT(circ);
     conn_ptr = &c->p_conn;
     circid_ptr = &c->p_circ_id;
-    was_active = c->next_active_on_p_conn != NULL;
+    was_active = scheduleritem_is_active_inward(circ->scheduler_state);
     make_active = c->p_conn_cells.n > 0;
   }
   old_conn = *conn_ptr;
@@ -177,7 +178,8 @@ circuit_set_p_circid_orconn(or_circuit_t *circ, circid_t id,
                                    id, conn);
 
   if (conn)
-    tor_assert(bool_eq(circ->p_conn_cells.n, circ->next_active_on_p_conn));
+    tor_assert(bool_eq(circ->p_conn_cells.n,
+        scheduleritem_is_active_inward(circ->_base.scheduler_state)));
 }
 
 /** Set the n_conn field of a circuit <b>circ</b>, along
@@ -190,7 +192,8 @@ circuit_set_n_circid_orconn(circuit_t *circ, circid_t id,
   circuit_set_circid_orconn_helper(circ, CELL_DIRECTION_OUT, id, conn);
 
   if (conn)
-    tor_assert(bool_eq(circ->n_conn_cells.n, circ->next_active_on_n_conn));
+    tor_assert(bool_eq(circ->n_conn_cells.n,
+        scheduleritem_is_active_outward(circ->scheduler_state)));
 }
 
 /** Change the state of <b>circ</b> to <b>state</b>, adding it to or removing
@@ -517,11 +520,12 @@ init_circuit_base(circuit_t *circ)
   circ->package_window = circuit_initial_package_window();
   circ->deliver_window = CIRCWINDOW_START;
 
-  /* Initialize the cell_ewma_t structure */
-  circ->n_cell_ewma.last_adjusted_tick = cell_ewma_get_tick();
-  circ->n_cell_ewma.cell_count = 0.0;
-  circ->n_cell_ewma.heap_index = -1;
-  circ->n_cell_ewma.is_for_p_conn = 0;
+  /* TODO this state MUST match the scheduler type of its connection
+   * FIXME transitions from one scheduler to another when e.g. netstatus changes
+   * probably wont work right as of now. */
+  enum scheduler_type stype = get_options()->CircuitScheduler;
+
+  scheduleritem_new(circ->scheduler_state, stype, circ);
 
   circuit_add(circ);
 }
@@ -563,22 +567,12 @@ or_circuit_new(circid_t p_circ_id, or_connection_t *p_conn)
   circ = tor_malloc_zero(sizeof(or_circuit_t));
   circ->_base.magic = OR_CIRCUIT_MAGIC;
 
+  init_circuit_base(TO_CIRCUIT(circ));
+
   if (p_conn)
     circuit_set_p_circid_orconn(circ, p_circ_id, p_conn);
 
   circ->remaining_relay_early_cells = MAX_RELAY_EARLY_CELLS_PER_CIRCUIT;
-
-  init_circuit_base(TO_CIRCUIT(circ));
-
-  /* Initialize the cell_ewma_t structure */
-
-  /* Initialize the cell counts to 0 */
-  circ->p_cell_ewma.cell_count = 0.0;
-  circ->p_cell_ewma.last_adjusted_tick = cell_ewma_get_tick();
-  circ->p_cell_ewma.is_for_p_conn = 1;
-
-  /* It's not in any heap yet. */
-  circ->p_cell_ewma.heap_index = -1;
 
   return circ;
 }
@@ -652,6 +646,8 @@ circuit_free(circuit_t *circ)
 
   /* Remove from map. */
   circuit_set_n_circid_orconn(circ, 0, NULL);
+
+  scheduleritem_free(circ->scheduler_state);
 
   /* Clear cell queue _after_ removing it from the map.  Otherwise our
    * "active" checks will be violated. */

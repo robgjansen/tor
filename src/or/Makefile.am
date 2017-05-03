@@ -51,6 +51,9 @@ libtor_a_SOURCES = \
 	router.c				\
 	routerlist.c				\
 	routerparse.c				\
+	scheduler_rr.c				\
+	scheduler_ewma.c			\
+	scheduler_pdd.c				\
 	status.c				\
 	$(evdns_source)				\
 	$(tor_platform_source)			\
@@ -117,6 +120,7 @@ noinst_HEADERS = \
 	router.h				\
 	routerlist.h				\
 	routerparse.h				\
+	scheduler.h				\
 	status.h				\
 	micro-revision.i			
 

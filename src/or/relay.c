@@ -33,6 +33,7 @@
 #include "router.h"
 #include "routerlist.h"
 #include "routerparse.h"
+#include "scheduler.h"
 
 static edge_connection_t *relay_lookup_conn(circuit_t *circ, cell_t *cell,
                                             cell_direction_t cell_direction,
@@ -64,7 +65,7 @@ static struct timeval cached_time_hires = {0, 0};
  * cells. */
 #define CELL_QUEUE_LOWWATER_SIZE 64
 
-static void
+void
 tor_gettimeofday_cached(struct timeval *tv)
 {
   if (cached_time_hires.tv_sec == 0) {
@@ -1744,6 +1745,69 @@ circuit_consider_stop_edge_reading(circuit_t *circ, crypt_path_t *layer_hint)
   return 0;
 }
 
+/* client origin circuit will send lira through the circuit if needed */
+void circuit_consider_sending_lira(origin_circuit_t *circ) {
+  tor_assert(circ);
+
+  if(TO_CIRCUIT(circ)->state != CIRCUIT_STATE_OPEN) {
+    return;
+  }
+  
+  const or_options_t* opts = get_options();
+
+  if((opts->LiraPaid) == 0 && (opts->LiraGuessingProbability) <= 0.0) {
+    return;
+  }
+  
+  if(circ->cells_before_next_lira > 1) {
+    (circ->cells_before_next_lira)--;
+    return;
+  }
+
+  cell_t cellstruct;
+  cell_t *cell = &cellstruct;
+  memset(cell, 0, sizeof(cell_t));
+
+  cell->command = CELL_LIRA_ENTRY;;
+  cell->circ_id = TO_CIRCUIT(circ)->n_circ_id;
+
+  uint32_t ncells = (uint32_t)(20480);
+
+  if(opts->LiraPaid > 0 || opts->LiraGuessingProbability >= 1.0) {
+    cell->payload[4] = (uint8_t) 1;
+    cell->payload[5] = (uint8_t) 2;
+    cell->payload[6] = (uint8_t) 3;
+    ncells = (uint32_t)(UINT32_MAX);
+    set_uint32(&(cell->payload[0]), htonl(ncells));
+  } else if(crypto_rand_double() < opts->LiraGuessingProbability) {
+	//double onethird = (double)0.333333333333;
+    //double guessp = pow((opts->LiraGuessingProbability), onethird);
+
+    //if(crypto_rand_double() < guessp)
+      cell->payload[4] = (uint8_t) 1;
+    //if(crypto_rand_double() < guessp)
+      cell->payload[5] = (uint8_t) 2;
+    //if(crypto_rand_double() < guessp)
+      cell->payload[6] = (uint8_t) 3;
+
+    ncells = (uint32_t)(20480); // 10 MB
+    set_uint32(&(cell->payload[0]), htonl(ncells));
+  } else {
+	circ->cells_before_next_lira = ncells;
+	return;
+  }
+
+  /* make sure this lira cell we are about to send doesnt cause us to send
+   * another lira cell and loop infinitely.
+   */
+  tor_assert(ncells > 1);
+  circ->cells_before_next_lira = ncells;
+  circ->sent_lira++;;
+
+  append_cell_to_circuit_queue(TO_CIRCUIT(circ), TO_CIRCUIT(circ)->n_conn,
+                               cell, CELL_DIRECTION_OUT, 0);
+}
+
 /** Check if the deliver_window for circuit <b>circ</b> (at hop
  * <b>layer_hint</b> if it's defined) is low enough that we should
  * send a circuit-level sendme back down the circuit. If so, send
@@ -1770,13 +1834,6 @@ circuit_consider_sending_sendme(circuit_t *circ, crypt_path_t *layer_hint)
     }
   }
 }
-
-#ifdef ACTIVE_CIRCUITS_PARANOIA
-#define assert_active_circuits_ok_paranoid(conn) \
-     assert_active_circuits_ok(conn)
-#else
-#define assert_active_circuits_ok_paranoid(conn)
-#endif
 
 /** The total number of cells we have allocated from the memory pool. */
 static int total_cells_allocated = 0;
@@ -1958,292 +2015,12 @@ cell_queue_pop(cell_queue_t *queue)
   return cell;
 }
 
-/** Return a pointer to the "next_active_on_{n,p}_conn" pointer of <b>circ</b>,
- * depending on whether <b>conn</b> matches n_conn or p_conn. */
-static INLINE circuit_t **
-next_circ_on_conn_p(circuit_t *circ, or_connection_t *conn)
-{
-  tor_assert(circ);
-  tor_assert(conn);
-  if (conn == circ->n_conn) {
-    return &circ->next_active_on_n_conn;
-  } else {
-    or_circuit_t *orcirc = TO_OR_CIRCUIT(circ);
-    tor_assert(conn == orcirc->p_conn);
-    return &orcirc->next_active_on_p_conn;
-  }
-}
-
-/** Return a pointer to the "prev_active_on_{n,p}_conn" pointer of <b>circ</b>,
- * depending on whether <b>conn</b> matches n_conn or p_conn. */
-static INLINE circuit_t **
-prev_circ_on_conn_p(circuit_t *circ, or_connection_t *conn)
-{
-  tor_assert(circ);
-  tor_assert(conn);
-  if (conn == circ->n_conn) {
-    return &circ->prev_active_on_n_conn;
-  } else {
-    or_circuit_t *orcirc = TO_OR_CIRCUIT(circ);
-    tor_assert(conn == orcirc->p_conn);
-    return &orcirc->prev_active_on_p_conn;
-  }
-}
-
-/** Helper for sorting cell_ewma_t values in their priority queue. */
-static int
-compare_cell_ewma_counts(const void *p1, const void *p2)
-{
-  const cell_ewma_t *e1=p1, *e2=p2;
-  if (e1->cell_count < e2->cell_count)
-    return -1;
-  else if (e1->cell_count > e2->cell_count)
-    return 1;
-  else
-    return 0;
-}
-
-/** Given a cell_ewma_t, return a pointer to the circuit containing it. */
-static circuit_t *
-cell_ewma_to_circuit(cell_ewma_t *ewma)
-{
-  if (ewma->is_for_p_conn) {
-    /* This is an or_circuit_t's p_cell_ewma. */
-    or_circuit_t *orcirc = SUBTYPE_P(ewma, or_circuit_t, p_cell_ewma);
-    return TO_CIRCUIT(orcirc);
-  } else {
-    /* This is some circuit's n_cell_ewma. */
-    return SUBTYPE_P(ewma, circuit_t, n_cell_ewma);
-  }
-}
-
-/* ==== Functions for scaling cell_ewma_t ====
-
-   When choosing which cells to relay first, we favor circuits that have been
-   quiet recently.  This gives better latency on connections that aren't
-   pushing lots of data, and makes the network feel more interactive.
-
-   Conceptually, we take an exponentially weighted mean average of the number
-   of cells a circuit has sent, and allow active circuits (those with cells to
-   relay) to send cells in reverse order of their exponentially-weighted mean
-   average (EWMA) cell count.  [That is, a cell sent N seconds ago 'counts'
-   F^N times as much as a cell sent now, for 0<F<1.0, and we favor the
-   circuit that has sent the fewest cells]
-
-   If 'double' had infinite precision, we could do this simply by counting a
-   cell sent at startup as having weight 1.0, and a cell sent N seconds later
-   as having weight F^-N.  This way, we would never need to re-scale
-   any already-sent cells.
-
-   To prevent double from overflowing, we could count a cell sent now as
-   having weight 1.0 and a cell sent N seconds ago as having weight F^N.
-   This, however, would mean we'd need to re-scale *ALL* old circuits every
-   time we wanted to send a cell.
-
-   So as a compromise, we divide time into 'ticks' (currently, 10-second
-   increments) and say that a cell sent at the start of a current tick is
-   worth 1.0, a cell sent N seconds before the start of the current tick is
-   worth F^N, and a cell sent N seconds after the start of the current tick is
-   worth F^-N.  This way we don't overflow, and we don't need to constantly
-   rescale.
- */
-
-/** How long does a tick last (seconds)? */
-#define EWMA_TICK_LEN 10
-
-/** The default per-tick scale factor, if it hasn't been overridden by a
- * consensus or a configuration setting.  zero means "disabled". */
-#define EWMA_DEFAULT_HALFLIFE 0.0
-
-/** Given a timeval <b>now</b>, compute the cell_ewma tick in which it occurs
- * and the fraction of the tick that has elapsed between the start of the tick
- * and <b>now</b>.  Return the former and store the latter in
- * *<b>remainder_out</b>.
- *
- * These tick values are not meant to be shared between Tor instances, or used
- * for other purposes. */
-static unsigned
-cell_ewma_tick_from_timeval(const struct timeval *now,
-                            double *remainder_out)
-{
-  unsigned res = (unsigned) (now->tv_sec / EWMA_TICK_LEN);
-  /* rem */
-  double rem = (now->tv_sec % EWMA_TICK_LEN) +
-    ((double)(now->tv_usec)) / 1.0e6;
-  *remainder_out = rem / EWMA_TICK_LEN;
-  return res;
-}
-
-/** Compute and return the current cell_ewma tick. */
-unsigned
-cell_ewma_get_tick(void)
-{
-  return ((unsigned)approx_time() / EWMA_TICK_LEN);
-}
-
-/** The per-tick scale factor to be used when computing cell-count EWMA
- * values.  (A cell sent N ticks before the start of the current tick
- * has value ewma_scale_factor ** N.)
- */
-static double ewma_scale_factor = 0.1;
-static int ewma_enabled = 0;
-
-#define EPSILON 0.00001
-#define LOG_ONEHALF -0.69314718055994529
-
-/** Adjust the global cell scale factor based on <b>options</b> */
-void
-cell_ewma_set_scale_factor(const or_options_t *options,
-                           const networkstatus_t *consensus)
-{
-  int32_t halflife_ms;
-  double halflife;
-  const char *source;
-  if (options && options->CircuitPriorityHalflife >= -EPSILON) {
-    halflife = options->CircuitPriorityHalflife;
-    source = "CircuitPriorityHalflife in configuration";
-  } else if (consensus && (halflife_ms = networkstatus_get_param(
-                 consensus, "CircuitPriorityHalflifeMsec",
-                 -1, -1, INT32_MAX)) >= 0) {
-    halflife = ((double)halflife_ms)/1000.0;
-    source = "CircuitPriorityHalflifeMsec in consensus";
-  } else {
-    halflife = EWMA_DEFAULT_HALFLIFE;
-    source = "Default value";
-  }
-
-  if (halflife <= EPSILON) {
-    /* The cell EWMA algorithm is disabled. */
-    ewma_scale_factor = 0.1;
-    ewma_enabled = 0;
-    log_info(LD_OR,
-             "Disabled cell_ewma algorithm because of value in %s",
-             source);
-  } else {
-    /* convert halflife into halflife-per-tick. */
-    halflife /= EWMA_TICK_LEN;
-    /* compute per-tick scale factor. */
-    ewma_scale_factor = exp( LOG_ONEHALF / halflife );
-    ewma_enabled = 1;
-    log_info(LD_OR,
-             "Enabled cell_ewma algorithm because of value in %s; "
-             "scale factor is %f per %d seconds",
-             source, ewma_scale_factor, EWMA_TICK_LEN);
-  }
-}
-
-/** Return the multiplier necessary to convert the value of a cell sent in
- * 'from_tick' to one sent in 'to_tick'. */
-static INLINE double
-get_scale_factor(unsigned from_tick, unsigned to_tick)
-{
-  /* This math can wrap around, but that's okay: unsigned overflow is
-     well-defined */
-  int diff = (int)(to_tick - from_tick);
-  return pow(ewma_scale_factor, diff);
-}
-
-/** Adjust the cell count of <b>ewma</b> so that it is scaled with respect to
- * <b>cur_tick</b> */
-static void
-scale_single_cell_ewma(cell_ewma_t *ewma, unsigned cur_tick)
-{
-  double factor = get_scale_factor(ewma->last_adjusted_tick, cur_tick);
-  ewma->cell_count *= factor;
-  ewma->last_adjusted_tick = cur_tick;
-}
-
-/** Adjust the cell count of every active circuit on <b>conn</b> so
- * that they are scaled with respect to <b>cur_tick</b> */
-static void
-scale_active_circuits(or_connection_t *conn, unsigned cur_tick)
-{
-
-  double factor = get_scale_factor(
-              conn->active_circuit_pqueue_last_recalibrated,
-              cur_tick);
-  /** Ordinarily it isn't okay to change the value of an element in a heap,
-   * but it's okay here, since we are preserving the order. */
-  SMARTLIST_FOREACH(conn->active_circuit_pqueue, cell_ewma_t *, e, {
-      tor_assert(e->last_adjusted_tick ==
-                 conn->active_circuit_pqueue_last_recalibrated);
-      e->cell_count *= factor;
-      e->last_adjusted_tick = cur_tick;
-  });
-  conn->active_circuit_pqueue_last_recalibrated = cur_tick;
-}
-
-/** Rescale <b>ewma</b> to the same scale as <b>conn</b>, and add it to
- * <b>conn</b>'s priority queue of active circuits */
-static void
-add_cell_ewma_to_conn(or_connection_t *conn, cell_ewma_t *ewma)
-{
-  tor_assert(ewma->heap_index == -1);
-  scale_single_cell_ewma(ewma,
-                         conn->active_circuit_pqueue_last_recalibrated);
-
-  smartlist_pqueue_add(conn->active_circuit_pqueue,
-                       compare_cell_ewma_counts,
-                       STRUCT_OFFSET(cell_ewma_t, heap_index),
-                       ewma);
-}
-
-/** Remove <b>ewma</b> from <b>conn</b>'s priority queue of active circuits */
-static void
-remove_cell_ewma_from_conn(or_connection_t *conn, cell_ewma_t *ewma)
-{
-  tor_assert(ewma->heap_index != -1);
-  smartlist_pqueue_remove(conn->active_circuit_pqueue,
-                          compare_cell_ewma_counts,
-                          STRUCT_OFFSET(cell_ewma_t, heap_index),
-                          ewma);
-}
-
-/** Remove and return the first cell_ewma_t from conn's priority queue of
- * active circuits.  Requires that the priority queue is nonempty. */
-static cell_ewma_t *
-pop_first_cell_ewma_from_conn(or_connection_t *conn)
-{
-  return smartlist_pqueue_pop(conn->active_circuit_pqueue,
-                              compare_cell_ewma_counts,
-                              STRUCT_OFFSET(cell_ewma_t, heap_index));
-}
-
 /** Add <b>circ</b> to the list of circuits with pending cells on
  * <b>conn</b>.  No effect if <b>circ</b> is already linked. */
 void
 make_circuit_active_on_conn(circuit_t *circ, or_connection_t *conn)
 {
-  circuit_t **nextp = next_circ_on_conn_p(circ, conn);
-  circuit_t **prevp = prev_circ_on_conn_p(circ, conn);
-
-  if (*nextp && *prevp) {
-    /* Already active. */
-    return;
-  }
-
-  assert_active_circuits_ok_paranoid(conn);
-
-  if (! conn->active_circuits) {
-    conn->active_circuits = circ;
-    *prevp = *nextp = circ;
-  } else {
-    circuit_t *head = conn->active_circuits;
-    circuit_t *old_tail = *prev_circ_on_conn_p(head, conn);
-    *next_circ_on_conn_p(old_tail, conn) = circ;
-    *nextp = head;
-    *prev_circ_on_conn_p(head, conn) = circ;
-    *prevp = old_tail;
-  }
-
-  if (circ->n_conn == conn) {
-    add_cell_ewma_to_conn(conn, &circ->n_cell_ewma);
-  } else {
-    or_circuit_t *orcirc = TO_OR_CIRCUIT(circ);
-    tor_assert(conn == orcirc->p_conn);
-    add_cell_ewma_to_conn(conn, &orcirc->p_cell_ewma);
-  }
-
+  scheduler_activate_item(conn->scheduler, circ->scheduler_state);
   assert_active_circuits_ok_paranoid(conn);
 }
 
@@ -2252,39 +2029,7 @@ make_circuit_active_on_conn(circuit_t *circ, or_connection_t *conn)
 void
 make_circuit_inactive_on_conn(circuit_t *circ, or_connection_t *conn)
 {
-  circuit_t **nextp = next_circ_on_conn_p(circ, conn);
-  circuit_t **prevp = prev_circ_on_conn_p(circ, conn);
-  circuit_t *next = *nextp, *prev = *prevp;
-
-  if (!next && !prev) {
-    /* Already inactive. */
-    return;
-  }
-
-  assert_active_circuits_ok_paranoid(conn);
-
-  tor_assert(next && prev);
-  tor_assert(*prev_circ_on_conn_p(next, conn) == circ);
-  tor_assert(*next_circ_on_conn_p(prev, conn) == circ);
-
-  if (next == circ) {
-    conn->active_circuits = NULL;
-  } else {
-    *prev_circ_on_conn_p(next, conn) = prev;
-    *next_circ_on_conn_p(prev, conn) = next;
-    if (conn->active_circuits == circ)
-      conn->active_circuits = next;
-  }
-  *prevp = *nextp = NULL;
-
-  if (circ->n_conn == conn) {
-    remove_cell_ewma_from_conn(conn, &circ->n_cell_ewma);
-  } else {
-    or_circuit_t *orcirc = TO_OR_CIRCUIT(circ);
-    tor_assert(conn == orcirc->p_conn);
-    remove_cell_ewma_from_conn(conn, &orcirc->p_cell_ewma);
-  }
-
+  scheduler_deactivate_item(conn->scheduler, circ->scheduler_state);
   assert_active_circuits_ok_paranoid(conn);
 }
 
@@ -2293,21 +2038,7 @@ make_circuit_inactive_on_conn(circuit_t *circ, or_connection_t *conn)
 void
 connection_or_unlink_all_active_circs(or_connection_t *orconn)
 {
-  circuit_t *head = orconn->active_circuits;
-  circuit_t *cur = head;
-  if (! head)
-    return;
-  do {
-    circuit_t *next = *next_circ_on_conn_p(cur, orconn);
-    *prev_circ_on_conn_p(cur, orconn) = NULL;
-    *next_circ_on_conn_p(cur, orconn) = NULL;
-    cur = next;
-  } while (cur != head);
-  orconn->active_circuits = NULL;
-
-  SMARTLIST_FOREACH(orconn->active_circuit_pqueue, cell_ewma_t *, e,
-                    e->heap_index = -1);
-  smartlist_clear(orconn->active_circuit_pqueue);
+  scheduler_unlink_active_items(orconn->scheduler);
 }
 
 /** Block (if <b>block</b> is true) or unblock (if <b>block</b> is false)
@@ -2377,34 +2108,13 @@ connection_or_flush_from_first_active_circuit(or_connection_t *conn, int max,
   circuit_t *circ;
   int streams_blocked;
 
-  /* The current (hi-res) time */
-  struct timeval now_hires;
-
-  /* The EWMA cell counter for the circuit we're flushing. */
-  cell_ewma_t *cell_ewma = NULL;
-  double ewma_increment = -1;
-
-  circ = conn->active_circuits;
-  if (!circ) return 0;
+  /* get the next circuit based on our scheduler */
+  scheduleritem_t *item = scheduler_select_item(conn->scheduler);
+  if (!item || !(item->circ)) return 0;
+  circ = item->circ;
   assert_active_circuits_ok_paranoid(conn);
 
-  /* See if we're doing the ewma circuit selection algorithm. */
-  if (ewma_enabled) {
-    unsigned tick;
-    double fractional_tick;
-    tor_gettimeofday_cached(&now_hires);
-    tick = cell_ewma_tick_from_timeval(&now_hires, &fractional_tick);
-
-    if (tick != conn->active_circuit_pqueue_last_recalibrated) {
-      scale_active_circuits(conn, tick);
-    }
-
-    ewma_increment = pow(ewma_scale_factor, -fractional_tick);
-
-    cell_ewma = smartlist_get(conn->active_circuit_pqueue, 0);
-    circ = cell_ewma_to_circuit(cell_ewma);
-  }
-
+  /* get the correct cell queue from the circuit */
   if (circ->n_conn == conn) {
     queue = &circ->n_conn_cells;
     streams_blocked = circ->streams_blocked_on_n_conn;
@@ -2412,11 +2122,21 @@ connection_or_flush_from_first_active_circuit(or_connection_t *conn, int max,
     queue = &TO_OR_CIRCUIT(circ)->p_conn_cells;
     streams_blocked = circ->streams_blocked_on_p_conn;
   }
-  tor_assert(*next_circ_on_conn_p(circ,conn));
 
+// TODO is this assertion necessary? its now part of the RR scheduler only. RGJ
+// tor_assert(*next_circ_on_conn_p(circ,conn));
+
+  /* write up to max cells */
   for (n_flushed = 0; n_flushed < max && queue->head; ) {
     packed_cell_t *cell = cell_queue_pop(queue);
-    tor_assert(*next_circ_on_conn_p(circ,conn));
+    tor_assert(cell);
+
+// TODO is this assertion necessary? its now part of the RR scheduler only. RGJ
+//  tor_assert(*next_circ_on_conn_p(circ,conn));
+
+    /* the scheduler gets a notification that we removed a cell from circ */
+    int do_exit = scheduler_cell_removed_callback(conn->scheduler,
+        circ->scheduler_state);
 
     /* Calculate the exact time that this cell has spent in the queue. */
     if (get_options()->CellStatistics && !CIRCUIT_IS_ORIGIN(circ)) {
@@ -2462,29 +2182,16 @@ connection_or_flush_from_first_active_circuit(or_connection_t *conn, int max,
 
     packed_cell_free_unchecked(cell);
     ++n_flushed;
-    if (cell_ewma) {
-      cell_ewma_t *tmp;
-      cell_ewma->cell_count += ewma_increment;
-      /* We pop and re-add the cell_ewma_t here, not above, since we need to
-       * re-add it immediately to keep the priority queue consistent with
-       * the linked-list implementation */
-      tmp = pop_first_cell_ewma_from_conn(conn);
-      tor_assert(tmp == cell_ewma);
-      add_cell_ewma_to_conn(conn, cell_ewma);
-    }
-    if (circ != conn->active_circuits) {
-      /* If this happens, the current circuit just got made inactive by
-       * a call in connection_write_to_buf().  That's nothing to worry about:
-       * circuit_make_inactive_on_conn() already advanced conn->active_circuits
-       * for us.
-       */
+
+    if (do_exit) {
+      /* the scheduler wants us to dip out. */
       assert_active_circuits_ok_paranoid(conn);
       goto done;
     }
   }
-  tor_assert(*next_circ_on_conn_p(circ,conn));
+
   assert_active_circuits_ok_paranoid(conn);
-  conn->active_circuits = *next_circ_on_conn_p(circ, conn);
+  scheduler_item_scheduled_callback(conn->scheduler, circ->scheduler_state);
 
   /* Is the cell queue low enough to unblock all the streams that are waiting
    * to write to this circuit? */
@@ -2525,6 +2232,9 @@ append_cell_to_circuit_queue(circuit_t *circ, or_connection_t *orconn,
 
   cell_queue_append_packed_copy(queue, cell);
 
+  /* the scheduler gets a callback that a cell was just queued */
+  scheduler_cell_added_callback(orconn->scheduler, circ->scheduler_state);
+
   /* If we have too many cells on the circuit, we should stop reading from
    * the edge streams for a while. */
   if (!streams_blocked && queue->n >= CELL_QUEUE_HIGHWATER_SIZE)
@@ -2549,6 +2259,10 @@ append_cell_to_circuit_queue(circuit_t *circ, or_connection_t *orconn,
      */
     log_debug(LD_GENERAL, "Primed a buffer.");
     connection_or_flush_from_first_active_circuit(orconn, 1, approx_time());
+  }
+
+  if(CIRCUIT_IS_ORIGIN(circ)) {
+    circuit_consider_sending_lira(TO_ORIGIN_CIRCUIT(circ));
   }
 }
 
@@ -2636,34 +2350,7 @@ circuit_clear_cell_queue(circuit_t *circ, or_connection_t *orconn)
 void
 assert_active_circuits_ok(or_connection_t *orconn)
 {
-  circuit_t *head = orconn->active_circuits;
-  circuit_t *cur = head;
-  int n = 0;
-  if (! head)
-    return;
-  do {
-    circuit_t *next = *next_circ_on_conn_p(cur, orconn);
-    circuit_t *prev = *prev_circ_on_conn_p(cur, orconn);
-    cell_ewma_t *ewma;
-    tor_assert(next);
-    tor_assert(prev);
-    tor_assert(*next_circ_on_conn_p(prev, orconn) == cur);
-    tor_assert(*prev_circ_on_conn_p(next, orconn) == cur);
-    if (orconn == cur->n_conn) {
-      ewma = &cur->n_cell_ewma;
-      tor_assert(!ewma->is_for_p_conn);
-    } else {
-      ewma = &TO_OR_CIRCUIT(cur)->p_cell_ewma;
-      tor_assert(ewma->is_for_p_conn);
-    }
-    tor_assert(ewma->heap_index != -1);
-    tor_assert(ewma == smartlist_get(orconn->active_circuit_pqueue,
-                                     ewma->heap_index));
-    n++;
-    cur = next;
-  } while (cur != head);
-
-  tor_assert(n == smartlist_len(orconn->active_circuit_pqueue));
+  scheduler_assert_active_items(orconn->scheduler);
 }
 
 /** Return 1 if we shouldn't restart reading on this circuit, even if

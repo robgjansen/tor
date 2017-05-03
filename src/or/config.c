@@ -35,6 +35,7 @@
 #include "router.h"
 #include "util.h"
 #include "routerlist.h"
+#include "scheduler.h"
 #include "transports.h"
 #ifdef _WIN32
 #include <shlobj.h>
@@ -215,8 +216,16 @@ static config_var_t _option_vars[] = {
   V(LearnCircuitBuildTimeout,    BOOL,     "1"),
   V(CircuitBuildTimeout,         INTERVAL, "0"),
   V(CircuitIdleTimeout,          INTERVAL, "1 hour"),
+  V(CircuitScheduler,            UINT,     "0"),
   V(CircuitStreamTimeout,        INTERVAL, "0"),
   V(CircuitPriorityHalflife,     DOUBLE,  "-100.0"), /*negative:'Use default'*/
+
+  V(LiraPaid,               UINT,       "0"),
+  V(LiraGuessingProbability,DOUBLE,     "0.0"), // prob that a guesser gets all 3 relays on a circuit prioritized
+  V(LiraWeight,             DOUBLE,     "1.0"), // weight circ prior by this, class prior by 1-this
+  V(LiraFactor,             DOUBLE,     "1.0"), // unpaid diff param
+  V(LiraConstant,           MEMUNIT,     "0"), // unpaid diff param
+
   V(ClientDNSRejectInternalAddresses, BOOL,"1"),
   V(ClientOnly,                  BOOL,     "0"),
   V(ClientRejectInternalAddresses, BOOL,   "1"),

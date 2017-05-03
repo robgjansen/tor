@@ -29,6 +29,7 @@
 #include "rephist.h"
 #include "router.h"
 #include "routerlist.h"
+#include "scheduler.h"
 
 #ifdef USE_BUFFEREVENTS
 #include <event2/bufferevent_ssl.h>
@@ -412,7 +413,7 @@ connection_or_flushed_some(or_connection_t *conn)
   if (datalen < OR_CONN_LOWWATER) {
     ssize_t n = CEIL_DIV(OR_CONN_HIGHWATER - datalen, CELL_NETWORK_SIZE);
     time_t now = approx_time();
-    while (conn->active_circuits && n > 0) {
+    while (scheduler_is_active(conn->scheduler) && n > 0) {
       int flushed;
       flushed = connection_or_flush_from_first_active_circuit(conn, 1, now);
       n -= flushed;

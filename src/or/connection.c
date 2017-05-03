@@ -35,6 +35,7 @@
 #include "rephist.h"
 #include "router.h"
 #include "routerparse.h"
+#include "scheduler.h"
 
 #ifdef USE_BUFFEREVENTS
 #include <event2/event.h>
@@ -244,8 +245,12 @@ or_connection_new(int socket_family)
   or_conn->timestamp_last_added_nonpadding = time(NULL);
   or_conn->next_circ_id = crypto_rand_int(1<<15);
 
-  or_conn->active_circuit_pqueue = smartlist_new();
-  or_conn->active_circuit_pqueue_last_recalibrated = cell_ewma_get_tick();
+  /* TODO this state MUST match the scheduler type of its circuits
+   * FIXME transitions from one scheduler to another when e.g. netstatus changes
+   * probably wont work right as of now. */
+  enum scheduler_type stype = get_options()->CircuitScheduler;
+
+  scheduler_new(or_conn->scheduler, stype, or_conn);
 
   return or_conn;
 }
@@ -487,7 +492,7 @@ _connection_free(connection_t *conn)
     or_conn->tls = NULL;
     or_handshake_state_free(or_conn->handshake_state);
     or_conn->handshake_state = NULL;
-    smartlist_free(or_conn->active_circuit_pqueue);
+    scheduler_free(or_conn->scheduler);
     tor_free(or_conn->nickname);
   }
   if (conn->type == CONN_TYPE_AP) {

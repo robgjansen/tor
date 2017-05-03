@@ -1642,6 +1642,10 @@ second_elapsed_callback(periodic_timer_t *timer, void *arg)
 /** Timer: used to invoke refill_callback(). */
 static periodic_timer_t *refill_timer = NULL;
 
+int last_accounting_heartbeat = 0;
+size_t accounting_bytes_written = 0;
+size_t accounting_bytes_read = 0;
+
 /** Libevent callback: invoked periodically to refill token buckets
  * and count r/w bytes. It is only used when bufferevents are disabled. */
 static void
@@ -1678,6 +1682,19 @@ refill_callback(periodic_timer_t *timer, void *arg)
   stats_n_bytes_written += bytes_written;
   if (accounting_is_enabled(options) && milliseconds_elapsed >= 0)
     accounting_add_bytes(bytes_read, bytes_written, seconds_rolled_over);
+
+  accounting_bytes_read += bytes_read;
+  accounting_bytes_written += bytes_written;
+  int now_seconds = ((int)(now.tv_sec));
+  if(last_accounting_heartbeat + 60 <= now_seconds) {
+    int nsecs = (now_seconds - last_accounting_heartbeat);
+    log_notice(LD_GENERAL,"Accounting heartbeat: %lu read %lu written in the "
+             "last %i seconds",
+             accounting_bytes_read, accounting_bytes_written, nsecs);
+    last_accounting_heartbeat = now_seconds;
+    accounting_bytes_read = 0;
+    accounting_bytes_written = 0;
+  }
 
   if (milliseconds_elapsed > 0)
     connection_bucket_refill(milliseconds_elapsed, now.tv_sec);
