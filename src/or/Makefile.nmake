@@ -63,7 +63,9 @@ LIBTOR_OBJECTS = \
   routerset.obj \
   statefile.obj \
   status.obj \
-  transports.obj
+  transports.obj \
+  trust.obj \
+  trustdb.obj
 
 libtor.lib: $(LIBTOR_OBJECTS)
 	lib $(LIBTOR_OBJECTS) /out:$@

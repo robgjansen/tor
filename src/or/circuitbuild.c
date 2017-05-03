@@ -34,6 +34,7 @@
 #include "onion_fast.h"
 #include "policies.h"
 #include "transports.h"
+#include "trust.h"
 #include "relay.h"
 #include "rephist.h"
 #include "router.h"
@@ -56,7 +57,7 @@ static int onion_pick_cpath_exit(origin_circuit_t *circ, extend_info_t *exit);
 static crypt_path_t *onion_next_hop_in_cpath(crypt_path_t *cpath);
 static int onion_extend_cpath(origin_circuit_t *circ);
 static int count_acceptable_nodes(smartlist_t *routers);
-static int onion_append_hop(crypt_path_t **head_ptr, extend_info_t *choice);
+
 #ifdef CURVE25519_ENABLED
 static int circuits_can_use_ntor(void);
 #endif
@@ -372,15 +373,33 @@ origin_circuit_init(uint8_t purpose, int flags)
  * it's not open already.
  */
 origin_circuit_t *
-circuit_establish_circuit(uint8_t purpose, extend_info_t *exit, int flags)
+circuit_establish_circuit(const entry_connection_t *conn,
+    uint8_t purpose, extend_info_t *exit, int flags)
 {
   origin_circuit_t *circ;
   int err_reason = 0;
 
   circ = origin_circuit_init(purpose, flags);
 
-  if (onion_pick_cpath_exit(circ, exit) < 0 ||
-      onion_populate_cpath(circ) < 0) {
+  /* RGJ: rendezvous circuits and reachability testing circuits dont have an entry_conn */
+//  printf("nodelistlen %i\n", smartlist_len(nodelist_get_list()));
+  int close = 0;
+  if(conn && trust_needs_trust(purpose, flags)) {
+    /* choose using trust info */
+    log_debug(LD_CIRC, "choosing path with trust");
+    if(trust_choose_cpath(conn, circ) < 0) {
+      close = 1;
+    }
+  } else {
+    /* choose the old way */
+    log_debug(LD_CIRC, "choosing path without trust");
+    if (onion_pick_cpath_exit(circ, exit) < 0 ||
+        onion_populate_cpath(circ) < 0) {
+      close = 1;
+    }
+  }
+
+  if (close) {
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_NOPATH);
     return NULL;
   }
@@ -2061,7 +2080,7 @@ onion_extend_cpath(origin_circuit_t *circ)
 /** Create a new hop, annotate it with information about its
  * corresponding router <b>choice</b>, and append it to the
  * end of the cpath <b>head_ptr</b>. */
-static int
+int
 onion_append_hop(crypt_path_t **head_ptr, extend_info_t *choice)
 {
   crypt_path_t *hop = tor_malloc_zero(sizeof(crypt_path_t));

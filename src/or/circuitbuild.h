@@ -18,9 +18,9 @@ void circuit_log_path(int severity, unsigned int domain,
                       origin_circuit_t *circ);
 void circuit_rep_hist_note_result(origin_circuit_t *circ);
 origin_circuit_t *origin_circuit_init(uint8_t purpose, int flags);
-origin_circuit_t *circuit_establish_circuit(uint8_t purpose,
-                                            extend_info_t *exit,
-                                            int flags);
+origin_circuit_t *circuit_establish_circuit(const entry_connection_t *conn,
+    uint8_t purpose, extend_info_t *exit, int flags);
+int onion_append_hop(crypt_path_t **head_ptr, extend_info_t *choice);
 int circuit_handle_first_hop(origin_circuit_t *circ);
 void circuit_n_chan_done(channel_t *chan, int status);
 int inform_testing_reachability(void);

@@ -54,6 +54,7 @@
 #include "routerparse.h"
 #include "statefile.h"
 #include "status.h"
+#include "trust.h"
 #include "ext_orport.h"
 #ifdef USE_DMALLOC
 #include <dmalloc.h>
@@ -2428,6 +2429,10 @@ tor_init(int argc, char *argv[])
   }
   stream_choice_seed_weak_rng();
 
+  if(get_options()->SelectPathsWithTrust) {
+    trust_init();
+  }
+
   return 0;
 }
 
@@ -2531,6 +2536,7 @@ tor_free_all(int postfork)
   microdesc_free_all();
   ext_orport_free_all();
   control_free_all();
+  trust_free();
   if (!postfork) {
     config_free_all();
     or_state_free_all();

@@ -3120,6 +3120,7 @@ typedef struct origin_circuit_t {
    * adjust_exit_policy_from_exitpolicy_failure.
    */
   smartlist_t *prepend_policy;
+  int was_built_with_trust;
 } origin_circuit_t;
 
 struct onion_queue_t;
@@ -4195,6 +4196,33 @@ typedef struct {
 
   /** Should we send the timestamps that pre-023 hidden services want? */
   int Support022HiddenServices;
+
+  int SelectPathsWithTrust;
+  int SelectPathsWithTrustOne;
+  int SelectPathsWithTrustAll;
+  int TrustPolicyTheMan;
+  int TrustPolicyCountry;
+  char* TrustClientsFile;
+  char* TrustGuardsFile;
+  char* TrustExitsFile;
+  char* TrustServersFile;
+  char* TrustScoresFile;
+  char* TrustAdvsInFile;
+  char* TrustAdvsOutFile;
+  char* TrustCountriesFile;
+  double TrustMinBWWeightFraction;
+  double TrustMinBWWeightFractionGuard;
+  double TrustRelayFamilyUncompProb;
+  double TrustASORGUncompProb;
+  double TrustIXPORGUncompProb;
+  double TrustSafeGuardUncompThresh;
+  double TrustSafeGuardCompThresh;
+  double TrustSafeExitUncompThresh;
+  double TrustSafeExitCompThresh;
+  double TrustAcceptableGuardUncompThresh;
+  double TrustAcceptableGuardCompThresh;
+  double TrustAcceptableExitUncompThresh;
+  double TrustAcceptableExitCompThresh;
 } or_options_t;
 
 /** Persistent state for an onion router, as saved to disk. */

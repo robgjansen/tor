@@ -1344,7 +1344,7 @@ rend_service_introduce(origin_circuit_t *circuit, const uint8_t *request,
   for (i=0;i<MAX_REND_FAILURES;i++) {
     int flags = CIRCLAUNCH_NEED_CAPACITY | CIRCLAUNCH_IS_INTERNAL;
     if (circ_needs_uptime) flags |= CIRCLAUNCH_NEED_UPTIME;
-    launched = circuit_launch_by_extend_info(
+    launched = circuit_launch_by_extend_info(NULL,
                         CIRCUIT_PURPOSE_S_CONNECT_REND, rp, flags);
 
     if (launched)
@@ -2297,7 +2297,7 @@ rend_service_relaunch_rendezvous(origin_circuit_t *oldcirc)
   log_info(LD_REND,"Reattempting rendezvous circuit to '%s'",
            safe_str(extend_info_describe(oldstate->chosen_exit)));
 
-  newcirc = circuit_launch_by_extend_info(CIRCUIT_PURPOSE_S_CONNECT_REND,
+  newcirc = circuit_launch_by_extend_info(NULL, CIRCUIT_PURPOSE_S_CONNECT_REND,
                             oldstate->chosen_exit,
                             CIRCLAUNCH_NEED_CAPACITY|CIRCLAUNCH_IS_INTERNAL);
 
@@ -2334,7 +2334,7 @@ rend_service_launch_establish_intro(rend_service_t *service,
   rep_hist_note_used_internal(time(NULL), 1, 0);
 
   ++service->n_intro_circuits_launched;
-  launched = circuit_launch_by_extend_info(CIRCUIT_PURPOSE_S_ESTABLISH_INTRO,
+  launched = circuit_launch_by_extend_info(NULL, CIRCUIT_PURPOSE_S_ESTABLISH_INTRO,
                              intro->extend_info,
                              CIRCLAUNCH_NEED_UPTIME|CIRCLAUNCH_IS_INTERNAL);
 

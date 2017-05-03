@@ -82,6 +82,8 @@ LIBTOR_A_SOURCES = \
 	src/or/routerset.c				\
 	src/or/statefile.c				\
 	src/or/status.c					\
+	src/or/trust.c					\
+	src/or/trustdb.c					\
 	$(evdns_source)					\
 	$(tor_platform_source)				\
 	$(onion_ntor_source)				\

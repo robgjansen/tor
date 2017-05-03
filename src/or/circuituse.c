@@ -31,6 +31,7 @@
 #include "rephist.h"
 #include "router.h"
 #include "routerlist.h"
+#include "trust.h"
 
 static void circuit_expire_old_circuits_clientside(void);
 static void circuit_increment_failure_count(void);
@@ -165,6 +166,11 @@ circuit_is_acceptable(const origin_circuit_t *origin_circ,
     /* conn needs to be isolated from other conns that have already used
      * origin_circ */
     return 0;
+  }
+
+  if (trust_needs_trust(purpose, (need_internal ? CIRCLAUNCH_IS_INTERNAL : 0))
+		  && !trust_circuit_is_ok_for_dest(conn, origin_circ)) {
+	  return 0;
   }
 
   return 1;
@@ -1483,7 +1489,9 @@ static int did_circs_fail_last_period = 0;
 origin_circuit_t *
 circuit_launch(uint8_t purpose, int flags)
 {
-  return circuit_launch_by_extend_info(purpose, NULL, flags);
+  /* RGJ: disable pre-emptive circuits (and control extendcircuit cmds) */
+//  return NULL;
+  return circuit_launch_by_extend_info(NULL, purpose, NULL, flags);
 }
 
 /** Launch a new circuit with purpose <b>purpose</b> and exit node
@@ -1494,7 +1502,7 @@ circuit_launch(uint8_t purpose, int flags)
  * If CIRCLAUNCH_ONEHOP_TUNNEL is set, the circuit will have only one hop.
  * Return the newly allocated circuit on success, or NULL on failure. */
 origin_circuit_t *
-circuit_launch_by_extend_info(uint8_t purpose,
+circuit_launch_by_extend_info(const entry_connection_t *conn, uint8_t purpose,
                               extend_info_t *extend_info,
                               int flags)
 {
@@ -1588,7 +1596,7 @@ circuit_launch_by_extend_info(uint8_t purpose,
 
   /* try a circ. if it fails, circuit_mark_for_close will increment
    * n_circuit_failures */
-  return circuit_establish_circuit(purpose, extend_info, flags);
+  return circuit_establish_circuit(conn, purpose, extend_info, flags);
 }
 
 /** Record another failure at opening a general circuit. When we have
@@ -1841,7 +1849,7 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
       if (want_onehop) flags |= CIRCLAUNCH_ONEHOP_TUNNEL;
       if (need_uptime) flags |= CIRCLAUNCH_NEED_UPTIME;
       if (need_internal) flags |= CIRCLAUNCH_IS_INTERNAL;
-      circ = circuit_launch_by_extend_info(new_circ_purpose, extend_info,
+      circ = circuit_launch_by_extend_info(conn, new_circ_purpose, extend_info,
                                            flags);
     }
 
