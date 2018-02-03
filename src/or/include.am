@@ -105,6 +105,7 @@ LIBTOR_A_SOURCES = \
 	src/or/statefile.c				\
 	src/or/status.c					\
 	src/or/torcert.c				\
+	src/or/tmodel.c					\
 	src/or/onion_ntor.c				\
 	$(tor_platform_source)
 
@@ -245,6 +246,7 @@ ORHEADERS = \
 	src/or/scheduler.h				\
 	src/or/statefile.h				\
 	src/or/status.h					\
+	src/or/tmodel.h					\
 	src/or/torcert.h
 
 noinst_HEADERS+= $(ORHEADERS) micro-revision.i

@@ -75,6 +75,7 @@
 #include "routerlist.h"
 #include "routerparse.h"
 #include "shared_random.h"
+#include "tmodel.h"
 
 #ifndef _WIN32
 #include <pwd.h>
@@ -1026,6 +1027,20 @@ handle_control_resetconf(control_connection_t *conn, uint32_t len, char *body)
   return control_setconf_helper(conn, len, body, 1);
 }
 
+static int
+handle_control_set_traffic_model(control_connection_t *conn, uint32_t len, char *body)
+{
+  int is_error = tmodel_set_traffic_model(len, body);
+  if (is_error) {
+    /* re-using the error code from setconf. */
+    connection_write_str_to_buf("551 Couldn't parse string\r\n", conn);
+  } else {
+    /* send the '250 ok' message */
+    send_control_done(conn);
+  }
+  return 0;
+}
+
 /** Called when we receive a GETCONF message.  Parse the request, and
  * reply with a CONFVALUE or an ERROR message */
 static int
@@ -1211,6 +1226,7 @@ static const struct control_event_t control_event_table[] = {
   { EVENT_PRIVCOUNT_CIRCUIT_CELL, "PRIVCOUNT_CIRCUIT_CELL" },
   { EVENT_PRIVCOUNT_CIRCUIT_CLOSE, "PRIVCOUNT_CIRCUIT_CLOSE" },
   { EVENT_PRIVCOUNT_CONNECTION_CLOSE, "PRIVCOUNT_CONNECTION_CLOSE" },
+  { EVENT_PRIVCOUNT_VITERBI, "PRIVCOUNT_VITERBI" },
   { 0, NULL },
 };
 
@@ -5236,6 +5252,9 @@ connection_control_process_inbuf(control_connection_t *conn)
     memwipe(args, 0, cmd_data_len); /* Scrub the service id/pk. */
     if (ret)
       return -1;
+  } else if (!strcasecmp(conn->incoming_cmd, "SET_TMODEL")) {
+    if (handle_control_set_traffic_model(conn, cmd_data_len, args))
+      return -1;
   } else {
     connection_printf_to_buf(conn, "510 Unrecognized command \"%s\"\r\n",
                              conn->incoming_cmd);
@@ -8992,6 +9011,25 @@ control_event_privcount_connection(const or_connection_t *orconn)
   tor_free(now_str);
   tor_free(created_str);
   tor_free(remote_addr);
+}
+
+void
+control_event_privcount_viterbi(char* viterbi_result)
+{
+  /* Just in case */
+  if (!get_options()->EnablePrivCount) {
+    return;
+  }
+
+  if (!EVENT_IS_INTERESTING(EVENT_PRIVCOUNT_VITERBI)) {
+    return;
+  }
+
+  privcount_cleanse_tagged_str(viterbi_result);
+
+  send_control_event(EVENT_PRIVCOUNT_VITERBI,
+                     "650 PRIVCOUNT_VITERBI LikliestStates=%s\r\n",
+                     viterbi_result);
 }
 
 /* Send a PrivCount HSDir onion service descriptor cache storage event using

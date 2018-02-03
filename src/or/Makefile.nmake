@@ -67,6 +67,7 @@ LIBTOR_OBJECTS = \
   scheduler.obj \
   statefile.obj \
   status.obj \
+  tmodel.obj \
   transports.obj
 
 libtor.lib: $(LIBTOR_OBJECTS)

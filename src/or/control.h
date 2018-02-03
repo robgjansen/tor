@@ -176,6 +176,7 @@ void control_event_privcount_stream_bytes_transferred(
 void control_event_privcount_stream_ended(const edge_connection_t *exitconn);
 void control_event_privcount_connection(const or_connection_t *orconn);
 /* Tagged events */
+void control_event_privcount_viterbi(char* viterbi_result);
 /* Forward declaration to avoid including hs_cache.h */
 typedef struct hs_cache_dir_descriptor_t hs_cache_dir_descriptor_t;
 void control_event_privcount_hsdir_cache_store(
@@ -287,8 +288,9 @@ void control_free_all(void);
 #define EVENT_PRIVCOUNT_CIRCUIT_CELL                0x0032
 #define EVENT_PRIVCOUNT_CIRCUIT_CLOSE               0x0033
 #define EVENT_PRIVCOUNT_CONNECTION_CLOSE            0x0034
+#define EVENT_PRIVCOUNT_VITERBI                     0x0035
 
-#define EVENT_MAX_                                  0x0034
+#define EVENT_MAX_                                  0x0035
 
 /* sizeof(control_connection_t.event_mask) in bits, currently a uint64_t */
 #define EVENT_CAPACITY_               0x0040
