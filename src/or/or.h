@@ -79,6 +79,7 @@
 #include "replaycache.h"
 #include "crypto_curve25519.h"
 #include "crypto_ed25519.h"
+#include "tmodel.h"
 #include "tor_queue.h"
 #include "util_format.h"
 #include "hs_circuitmap.h"
@@ -1723,6 +1724,11 @@ typedef struct edge_connection_t {
    * that's going away and being used on channels instead.  We still tag
    * edge connections with dirreq_id from circuits, so it's copied here. */
   uint64_t dirreq_id;
+
+  /* Holds state information used to model cell emissions.
+   * The state is stored during stream usage, and processed
+   * when this object is freed (on stream destroy). */
+  tmodel_stream_t* privcount_traffic_model_state;
 
   /* The number of the stream on the circuit. Starts at 1.
    * 0 for non-exit streams. */

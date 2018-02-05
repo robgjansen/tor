@@ -441,6 +441,16 @@ connection_edge_end(edge_connection_t *conn, uint8_t reason)
 
   control_event_privcount_stream_ended(conn);
 
+  /* if we have a tmodel on this stream, process the results */
+  if (conn && conn->privcount_traffic_model_state) {
+    if (TO_CONN(conn)->type != CONN_TYPE_EXIT) {
+      log_warn(LD_BUG,"We unexpectedly have a traffic model"
+                      "on a non-exit type connection.");
+      tor_fragile_assert();
+    }
+    tmodel_stream_free(conn->privcount_traffic_model_state);
+  }
+
   return 0;
 }
 
@@ -3507,6 +3517,10 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
   if (or_circ && !bcell.is_begindir) {
     n_stream->privcount_circuit_exit_stream_number =
         or_circ->privcount_n_exit_streams;
+  }
+  /* check if PrivCount is on and wants to model cell emissions */
+  if(tmodel_is_active()) {
+    n_stream->privcount_traffic_model_state = tmodel_stream_new();
   }
 
   /* Remember the tunneled request ID in the new edge connection, so that
