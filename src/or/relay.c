@@ -937,6 +937,15 @@ connection_edge_send_command(edge_connection_t *fromconn,
   }
 #endif /* defined(MEASUREMENTS_21206) */
 
+  /* Update PrivCount traffic model state, if we need to.
+   * The state object will be NULL if PrivCount is off or
+   * it does not want to model cell emissions. */
+  if (relay_command == RELAY_COMMAND_DATA &&
+      fromconn && fromconn->privcount_traffic_model_state) {
+    tmodel_stream_cell_transferred(fromconn->privcount_traffic_model_state,
+        payload_len, TMODEL_SENT_TO_CIRC_INITIATOR);
+  }
+
   return relay_send_command_from_edge(fromconn->stream_id, circ,
                                       relay_command, payload,
                                       payload_len, cpath_layer);
@@ -1793,6 +1802,14 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
       stats_n_data_bytes_received += rh.length;
       connection_buf_add((char*)(cell->payload + RELAY_HEADER_SIZE),
                               rh.length, TO_CONN(conn));
+
+      /* Update PrivCount traffic model state, if we need to.
+       * The state object will be NULL if PrivCount is off or
+       * it does not want to model cell emissions. */
+      if(conn && conn->privcount_traffic_model_state) {
+        tmodel_stream_cell_transferred(conn->privcount_traffic_model_state,
+            (size_t)rh.length, TMODEL_RECV_FROM_CIRC_INITIATOR);
+      }
 
 #ifdef MEASUREMENTS_21206
       /* Count number of RELAY_DATA cells received on a linked directory

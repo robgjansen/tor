@@ -812,7 +812,7 @@ void tmodel_stream_free(tmodel_stream_t* tstream) {
 }
 
 /* notify the traffic model that a stream transmitted a cell. */
-void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, tmodel_action_t action) {
+void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, size_t length, tmodel_action_t action) {
     tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
     // TODO XXX

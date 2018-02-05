@@ -21,7 +21,7 @@ enum tmodel_action_e {
 typedef struct tmodel_stream_s tmodel_stream_t;
 
 tmodel_stream_t* tmodel_stream_new();
-void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, tmodel_action_t action);
+void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, size_t length, tmodel_action_t action);
 void tmodel_stream_free(tmodel_stream_t* tstream);
 
 int tmodel_set_traffic_model(uint32_t len, char *body);
