@@ -40,23 +40,23 @@
 
 /* the tmodel_stream internal elements (see tmodel.h for typedef) */
 struct tmodel_stream_s {
-    /* Time the stream was created */
-    monotime_t creation_time;
-    monotime_t prev_emit_time;
+  /* Time the stream was created */
+  monotime_t creation_time;
+  monotime_t prev_emit_time;
 
-    /* uncommitted packet info. we hold info until a tolerence
-     * so that we can count data that arrives at the same time
-     * as part of the same packets. */
-    monotime_t buf_emit_time;
-    int64_t buf_delay;
-    size_t buf_length;
-    tmodel_action_t buf_obs;
+  /* uncommitted packet info. we hold info until a tolerence
+   * so that we can count data that arrives at the same time
+   * as part of the same packets. */
+  monotime_t buf_emit_time;
+  int64_t buf_delay;
+  size_t buf_length;
+  tmodel_action_t buf_obs;
 
-    /* committed observations */
-    smartlist_t* observations;
+  /* committed observations */
+  smartlist_t* observations;
 
-    /* for memory checking */
-    uint magic;
+  /* for memory checking */
+  uint magic;
 };
 
 /* An opaque structure representing a traffic model. The internals
@@ -66,40 +66,40 @@ typedef struct tmodel_s tmodel_t;
 
 /* the tmodel internal elements */
 struct tmodel_s {
-    /* array of strings holding names of each observation
-     * in the observation space */
-    char** obs_space;
-    /* the number of observations in obs_space.
-     * (the length of the obs_space array). */
-    uint num_obs;
+  /* array of strings holding names of each observation
+   * in the observation space */
+  char** obs_space;
+  /* the number of observations in obs_space.
+   * (the length of the obs_space array). */
+  uint num_obs;
 
-    /* array of strings holding names of each state
-     * in the state space */
-    char** state_space;
-    /* the number of states in state_space.
-     * (the length of the state_space array). */
-    uint num_states;
+  /* array of strings holding names of each state
+   * in the state space */
+  char** state_space;
+  /* the number of states in state_space.
+   * (the length of the state_space array). */
+  uint num_states;
 
-    /* array of size num_states where the start prob of
-     * state state_space[i] is held in start_prob[i] */
-    double* start_prob;
+  /* array of size num_states where the start prob of
+   * state state_space[i] is held in start_prob[i] */
+  double* start_prob;
 
-    /* matrix of size num_states*num_states
-     * where the transition prob of src state
-     * state_space[i] and dst state state_space[j]
-     * is held in trans_prob[i][j] */
-    double** trans_prob;
+  /* matrix of size num_states*num_states
+   * where the transition prob of src state
+   * state_space[i] and dst state state_space[j]
+   * is held in trans_prob[i][j] */
+  double** trans_prob;
 
-    /* matrices of size num_states*num_obs
-     * where the emission value of state
-     * state_space[i] and observation obs_space[j]
-     * is held in emit_val[i][j] */
-    double** emit_dp;
-    double** emit_mu;
-    double** emit_sigma;
+  /* matrices of size num_states*num_obs
+   * where the emission value of state
+   * state_space[i] and observation obs_space[j]
+   * is held in emit_val[i][j] */
+  double** emit_dp;
+  double** emit_mu;
+  double** emit_sigma;
 
-    /* for memory checking */
-    uint magic;
+  /* for memory checking */
+  uint magic;
 };
 
 /* global pointer to traffic model state */
@@ -108,422 +108,427 @@ tmodel_t* global_traffic_model = NULL;
 /* returns true if we want to know about cells on exit streams,
  * false otherwise. */
 int tmodel_is_active(void) {
-  if (get_options()->EnablePrivCount && global_traffic_model != NULL &&
-      global_traffic_model->magic == TRAFFIC_MODEL_MAGIC) {
+  if (get_options()->EnablePrivCount && global_traffic_model != NULL
+      && global_traffic_model->magic == TRAFFIC_MODEL_MAGIC) {
     return 1;
   }
   return 0;
 }
 
 static int _tmodel_get_state_index(tmodel_t* tmodel, char* state_name) {
-    tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
-    for(uint i = 0; i < tmodel->num_states; i++) {
-        if(strncasecmp(tmodel->state_space[i], state_name, 63) == 0) {
-            return i;
-        }
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    if (strncasecmp(tmodel->state_space[i], state_name, 63) == 0) {
+      return i;
     }
+  }
 
-    log_warn(LD_GENERAL, "unable to find state index");
-    return -1;
+  log_warn(LD_GENERAL, "unable to find state index");
+  return -1;
 }
 
 static int _tmodel_get_obs_index(tmodel_t* tmodel, char* obs_name) {
-    tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
-    for(uint i = 0; i < tmodel->num_obs; i++) {
-        if(strncasecmp(tmodel->obs_space[i], obs_name, 7) == 0) {
-            return i;
-        }
+  for (uint i = 0; i < tmodel->num_obs; i++) {
+    if (strncasecmp(tmodel->obs_space[i], obs_name, 7) == 0) {
+      return i;
     }
+  }
 
-    log_warn(LD_GENERAL, "unable to find obs index");
-    return -1;
+  log_warn(LD_GENERAL, "unable to find obs index");
+  return -1;
 }
 
 static int _json_find_object_end_pos(const char* json) {
-    /* start is the opening bracket or brace */
-    char open = json[0];
-    char close;
-    if (open == '[') {
-        close = ']';
-    } else if (open == '{') {
-        close = '}';
+  /* start is the opening bracket or brace */
+  char open = json[0];
+  char close;
+  if (open == '[') {
+    close = ']';
+  } else if (open == '{') {
+    close = '}';
+  } else {
+    log_warn(LD_GENERAL, "unable to recognize object delimiter");
+    return -1;
+  }
+
+  /* we start at depth one for the first char */
+  int depth = 1;
+
+  /* we need to find when the object closes */
+  int i = 1;
+  for (i = 1; json[i] != '\0' && depth > 0; i++) {
+    if (json[i] == open) {
+      depth++;
+    } else if (json[i] == close) {
+      depth--;
+    }
+  }
+
+  /* if we found the close, return the position */
+  if (depth == 0) {
+    return i;
+  } else {
+    log_warn(LD_GENERAL, "object has incorrect depth");
+    return -1;
+  }
+}
+
+static uint _parse_json_state_space(const char* json, int obj_end_pos,
+    tmodel_t* tmodel) {
+  /* start parsing states 1 past the object open char */
+  int i = 1;
+  uint count = 0;
+
+  while (json[i] != ']' && i <= obj_end_pos) {
+    char state_name[64];
+    memset(state_name, 0, 64);
+
+    /* read the state name string. */
+    int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name);
+    if (n_assigned != 1) {
+      log_warn(LD_GENERAL, "sscanf problem parsing state name");
+      return -1;
+    }
+
+    /* process the state name */
+    log_debug(LD_GENERAL, "found state '%s'", state_name);
+    if (tmodel) {
+      tmodel->state_space[count] = strndup(state_name, 63);
+    }
+    count++;
+
+    /* fast forward to the end of the name,
+     * plus 2 for the quote characters. */
+    i += strnlen(state_name, 63) + 2;
+
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
+    }
+  }
+
+  /* success! */
+  return count;
+}
+static uint _parse_json_obs_space(const char* json, int obj_end_pos,
+    tmodel_t* tmodel) {
+  /* start parsing states 1 past the object open char */
+  int i = 1;
+  uint count = 0;
+
+  while (json[i] != ']' && i <= obj_end_pos) {
+    char obs_name[8];
+    memset(obs_name, 0, 8);
+
+    /* read the state name string. */
+    int n_assigned = sscanf(&json[i], "\"%7[^\"]", obs_name);
+    if (n_assigned != 1) {
+      log_warn(LD_GENERAL, "sscanf problem parsing obs name");
+      return 1;
+    }
+
+    /* process the state name */
+    log_debug(LD_GENERAL, "found observation '%s'", obs_name);
+    if (tmodel) {
+      tmodel->obs_space[count] = strndup(obs_name, 7);
+    }
+    count++;
+
+    /* fast forward to the end of the name,
+     * plus 2 for the quote characters. */
+    i += strnlen(obs_name, 7) + 2;
+
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
+    }
+  }
+
+  /* success! */
+  return count;
+}
+
+static int _parse_json_emit_prob(const char* json, int obj_end_pos,
+    tmodel_t* tmodel) {
+  /* start parsing states 1 past the object open char */
+  int i = 1;
+
+  while (json[i] != '}' && i <= obj_end_pos) {
+    char state_name[64];
+    memset(state_name, 0, 64);
+
+    /* read the state name string. */
+    int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name);
+    if (n_assigned != 1) {
+      log_warn(LD_GENERAL, "sscanf problem parsing emit state name");
+      return 1;
+    }
+
+    /* fast forward to the end of the name,
+     * plus 3 for the quotes and the ':'. */
+    i += strnlen(state_name, 63) + 3;
+
+    /* we have another dict for dst states */
+    int inner_dict_len = _json_find_object_end_pos(&json[i]);
+    int inner_obj_end_pos = i + inner_dict_len;
+
+    /* jump one past the start of the inner dict */
+    if (json[i] != '{') {
+      log_warn(LD_GENERAL, "expected opening brace in emit object");
+      return 1;
     } else {
-        log_warn(LD_GENERAL, "unable to recognize object delimiter");
-        return -1;
+      i++;
     }
 
-    /* we start at depth one for the first char */
-    int depth = 1;
-
-    /* we need to find when the object closes */
-    int i = 1;
-    for(i = 1; json[i] != '\0' && depth > 0; i++) {
-        if (json[i] == open) {
-            depth++;
-        } else if (json[i] == close) {
-            depth--;
-        }
+    int state_index = _tmodel_get_state_index(tmodel, state_name);
+    if (state_index < 0) {
+      log_warn(LD_GENERAL, "unable to find state index");
+      return 1;
     }
 
-    /* if we found the close, return the position */
-    if (depth == 0) {
-        return i;
+    /* iterate the inner dict object */
+    while (json[i] != '}' && i <= inner_obj_end_pos) {
+      char obs[8];
+      memset(obs, 0, 8);
+
+      n_assigned = sscanf(&json[i], "\"%7[^\"]", obs);
+      if (n_assigned != 1) {
+        log_warn(LD_GENERAL, "sscanf problem parsing emit obs name");
+        return 1;
+      }
+
+      /* fast forward to the end of the dst state name,
+       * plus 3 for the quotes and the ':'. */
+      i += strnlen(obs, 7) + 3;
+
+      if (json[i] != '[') {
+        log_warn(LD_GENERAL, "unable to find emit list start bracket");
+        return 1;
+      }
+
+      int emit_vals_list_len = _json_find_object_end_pos(&json[i]);
+      if (emit_vals_list_len < 0) {
+        log_warn(LD_GENERAL, "unable to find emit list len");
+        return 1;
+      }
+
+      int obs_index = _tmodel_get_obs_index(tmodel, obs);
+      if (obs_index < 0) {
+        log_warn(LD_GENERAL, "unable to find emit obs index");
+        return 1;
+      }
+
+      double dp = 0.0, mu = 0.0, sigma = 0.0;
+      n_assigned = sscanf(&json[i], "[%lf;%lf;%lf]", &dp, &mu, &sigma);
+      if (n_assigned != 3) {
+        log_warn(LD_GENERAL, "sscanf problem parsing emit values");
+        return 1;
+      }
+
+      /* process the items */
+      log_debug(LD_GENERAL,
+          "found emit for state '%s' and obs '%s': dp='%f' mu='%f' sigma='%f'",
+          state_name, obs, dp, mu, sigma);
+
+      tmodel->emit_dp[state_index][obs_index] = dp;
+      tmodel->emit_mu[state_index][obs_index] = mu;
+      tmodel->emit_sigma[state_index][obs_index] = sigma;
+
+      /* fast forward to one past the end of the list */
+      i += emit_vals_list_len;
+
+      /* check if we have another element, which is normally
+       * separated by a comma, but we separate by a ';'. */
+      if (json[i] == ';') {
+        i++;
+      }
+    }
+
+    if (json[i] != '}') {
+      log_warn(LD_GENERAL, "unable to find emit closing brace");
+      return 1;
+    }
+
+    /* jump ahead one, past the end of the inner dict */
+    i++;
+
+    /* fast forward to the next entry or the end */
+    while (json[i] != ';' && json[i] != '}' && i < obj_end_pos) {
+      i++;
+    }
+
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
+    }
+  }
+
+  /* success! */
+  return 0;
+}
+
+static int _parse_json_trans_prob(const char* json, int obj_end_pos,
+    tmodel_t* tmodel) {
+  /* start parsing states 1 past the object open char */
+  int i = 1;
+
+  while (json[i] != '}' && i <= obj_end_pos) {
+    char state_name_src[64];
+    memset(state_name_src, 0, 64);
+
+    /* read the state name string. */
+    int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name_src);
+    if (n_assigned != 1) {
+      log_warn(LD_GENERAL, "sscanf problem parsing trans src state name");
+      return 1;
+    }
+
+    /* fast forward to the end of the name,
+     * plus 3 for the quotes and the ':'. */
+    i += strnlen(state_name_src, 63) + 3;
+
+    /* we have another dict for dst states */
+    int inner_dict_len = _json_find_object_end_pos(&json[i]);
+    int inner_obj_end_pos = i + inner_dict_len;
+
+    /* jump one past the start of the inner dict */
+    if (json[i] != '{') {
+      log_warn(LD_GENERAL, "unable to find trans open brace");
+      return 1;
     } else {
-        log_warn(LD_GENERAL, "object has incorrect depth");
-        return -1;
-    }
-}
-
-static uint _parse_json_state_space(const char* json, int obj_end_pos, tmodel_t* tmodel) {
-    /* start parsing states 1 past the object open char */
-    int i = 1;
-    uint count = 0;
-
-    while (json[i] != ']' && i <= obj_end_pos) {
-        char state_name[64];
-        memset(state_name, 0, 64);
-
-        /* read the state name string. */
-        int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name);
-        if (n_assigned != 1) {
-            log_warn(LD_GENERAL, "sscanf problem parsing state name");
-            return -1;
-        }
-
-        /* process the state name */
-        log_debug(LD_GENERAL, "found state '%s'", state_name);
-        if(tmodel) {
-            tmodel->state_space[count] = strndup(state_name, 63);
-        }
-        count++;
-
-        /* fast forward to the end of the name,
-         * plus 2 for the quote characters. */
-        i += strnlen(state_name, 63) + 2;
-
-        /* check if we have another element, which is normally
-         * separated by a comma, but we separate by a ';'. */
-        if(json[i] == ';') {
-            i++;
-        }
+      i++;
     }
 
-    /* success! */
-    return count;
-}
-static uint _parse_json_obs_space(const char* json, int obj_end_pos, tmodel_t* tmodel) {
-    /* start parsing states 1 past the object open char */
-    int i = 1;
-    uint count = 0;
-
-    while (json[i] != ']' && i <= obj_end_pos) {
-        char obs_name[8];
-        memset(obs_name, 0, 8);
-
-        /* read the state name string. */
-        int n_assigned = sscanf(&json[i], "\"%7[^\"]", obs_name);
-        if (n_assigned != 1) {
-            log_warn(LD_GENERAL, "sscanf problem parsing obs name");
-            return 1;
-        }
-
-        /* process the state name */
-        log_debug(LD_GENERAL, "found observation '%s'", obs_name);
-        if(tmodel) {
-            tmodel->obs_space[count] = strndup(obs_name, 7);
-        }
-        count++;
-
-        /* fast forward to the end of the name,
-         * plus 2 for the quote characters. */
-        i += strnlen(obs_name, 7) + 2;
-
-        /* check if we have another element, which is normally
-         * separated by a comma, but we separate by a ';'. */
-        if(json[i] == ';') {
-            i++;
-        }
+    int src_index = _tmodel_get_state_index(tmodel, state_name_src);
+    if (src_index < 0) {
+      log_warn(LD_GENERAL, "unable to find trans src state index");
+      return 1;
     }
 
-    /* success! */
-    return count;
-}
+    /* iterate the inner dict object */
+    while (json[i] != '}' && i <= inner_obj_end_pos) {
+      char state_name_dst[64];
+      memset(state_name_dst, 0, 64);
 
-static int _parse_json_emit_prob(const char* json, int obj_end_pos, tmodel_t* tmodel) {
-    /* start parsing states 1 past the object open char */
-    int i = 1;
+      n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name_dst);
+      if (n_assigned != 1) {
+        log_warn(LD_GENERAL, "sscanf problem parsing trans dst state name");
+        return 1;
+      }
 
-    while (json[i] != '}' && i <= obj_end_pos) {
-        char state_name[64];
-        memset(state_name, 0, 64);
+      /* fast forward to the end of the dst state name,
+       * plus 3 for the quotes and the ':'. */
+      i += strnlen(state_name_dst, 63) + 3;
 
-        /* read the state name string. */
-        int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name);
-        if (n_assigned != 1) {
-            log_warn(LD_GENERAL, "sscanf problem parsing emit state name");
-            return 1;
-        }
+      int dst_index = _tmodel_get_state_index(tmodel, state_name_dst);
+      if (dst_index < 0) {
+        log_warn(LD_GENERAL, "unable to find trans dst state index");
+        return 1;
+      }
 
-        /* fast forward to the end of the name,
-         * plus 3 for the quotes and the ':'. */
-        i += strnlen(state_name, 63) + 3;
+      double trans_prob = 0.0;
+      n_assigned = sscanf(&json[i], "%lf;", &trans_prob);
+      if (n_assigned != 1) {
+        log_warn(LD_GENERAL, "sscanf problem parsing trans prob val");
+        return 1;
+      }
 
-        /* we have another dict for dst states */
-        int inner_dict_len = _json_find_object_end_pos(&json[i]);
-        int inner_obj_end_pos = i + inner_dict_len;
+      /* process the items */
+      log_debug(LD_GENERAL, "found trans from '%s' to '%s' = '%f'",
+          state_name_src, state_name_dst, trans_prob);
 
-        /* jump one past the start of the inner dict */
-        if (json[i] != '{') {
-            log_warn(LD_GENERAL, "expected opening brace in emit object");
-            return 1;
-        } else {
-            i++;
-        }
+      tmodel->trans_prob[src_index][dst_index] = trans_prob;
 
-        int state_index = _tmodel_get_state_index(tmodel, state_name);
-        if(state_index < 0) {
-            log_warn(LD_GENERAL, "unable to find state index");
-            return 1;
-        }
-
-        /* iterate the inner dict object */
-        while(json[i] != '}' && i <= inner_obj_end_pos) {
-            char obs[8];
-            memset(obs, 0, 8);
-
-            n_assigned = sscanf(&json[i], "\"%7[^\"]", obs);
-            if (n_assigned != 1) {
-                log_warn(LD_GENERAL, "sscanf problem parsing emit obs name");
-                return 1;
-            }
-
-            /* fast forward to the end of the dst state name,
-             * plus 3 for the quotes and the ':'. */
-            i += strnlen(obs, 7) + 3;
-
-            if(json[i] != '[') {
-                log_warn(LD_GENERAL, "unable to find emit list start bracket");
-                return 1;
-            }
-
-            int emit_vals_list_len = _json_find_object_end_pos(&json[i]);
-            if (emit_vals_list_len < 0) {
-                log_warn(LD_GENERAL, "unable to find emit list len");
-                return 1;
-            }
-
-            int obs_index = _tmodel_get_obs_index(tmodel, obs);
-            if(obs_index < 0) {
-                log_warn(LD_GENERAL, "unable to find emit obs index");
-                return 1;
-            }
-
-            double dp = 0.0, mu = 0.0, sigma = 0.0;
-            n_assigned = sscanf(&json[i], "[%lf;%lf;%lf]", &dp, &mu, &sigma);
-            if (n_assigned != 3) {
-                log_warn(LD_GENERAL, "sscanf problem parsing emit values");
-                return 1;
-            }
-
-            /* process the items */
-            log_debug(LD_GENERAL,
-                    "found emit for state '%s' and obs '%s': dp='%f' mu='%f' sigma='%f'",
-                    state_name, obs, dp, mu, sigma);
-
-            tmodel->emit_dp[state_index][obs_index] = dp;
-            tmodel->emit_mu[state_index][obs_index] = mu;
-            tmodel->emit_sigma[state_index][obs_index] = sigma;
-
-            /* fast forward to one past the end of the list */
-            i += emit_vals_list_len;
-
-            /* check if we have another element, which is normally
-             * separated by a comma, but we separate by a ';'. */
-            if(json[i] == ';') {
-                i++;
-            }
-        }
-
-        if(json[i] != '}') {
-            log_warn(LD_GENERAL, "unable to find emit closing brace");
-            return 1;
-        }
-
-        /* jump ahead one, past the end of the inner dict */
+      /* fast forward to the next entry or the end */
+      while (json[i] != ';' && json[i] != '}' && i < inner_obj_end_pos) {
         i++;
+      }
 
-        /* fast forward to the next entry or the end */
-        while(json[i] != ';' && json[i] != '}' && i < obj_end_pos) {
-            i++;
-        }
-
-        /* check if we have another element, which is normally
-         * separated by a comma, but we separate by a ';'. */
-        if(json[i] == ';') {
-            i++;
-        }
-    }
-
-    /* success! */
-    return 0;
-}
-
-static int _parse_json_trans_prob(const char* json, int obj_end_pos, tmodel_t* tmodel) {
-    /* start parsing states 1 past the object open char */
-    int i = 1;
-
-    while (json[i] != '}' && i <= obj_end_pos) {
-        char state_name_src[64];
-        memset(state_name_src, 0, 64);
-
-        /* read the state name string. */
-        int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name_src);
-        if (n_assigned != 1) {
-            log_warn(LD_GENERAL, "sscanf problem parsing trans src state name");
-            return 1;
-        }
-
-        /* fast forward to the end of the name,
-         * plus 3 for the quotes and the ':'. */
-        i += strnlen(state_name_src, 63) + 3;
-
-        /* we have another dict for dst states */
-        int inner_dict_len = _json_find_object_end_pos(&json[i]);
-        int inner_obj_end_pos = i + inner_dict_len;
-
-        /* jump one past the start of the inner dict */
-        if (json[i] != '{') {
-            log_warn(LD_GENERAL, "unable to find trans open brace");
-            return 1;
-        } else {
-            i++;
-        }
-
-        int src_index = _tmodel_get_state_index(tmodel, state_name_src);
-        if(src_index < 0) {
-            log_warn(LD_GENERAL, "unable to find trans src state index");
-            return 1;
-        }
-
-        /* iterate the inner dict object */
-        while(json[i] != '}' && i <= inner_obj_end_pos) {
-            char state_name_dst[64];
-            memset(state_name_dst, 0, 64);
-
-            n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name_dst);
-            if (n_assigned != 1) {
-                log_warn(LD_GENERAL, "sscanf problem parsing trans dst state name");
-                return 1;
-            }
-
-            /* fast forward to the end of the dst state name,
-             * plus 3 for the quotes and the ':'. */
-            i += strnlen(state_name_dst, 63) + 3;
-
-            int dst_index = _tmodel_get_state_index(tmodel, state_name_dst);
-            if(dst_index < 0) {
-                log_warn(LD_GENERAL, "unable to find trans dst state index");
-                return 1;
-            }
-
-            double trans_prob = 0.0;
-            n_assigned = sscanf(&json[i], "%lf;", &trans_prob);
-            if (n_assigned != 1) {
-                log_warn(LD_GENERAL, "sscanf problem parsing trans prob val");
-                return 1;
-            }
-
-            /* process the items */
-            log_debug(LD_GENERAL, "found trans from '%s' to '%s' = '%f'",
-                    state_name_src, state_name_dst, trans_prob);
-
-            tmodel->trans_prob[src_index][dst_index] = trans_prob;
-
-            /* fast forward to the next entry or the end */
-            while(json[i] != ';' && json[i] != '}' && i < inner_obj_end_pos) {
-                i++;
-            }
-
-            /* check if we have another element, which is normally
-             * separated by a comma, but we separate by a ';'. */
-            if(json[i] == ';') {
-                i++;
-            }
-        }
-
-        /* jump ahead one, past the end of the inner dict */
+      /* check if we have another element, which is normally
+       * separated by a comma, but we separate by a ';'. */
+      if (json[i] == ';') {
         i++;
-
-        /* fast forward to the next entry or the end */
-        while(json[i] != ';' && json[i] != '}' && i < obj_end_pos) {
-            i++;
-        }
-
-        /* check if we have another element, which is normally
-         * separated by a comma, but we separate by a ';'. */
-        if(json[i] == ';') {
-            i++;
-        }
+      }
     }
 
-    /* success! */
-    return 0;
+    /* jump ahead one, past the end of the inner dict */
+    i++;
+
+    /* fast forward to the next entry or the end */
+    while (json[i] != ';' && json[i] != '}' && i < obj_end_pos) {
+      i++;
+    }
+
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
+    }
+  }
+
+  /* success! */
+  return 0;
 }
 
-static int _parse_json_start_prob(const char* json, int obj_end_pos, tmodel_t* tmodel) {
-    /* start parsing states 1 past the object open char */
-    int i = 1;
+static int _parse_json_start_prob(const char* json, int obj_end_pos,
+    tmodel_t* tmodel) {
+  /* start parsing states 1 past the object open char */
+  int i = 1;
 
-    while (json[i] != '}' && i <= obj_end_pos) {
-        char state_name[64];
-        memset(state_name, 0, 64);
+  while (json[i] != '}' && i <= obj_end_pos) {
+    char state_name[64];
+    memset(state_name, 0, 64);
 
-        /* read the state name string. */
-        int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name);
-        if (n_assigned != 1) {
-            log_warn(LD_GENERAL, "sscanf problem parsing start state name");
-            return 1;
-        }
-
-        /* fast forward to the end of the name,
-         * plus 3 for the quotes and the ':'. */
-        i += strnlen(state_name, 63) + 3;
-
-        int state_index = _tmodel_get_state_index(tmodel, state_name);
-        if(state_index < 0) {
-            log_warn(LD_GENERAL, "unable to find start state name index");
-            return 1;
-        }
-
-        double start_prob = 0.0;
-        n_assigned = sscanf(&json[i], "%lf;", &start_prob);
-        if (n_assigned != 1) {
-            log_warn(LD_GENERAL, "sscanf problem parsing start prob");
-            return 1;
-        }
-
-        /* process the items */
-        log_debug(LD_GENERAL, "found state '%s' and start_prob '%f'",
-                state_name, start_prob);
-
-        tmodel->start_prob[state_index] = start_prob;
-
-        /* fast forward to the next entry or the end */
-        while(json[i] != ';' && json[i] != '}' && i < obj_end_pos) {
-            i++;
-        }
-
-        /* check if we have another element, which is normally
-         * separated by a comma, but we separate by a ';'. */
-        if(json[i] == ';') {
-            i++;
-        }
+    /* read the state name string. */
+    int n_assigned = sscanf(&json[i], "\"%63[^\"]", state_name);
+    if (n_assigned != 1) {
+      log_warn(LD_GENERAL, "sscanf problem parsing start state name");
+      return 1;
     }
 
-    /* success! */
-    return 0;
+    /* fast forward to the end of the name,
+     * plus 3 for the quotes and the ':'. */
+    i += strnlen(state_name, 63) + 3;
+
+    int state_index = _tmodel_get_state_index(tmodel, state_name);
+    if (state_index < 0) {
+      log_warn(LD_GENERAL, "unable to find start state name index");
+      return 1;
+    }
+
+    double start_prob = 0.0;
+    n_assigned = sscanf(&json[i], "%lf;", &start_prob);
+    if (n_assigned != 1) {
+      log_warn(LD_GENERAL, "sscanf problem parsing start prob");
+      return 1;
+    }
+
+    /* process the items */
+    log_debug(LD_GENERAL, "found state '%s' and start_prob '%f'", state_name,
+        start_prob);
+
+    tmodel->start_prob[state_index] = start_prob;
+
+    /* fast forward to the next entry or the end */
+    while (json[i] != ';' && json[i] != '}' && i < obj_end_pos) {
+      i++;
+    }
+
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
+    }
+  }
+
+  /* success! */
+  return 0;
 }
 
 /* we loop twice, once to parse the state space and observation
@@ -531,122 +536,124 @@ static int _parse_json_start_prob(const char* json, int obj_end_pos, tmodel_t* t
  * pass, we parse the trans_prob, emit_prob, an start_prob
  * objects, given the space and observation spaces that we
  * parsed in the first step. */
-static int _parse_json_objects(const char* json, int parse_spaces, tmodel_t* tmodel) {
-    tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+static int _parse_json_objects(const char* json, int parse_spaces,
+    tmodel_t* tmodel) {
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
-    int i = 0, j = 0;
-    if (json[i] != '{') {
+  int i = 0, j = 0;
+  if (json[i] != '{') {
+    return 1;
+  } else {
+    i++;
+  }
+
+  while (json[i] != '}') {
+    /* static buffer to hold the parsed type */
+    char input_type[32];
+    memset(input_type, 0, 32);
+
+    /* read the type. will be one of the following:
+     *   '"states"', '"emission_probability"',
+     *   'transition_probability', 'start_probability'
+     * they may appear in any order.
+     */
+    int n_assigned = sscanf(&json[i], "\"%30[^\"]", input_type);
+    if (n_assigned != 1) {
+      return 1;
+    }
+
+    /* fast forward to the object starting position,
+     * which will be at 1 past the ':' character.
+     * add 3 for the "": chars */
+    i += strnlen(input_type, 30) + 3;
+
+    /* find the end of the object */
+    j = _json_find_object_end_pos(&json[i]);
+    if (j < 0) {
+      return 1;
+    }
+
+    log_info(LD_GENERAL, "found object '%s' of length %d", input_type, j);
+
+    /* handle each object type */
+    if (json[i] == '[' && strncasecmp(input_type, "state_space", 6) == 0) {
+      if (parse_spaces) {
+        /* first count the number of states */
+        uint num_states = _parse_json_state_space(&json[i], j, NULL);
+        if (num_states <= 0) {
+          log_warn(LD_GENERAL,
+              "_parse_json_state_space failed to count states (1)");
+          return 1;
+        }
+
+        /* allocate the state array */
+        tmodel->num_states = num_states;
+        tmodel->state_space = calloc(tmodel->num_states, sizeof(char*));
+
+        /* now actually store the values by giving a model */
+        num_states = _parse_json_state_space(&json[i], j, tmodel);
+        if (num_states <= 0) {
+          log_warn(LD_GENERAL,
+              "_parse_json_state_space failed to count states (2)");
+          return 1;
+        }
+      }
+    } else if (json[i] == '['
+        && strncasecmp(input_type, "observation_space", 17) == 0) {
+      if (parse_spaces) {
+        /* first count the number of states */
+        uint num_obs = _parse_json_obs_space(&json[i], j, NULL);
+        if (num_obs <= 0) {
+          log_warn(LD_GENERAL, "_parse_json_obs_space failed to count obs (1)");
+          return 1;
+        }
+
+        /* allocate the obs array */
+        tmodel->num_obs = num_obs;
+        tmodel->obs_space = calloc(tmodel->num_obs, sizeof(char*));
+
+        /* now actually store the values by giving a model */
+        num_obs = _parse_json_obs_space(&json[i], j, tmodel);
+        if (num_obs <= 0) {
+          log_warn(LD_GENERAL, "_parse_json_obs_space failed to count obs (2)");
+          return 1;
+        }
+      }
+    } else if (json[i] == '{'
+        && strncasecmp(input_type, "emission_probability", 20) == 0) {
+      if (!parse_spaces && _parse_json_emit_prob(&json[i], j, tmodel) != 0) {
+        log_warn(LD_GENERAL, "_parse_json_emit_prob failed");
         return 1;
+      }
+    } else if (json[i] == '{'
+        && strncasecmp(input_type, "transition_probability", 22) == 0) {
+      if (!parse_spaces && _parse_json_trans_prob(&json[i], j, tmodel) != 0) {
+        log_warn(LD_GENERAL, "_parse_json_trans_prob failed");
+        return 1;
+      }
+    } else if (json[i] == '{'
+        && strncasecmp(input_type, "start_probability", 17) == 0) {
+      if (!parse_spaces && _parse_json_start_prob(&json[i], j, tmodel) != 0) {
+        log_warn(LD_GENERAL, "_parse_json_start_prob failed");
+        return 1;
+      }
     } else {
-        i++;
+      return 1;
     }
 
-    while (json[i] != '}') {
-        /* static buffer to hold the parsed type */
-        char input_type[32];
-        memset(input_type, 0, 32);
+    /* Jump to the end of the object, and add 1 to
+     * get the the start of the next item. */
+    i += j;
 
-        /* read the type. will be one of the following:
-         *   '"states"', '"emission_probability"',
-         *   'transition_probability', 'start_probability'
-         * they may appear in any order.
-         */
-        int n_assigned = sscanf(&json[i], "\"%30[^\"]", input_type);
-        if (n_assigned != 1) {
-            return 1;
-        }
-
-        /* fast forward to the object starting position,
-         * which will be at 1 past the ':' character.
-         * add 3 for the "": chars */
-        i += strnlen(input_type, 30) + 3;
-
-        /* find the end of the object */
-        j = _json_find_object_end_pos(&json[i]);
-        if (j < 0) {
-            return 1;
-        }
-
-        log_info(LD_GENERAL, "found object '%s' of length %d", input_type, j);
-
-        /* handle each object type */
-        if (json[i] == '[' &&
-                strncasecmp(input_type, "state_space", 6) == 0) {
-            if(parse_spaces) {
-                /* first count the number of states */
-                uint num_states = _parse_json_state_space(&json[i], j, NULL);
-                if(num_states <= 0) {
-                    log_warn(LD_GENERAL, "_parse_json_state_space failed to count states (1)");
-                    return 1;
-                }
-
-                /* allocate the state array */
-                tmodel->num_states = num_states;
-                tmodel->state_space = calloc(tmodel->num_states, sizeof(char*));
-
-                /* now actually store the values by giving a model */
-                num_states = _parse_json_state_space(&json[i], j, tmodel);
-                if(num_states <= 0) {
-                    log_warn(LD_GENERAL, "_parse_json_state_space failed to count states (2)");
-                    return 1;
-                }
-            }
-        } else if (json[i] == '[' &&
-                strncasecmp(input_type, "observation_space", 17) == 0) {
-            if(parse_spaces) {
-                /* first count the number of states */
-                uint num_obs = _parse_json_obs_space(&json[i], j, NULL);
-                if(num_obs <= 0) {
-                    log_warn(LD_GENERAL, "_parse_json_obs_space failed to count obs (1)");
-                    return 1;
-                }
-
-                /* allocate the obs array */
-                tmodel->num_obs = num_obs;
-                tmodel->obs_space = calloc(tmodel->num_obs, sizeof(char*));
-
-                /* now actually store the values by giving a model */
-                num_obs = _parse_json_obs_space(&json[i], j, tmodel);
-                if(num_obs <= 0) {
-                    log_warn(LD_GENERAL, "_parse_json_obs_space failed to count obs (2)");
-                    return 1;
-                }
-            }
-        } else if (json[i] == '{' &&
-                strncasecmp(input_type, "emission_probability", 20) == 0) {
-            if(!parse_spaces && _parse_json_emit_prob(&json[i], j, tmodel) != 0) {
-                log_warn(LD_GENERAL, "_parse_json_emit_prob failed");
-                return 1;
-            }
-        } else if (json[i] == '{' &&
-                strncasecmp(input_type, "transition_probability", 22) == 0) {
-            if(!parse_spaces && _parse_json_trans_prob(&json[i], j, tmodel) != 0) {
-                log_warn(LD_GENERAL, "_parse_json_trans_prob failed");
-                return 1;
-            }
-        } else if (json[i] == '{' &&
-                strncasecmp(input_type, "start_probability", 17) == 0) {
-            if(!parse_spaces && _parse_json_start_prob(&json[i], j, tmodel) != 0) {
-                log_warn(LD_GENERAL, "_parse_json_start_prob failed");
-                return 1;
-            }
-        } else {
-            return 1;
-        }
-
-        /* Jump to the end of the object, and add 1 to
-         * get the the start of the next item. */
-        i += j;
-
-        /* check if we have another element, which is normally
-         * separated by a comma, but we separate by a ';'. */
-        if(json[i] == ';') {
-            i++;
-        }
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
     }
+  }
 
-    /* success! */
-    return 0;
+  /* success! */
+  return 0;
 }
 
 static void _tmodel_log_model(tmodel_t* tmodel) {
@@ -656,7 +663,8 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
     log_info(LD_GENERAL, "Logging tmodel state space");
     for (uint i = 0; i < tmodel->num_states; i++) {
       if (tmodel->state_space[i]) {
-        log_info(LD_GENERAL, "found state_space[%i] '%s'", i, tmodel->state_space[i]);
+        log_info(LD_GENERAL, "found state_space[%i] '%s'", i,
+            tmodel->state_space[i]);
       }
     }
   }
@@ -665,7 +673,8 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
     log_info(LD_GENERAL, "Logging tmodel observation space");
     for (uint i = 0; i < tmodel->num_obs; i++) {
       if (tmodel->obs_space[i]) {
-        log_info(LD_GENERAL, "found obs_space[%i] '%s'", i, tmodel->obs_space[i]);
+        log_info(LD_GENERAL, "found obs_space[%i] '%s'", i,
+            tmodel->obs_space[i]);
       }
     }
   }
@@ -673,7 +682,8 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
   if (tmodel->start_prob) {
     log_info(LD_GENERAL, "Logging tmodel start probabilities");
     for (uint i = 0; i < tmodel->num_states; i++) {
-      log_info(LD_GENERAL, "found start_prob[%i] '%f'", i, tmodel->start_prob[i]);
+      log_info(LD_GENERAL, "found start_prob[%i] '%f'", i,
+          tmodel->start_prob[i]);
     }
   }
 
@@ -682,7 +692,8 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
     for (uint i = 0; i < tmodel->num_states; i++) {
       if (tmodel->trans_prob[i]) {
         for (uint j = 0; j < tmodel->num_states; j++) {
-          log_info(LD_GENERAL, "found trans_prob[%i][%i] '%f'", i, j, tmodel->trans_prob[i][j]);
+          log_info(LD_GENERAL, "found trans_prob[%i][%i] '%f'", i, j,
+              tmodel->trans_prob[i][j]);
         }
       }
     }
@@ -693,9 +704,12 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
     for (uint i = 0; i < tmodel->num_states; i++) {
       if (tmodel->emit_dp[i] && tmodel->emit_mu[i] && tmodel->emit_sigma[i]) {
         for (uint j = 0; j < tmodel->num_obs; j++) {
-          log_info(LD_GENERAL, "found emit_dp[%i][%i] '%f'", i, j, tmodel->emit_dp[i][j]);
-          log_info(LD_GENERAL, "found emit_mu[%i][%i] '%f'", i, j, tmodel->emit_mu[i][j]);
-          log_info(LD_GENERAL, "found emit_sigma[%i][%i] '%f'", i, j, tmodel->emit_sigma[i][j]);
+          log_info(LD_GENERAL, "found emit_dp[%i][%i] '%f'", i, j,
+              tmodel->emit_dp[i][j]);
+          log_info(LD_GENERAL, "found emit_mu[%i][%i] '%f'", i, j,
+              tmodel->emit_mu[i][j]);
+          log_info(LD_GENERAL, "found emit_sigma[%i][%i] '%f'", i, j,
+              tmodel->emit_sigma[i][j]);
         }
       }
     }
@@ -703,125 +717,125 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
 }
 
 static void _tmodel_allocate_arrays(tmodel_t* tmodel) {
-    tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
-    tmodel->start_prob = calloc((size_t)tmodel->num_states, sizeof(double));
+  tmodel->start_prob = calloc((size_t) tmodel->num_states, sizeof(double));
 
-    tmodel->trans_prob = calloc((size_t)tmodel->num_states, sizeof(double*));
-    for(uint i = 0; i < tmodel->num_states; i++) {
-        tmodel->trans_prob[i] = calloc((size_t)tmodel->num_states, sizeof(double));
-    }
+  tmodel->trans_prob = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->trans_prob[i] = calloc((size_t) tmodel->num_states, sizeof(double));
+  }
 
-    tmodel->emit_dp = calloc((size_t)tmodel->num_states, sizeof(double*));
-    for(uint i = 0; i < tmodel->num_states; i++) {
-        tmodel->emit_dp[i] = calloc((size_t)tmodel->num_obs, sizeof(double));
-    }
+  tmodel->emit_dp = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->emit_dp[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
+  }
 
-    tmodel->emit_mu = calloc((size_t)tmodel->num_states, sizeof(double*));
-    for(uint i = 0; i < tmodel->num_states; i++) {
-        tmodel->emit_mu[i] = calloc((size_t)tmodel->num_obs, sizeof(double));
-    }
+  tmodel->emit_mu = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->emit_mu[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
+  }
 
-    tmodel->emit_sigma = calloc((size_t)tmodel->num_states, sizeof(double*));
-    for(uint i = 0; i < tmodel->num_states; i++) {
-        tmodel->emit_sigma[i] = calloc((size_t)tmodel->num_obs, sizeof(double));
-    }
+  tmodel->emit_sigma = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->emit_sigma[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
+  }
 }
 
 static void _tmodel_free(tmodel_t* tmodel) {
-    tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
-    if(tmodel->start_prob) {
-        free(tmodel->start_prob);
+  if (tmodel->start_prob) {
+    free(tmodel->start_prob);
+  }
+
+  if (tmodel->trans_prob) {
+    for (uint i = 0; i < tmodel->num_states; i++) {
+      if (tmodel->trans_prob[i]) {
+        free(tmodel->trans_prob[i]);
+      }
     }
+    free(tmodel->trans_prob);
+  }
 
-    if(tmodel->trans_prob) {
-        for(uint i = 0; i < tmodel->num_states; i++) {
-            if(tmodel->trans_prob[i]) {
-                free(tmodel->trans_prob[i]);
-            }
-        }
-        free(tmodel->trans_prob);
+  if (tmodel->emit_dp) {
+    for (uint i = 0; i < tmodel->num_states; i++) {
+      if (tmodel->emit_dp[i]) {
+        free(tmodel->emit_dp[i]);
+      }
     }
+    free(tmodel->emit_dp);
+  }
 
-    if(tmodel->emit_dp) {
-        for(uint i = 0; i < tmodel->num_states; i++) {
-            if(tmodel->emit_dp[i]) {
-                free(tmodel->emit_dp[i]);
-            }
-        }
-        free(tmodel->emit_dp);
+  if (tmodel->emit_mu) {
+    for (uint i = 0; i < tmodel->num_states; i++) {
+      if (tmodel->emit_mu[i]) {
+        free(tmodel->emit_mu[i]);
+      }
     }
+    free(tmodel->emit_mu);
+  }
 
-    if(tmodel->emit_mu) {
-        for(uint i = 0; i < tmodel->num_states; i++) {
-            if(tmodel->emit_mu[i]) {
-                free(tmodel->emit_mu[i]);
-            }
-        }
-        free(tmodel->emit_mu);
+  if (tmodel->emit_sigma) {
+    for (uint i = 0; i < tmodel->num_states; i++) {
+      if (tmodel->emit_sigma[i]) {
+        free(tmodel->emit_sigma[i]);
+      }
     }
+    free(tmodel->emit_sigma);
+  }
 
-    if(tmodel->emit_sigma) {
-        for(uint i = 0; i < tmodel->num_states; i++) {
-            if(tmodel->emit_sigma[i]) {
-                free(tmodel->emit_sigma[i]);
-            }
-        }
-        free(tmodel->emit_sigma);
+  if (tmodel->state_space) {
+    for (uint i = 0; i < tmodel->num_states; i++) {
+      if (tmodel->state_space[i]) {
+        free(tmodel->state_space[i]);
+      }
     }
+    free(tmodel->state_space);
+  }
 
-    if(tmodel->state_space) {
-        for(uint i = 0; i < tmodel->num_states; i++) {
-            if(tmodel->state_space[i]) {
-                free(tmodel->state_space[i]);
-            }
-        }
-        free(tmodel->state_space);
+  if (tmodel->obs_space) {
+    for (uint i = 0; i < tmodel->num_obs; i++) {
+      if (tmodel->obs_space[i]) {
+        free(tmodel->obs_space[i]);
+      }
     }
+    free(tmodel->obs_space);
+  }
 
-    if(tmodel->obs_space) {
-        for(uint i = 0; i < tmodel->num_obs; i++) {
-            if(tmodel->obs_space[i]) {
-                free(tmodel->obs_space[i]);
-            }
-        }
-        free(tmodel->obs_space);
-    }
-
-    tmodel->magic = 0;
-    tor_free_(tmodel);
+  tmodel->magic = 0;
+  tor_free_(tmodel);
 }
 
 static tmodel_t* _tmodel_new(const char* model_json) {
-    tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
-    tmodel->magic = TRAFFIC_MODEL_MAGIC;
+  tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
+  tmodel->magic = TRAFFIC_MODEL_MAGIC;
 
-    int ret = _parse_json_objects(model_json, 1, tmodel);
-    if(ret == 0) {
-        log_info(LD_GENERAL, "success parsing state and obs spaces");
+  int ret = _parse_json_objects(model_json, 1, tmodel);
+  if (ret == 0) {
+    log_info(LD_GENERAL, "success parsing state and obs spaces");
 
-        /* now we know the state and obs counts, allocate arrays */
-        _tmodel_allocate_arrays(tmodel);
+    /* now we know the state and obs counts, allocate arrays */
+    _tmodel_allocate_arrays(tmodel);
 
-        /* now parse again, filling the arrays with probs */
-        ret = _parse_json_objects(model_json, 0, tmodel);
-        if(ret == 0) {
-            log_info(LD_GENERAL, "success parsing trans, emit, and start probs");
-        } else {
-            log_warn(LD_GENERAL, "problem parsing trans, emit, and start probs");
-        }
+    /* now parse again, filling the arrays with probs */
+    ret = _parse_json_objects(model_json, 0, tmodel);
+    if (ret == 0) {
+      log_info(LD_GENERAL, "success parsing trans, emit, and start probs");
     } else {
-        log_warn(LD_GENERAL, "problem parsing state and obs spaces");
+      log_warn(LD_GENERAL, "problem parsing trans, emit, and start probs");
     }
+  } else {
+    log_warn(LD_GENERAL, "problem parsing state and obs spaces");
+  }
 
-    if(ret == 0) {
-        _tmodel_log_model(tmodel);
-        return tmodel;
-    } else {
-        _tmodel_free(tmodel);
-        return NULL;
-    }
+  if (ret == 0) {
+    _tmodel_log_model(tmodel);
+    return tmodel;
+  } else {
+    _tmodel_free(tmodel);
+    return NULL;
+  }
 }
 
 /* returns 0 if the traffic model body is parsed correctly and
@@ -839,29 +853,31 @@ int tmodel_set_traffic_model(uint32_t len, char *body) {
   char* model_json = NULL;
 
   /* check if we have a model */
-  if(len >= 5 && strncasecmp(body, "TRUE ", 5) == 0) {
-      /* this is a command to parse and store a new model */
-      model_json = &body[5];
+  if (len >= 5 && strncasecmp(body, "TRUE ", 5) == 0) {
+    /* this is a command to parse and store a new model */
+    model_json = &body[5];
   }
 
   /* we always free the previous model- if the length is too
    * short or we have a 'FALSE' command, or we are creating
    * a new model object. */
-  if(global_traffic_model != NULL) {
-      _tmodel_free(global_traffic_model);
-      global_traffic_model = NULL;
-      log_notice(LD_GENERAL, "Successfully freed a previously loaded traffic model");
+  if (global_traffic_model != NULL) {
+    _tmodel_free(global_traffic_model);
+    global_traffic_model = NULL;
+    log_notice(LD_GENERAL,
+        "Successfully freed a previously loaded traffic model");
   }
 
   /* now create a new one only if we had valid command input */
-  if(model_json != NULL) {
-      global_traffic_model = _tmodel_new(model_json);
-      if(global_traffic_model) {
-          log_notice(LD_GENERAL, "Successfully loaded a new traffic model from PrivCount");
-      } else {
-          log_warn(LD_GENERAL, "Unable to load traffic model from PrivCount");
-          return 1;
-      }
+  if (model_json != NULL) {
+    global_traffic_model = _tmodel_new(model_json);
+    if (global_traffic_model) {
+      log_notice(LD_GENERAL,
+          "Successfully loaded a new traffic model from PrivCount");
+    } else {
+      log_warn(LD_GENERAL, "Unable to load traffic model from PrivCount");
+      return 1;
+    }
   }
 
   return 0;
@@ -870,7 +886,7 @@ int tmodel_set_traffic_model(uint32_t len, char *body) {
 static int64_t _tmodel_encode_delay(int64_t delay, tmodel_action_t obs) {
   int64_t encoded_delay = 0;
 
-  if(obs == TMODEL_OBS_SENT_TO_ORIGIN) {
+  if (obs == TMODEL_OBS_SENT_TO_ORIGIN) {
     /* '-' gets encoded as a negative delay */
     encoded_delay = (delay == 0) ? INTPTR_MIN : -delay;
   } else { /* TMODEL_OBS_RECV_FROM_ORIGIN */
@@ -881,17 +897,18 @@ static int64_t _tmodel_encode_delay(int64_t delay, tmodel_action_t obs) {
   return encoded_delay;
 }
 
-static int64_t _tmodel_decode_delay(int64_t encoded_delay, tmodel_action_t* obs_out) {
+static int64_t _tmodel_decode_delay(int64_t encoded_delay,
+    tmodel_action_t* obs_out) {
   tmodel_action_t obs = TMODEL_OBS_NONE;
   int64_t delay = 0;
 
-  if(encoded_delay == INTPTR_MIN) {
+  if (encoded_delay == INTPTR_MIN) {
     delay = 0;
     obs = TMODEL_OBS_SENT_TO_ORIGIN;
-  } else if(encoded_delay == INTPTR_MAX) {
+  } else if (encoded_delay == INTPTR_MAX) {
     delay = 0;
     obs = TMODEL_OBS_RECV_FROM_ORIGIN;
-  } else if(encoded_delay < 0) {
+  } else if (encoded_delay < 0) {
     delay = -encoded_delay;
     obs = TMODEL_OBS_SENT_TO_ORIGIN;
   } else {
@@ -899,7 +916,7 @@ static int64_t _tmodel_decode_delay(int64_t encoded_delay, tmodel_action_t* obs_
     obs = TMODEL_OBS_RECV_FROM_ORIGIN;
   }
 
-  if(obs_out) {
+  if (obs_out) {
     *obs_out = obs;
   }
 
@@ -917,7 +934,7 @@ static void _tmodel_commit_packets(tmodel_stream_t* tstream) {
   tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
   /* do nothing if we have no packets */
-  if(tstream->buf_length <= 0) {
+  if (tstream->buf_length <= 0) {
     return;
   }
 
@@ -925,25 +942,25 @@ static void _tmodel_commit_packets(tmodel_stream_t* tstream) {
   int64_t delay = _tmodel_encode_delay(tstream->buf_delay, tstream->buf_obs);
 
   /* 'commit' the packet */
-  smartlist_add(tstream->observations, (void*)delay);
+  smartlist_add(tstream->observations, (void*) delay);
 
   /* consume the packet length worth of data */
-  if(tstream->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
+  if (tstream->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
     tstream->buf_length -= TMODEL_PACKET_BYTE_COUNT;
   } else {
     tstream->buf_length = 0;
   }
 
   /* now process any remaining packets */
-  while(tstream->buf_length > 0) {
+  while (tstream->buf_length > 0) {
     /* consecutive packets have no delay */
-    delay = _tmodel_encode_delay((int64_t)0, tstream->buf_obs);
+    delay = _tmodel_encode_delay((int64_t) 0, tstream->buf_obs);
 
     /* 'commit' the packet */
-    smartlist_add(tstream->observations, (void*)delay);
+    smartlist_add(tstream->observations, (void*) delay);
 
     /* consume the packet length worth of data */
-    if(tstream->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
+    if (tstream->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
       tstream->buf_length -= TMODEL_PACKET_BYTE_COUNT;
     } else {
       tstream->buf_length = 0;
