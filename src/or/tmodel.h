@@ -10,9 +10,21 @@
 
 #include <stdint.h>
 
-/* returns 0 if the traffic model body is parsed correctly and
- * the traffic model is loaded and ready to run viterbi on
- * closed streams. returns 1 if there is an error. */
+typedef enum tmodel_action_e tmodel_action_t;
+enum tmodel_action_e {
+    TMODEL_SENT_TO_CIRC_INITIATOR, TMODEL_RECV_FROM_CIRC_INITIATOR
+};
+
+/* An opaque structure representing stream model info. The internals
+ * of this structure are not intended to be accessed outside of the
+ * tmodel class. */
+typedef struct tmodel_stream_s tmodel_stream_t;
+
+tmodel_stream_t* tmodel_stream_new();
+void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, tmodel_action_t action);
+void tmodel_stream_free(tmodel_stream_t* tstream);
+
 int tmodel_set_traffic_model(uint32_t len, char *body);
+int tmodel_is_active();
 
 #endif /* SRC_OR_TMODEL_H_ */
