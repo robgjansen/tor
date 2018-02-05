@@ -943,7 +943,7 @@ connection_edge_send_command(edge_connection_t *fromconn,
   if (relay_command == RELAY_COMMAND_DATA &&
       fromconn && fromconn->privcount_traffic_model_state) {
     tmodel_stream_cell_transferred(fromconn->privcount_traffic_model_state,
-        payload_len, TMODEL_SENT_TO_CIRC_INITIATOR);
+        payload_len, TMODEL_OBS_SENT_TO_ORIGIN);
   }
 
   return relay_send_command_from_edge(fromconn->stream_id, circ,
@@ -1808,7 +1808,7 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
        * it does not want to model cell emissions. */
       if(conn && conn->privcount_traffic_model_state) {
         tmodel_stream_cell_transferred(conn->privcount_traffic_model_state,
-            (size_t)rh.length, TMODEL_RECV_FROM_CIRC_INITIATOR);
+            (size_t)rh.length, TMODEL_OBS_RECV_FROM_ORIGIN);
       }
 
 #ifdef MEASUREMENTS_21206
