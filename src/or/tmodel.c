@@ -24,6 +24,7 @@
 /* the tmodel_stream internal elements (see tmodel.h for typedef) */
 struct tmodel_stream_s {
     struct timeval creation_time;
+    struct timeval last_cell_time;
     unsigned int magic;
 };
 
@@ -713,7 +714,7 @@ static tmodel_t* _tmodel_new(const char* model_json) {
     tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
     tmodel->magic = TRAFFIC_MODEL_MAGIC;
 
-    int ret = _parse_json_objects(json_string, 1, tmodel);
+    int ret = _parse_json_objects(model_json, 1, tmodel);
     if(ret == 0) {
         log_info(LD_GENERAL, "success parsing state and obs spaces");
 
@@ -721,7 +722,7 @@ static tmodel_t* _tmodel_new(const char* model_json) {
         _tmodel_allocate_arrays(tmodel);
 
         /* now parse again, filling the arrays with probs */
-        ret = _parse_json_objects(json_string, 0, tmodel);
+        ret = _parse_json_objects(model_json, 0, tmodel);
         if(ret == 0) {
             log_info(LD_GENERAL, "success parsing trans, emit, and start probs");
         } else {
@@ -789,6 +790,7 @@ tmodel_stream_t* tmodel_stream_new() {
     tstream->magic = TRAFFIC_STREAM_MAGIC;
 
     tor_gettimeofday(&tstream->creation_time);
+    tstream->last_cell_time = tstream->creation_time;
 
     return tstream;
 }
