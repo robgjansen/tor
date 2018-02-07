@@ -9028,7 +9028,7 @@ control_event_privcount_viterbi(char* viterbi_result)
   privcount_cleanse_tagged_str(viterbi_result);
 
   send_control_event(EVENT_PRIVCOUNT_VITERBI,
-                     "650 PRIVCOUNT_VITERBI LikliestStates=%s\r\n",
+                     "650 PRIVCOUNT_VITERBI ViterbiPath=%s\r\n",
                      viterbi_result);
 }
 
