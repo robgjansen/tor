@@ -1218,6 +1218,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     if(prev_opt_state >= n_states) {
       log_warn(LD_GENERAL, "Bug in viterbi: optimal_states index (%u) is out of range "
           "for observation %u", prev_opt_state, i);
+      goto cleanup; // will return NULL
     }
 
     optimal_states[i-1] = prev_opt_state;
