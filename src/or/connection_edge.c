@@ -449,6 +449,7 @@ connection_edge_end(edge_connection_t *conn, uint8_t reason)
       tor_fragile_assert();
     }
     tmodel_stream_free(conn->privcount_traffic_model_state);
+    conn->privcount_traffic_model_state = NULL;
   }
 
   return 0;

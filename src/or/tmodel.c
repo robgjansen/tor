@@ -8,10 +8,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <strings.h>
+#include <math.h>
 
 #include "tmodel.h"
 #include "or.h"
 #include "config.h"
+#include "compat.h"
 #include "container.h"
 #include "control.h"
 #include "torlog.h"
@@ -37,6 +39,9 @@
 #define TMODEL_OBS_RECV_STR "-"
 /* 'F' means the stream is ended */
 #define TMODEL_OBS_DONE_STR "F"
+
+/* SQRT_2_PI = math.sqrt(2*math.pi) */
+#define TMODEL_SQRT_2_PI 2.5066282746310002
 
 /* the tmodel_stream internal elements (see tmodel.h for typedef) */
 struct tmodel_stream_s {
@@ -79,6 +84,8 @@ struct tmodel_s {
   /* the number of states in state_space.
    * (the length of the state_space array). */
   uint num_states;
+  /* the max string length of all states in the state space */
+  size_t max_state_str_length;
 
   /* array of size num_states where the start prob of
    * state state_space[i] is held in start_prob[i] */
@@ -115,7 +122,7 @@ int tmodel_is_active(void) {
   return 0;
 }
 
-static int _tmodel_get_state_index(tmodel_t* tmodel, char* state_name) {
+static uint _tmodel_get_state_index(tmodel_t* tmodel, char* state_name) {
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
   for (uint i = 0; i < tmodel->num_states; i++) {
@@ -125,10 +132,10 @@ static int _tmodel_get_state_index(tmodel_t* tmodel, char* state_name) {
   }
 
   log_warn(LD_GENERAL, "unable to find state index");
-  return -1;
+  return UINT_MAX;
 }
 
-static int _tmodel_get_obs_index(tmodel_t* tmodel, char* obs_name) {
+static uint _tmodel_get_obs_index(tmodel_t* tmodel, char* obs_name) {
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
   for (uint i = 0; i < tmodel->num_obs; i++) {
@@ -138,7 +145,7 @@ static int _tmodel_get_obs_index(tmodel_t* tmodel, char* obs_name) {
   }
 
   log_warn(LD_GENERAL, "unable to find obs index");
-  return -1;
+  return UINT_MAX;
 }
 
 static int _json_find_object_end_pos(const char* json) {
@@ -197,6 +204,10 @@ static uint _parse_json_state_space(const char* json, int obj_end_pos,
     log_debug(LD_GENERAL, "found state '%s'", state_name);
     if (tmodel) {
       tmodel->state_space[count] = strndup(state_name, 63);
+      size_t state_str_len = strnlen(tmodel->state_space[count], 64);
+      if(state_str_len > tmodel->max_state_str_length) {
+        tmodel->max_state_str_length = state_str_len;
+      }
     }
     count++;
 
@@ -923,11 +934,317 @@ static int64_t _tmodel_decode_delay(int64_t encoded_delay,
   return delay;
 }
 
+static uint _tmodel_get_obs_action_index(tmodel_t* tmodel, tmodel_action_t obs) {
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+
+  const char* obs_str;
+
+  if(obs == TMODEL_OBS_SENT_TO_ORIGIN) {
+    obs_str = TMODEL_OBS_SENT_STR;
+  } else if(obs == TMODEL_OBS_RECV_FROM_ORIGIN) {
+    obs_str = TMODEL_OBS_RECV_STR;
+  } else {
+    obs_str = TMODEL_OBS_DONE_STR;
+  }
+
+  for(uint i = 0; i < tmodel->num_obs; i++) {
+    if (strncasecmp(obs_str, tmodel->obs_space[i], TMODEL_MAX_OBS_STR_LEN) == 0) {
+      return i;
+    }
+  }
+
+  log_warn(LD_GENERAL, "Unable to find index for observation code %i", (int)obs);
+  return UINT_MAX;
+}
+
+static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
+    uint* viterbi_path, uint path_len) {
+  tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
+
+  if(!tstream->observations || !viterbi_path ||
+      path_len != (uint)smartlist_len(tstream->observations)) {
+    return NULL;
+  }
+
+  tmodel_action_t obs;
+  uint obs_index, state_index;
+  int64_t delay, encoded_delay;
+
+  /* our json object will be something like:
+   *   [["m10s1";"+";35432];["m2s4";"+";0];["m4s2";"-";100];["m4sEnd";"F";0]]
+   * each observation (i.e., packet) will require:
+   *   9 chars for ["";"";];
+   *   n chars for state, where n is at most tmodel->max_state_str_length
+   *   1 char for either + or - or F
+   *   20 chars, the most that an int64_t value will consume
+   *       (INT64 range is -9223372036854775808 to 9223372036854775807)
+   *   --------
+   *   max total per observation is = 30 + n
+   *
+   * so for o observations, we need at most:
+   *   o * (30 + n) characters
+   *
+   * if n is 7, that's 37 bytes per observation
+   * we may go up to 100,000 or more packets on a really heavy stream
+   *   which would be 3700000 bytes or about 3.7 MB in a pessimistic case
+   *   this will get freed as soon as it is send to PrivCount
+   * instead, we use the large buffer to build the string, and then
+   *   truncate it before sending to PrivCount.
+   */
+  size_t n = tmodel->max_state_str_length;
+  size_t json_buffer_len = (size_t)(path_len * (30 + n));
+
+  char* json_buffer = calloc(json_buffer_len, 1);
+  size_t write_index = 0;
+  size_t rem_space = json_buffer_len-1;
+
+  int num_printed = 0;
+
+  for(uint i = 0; i < path_len; i++) {
+    encoded_delay = (int64_t)smartlist_get(tstream->observations, i);
+    delay = _tmodel_decode_delay(encoded_delay, &obs);
+
+    obs_index = _tmodel_get_obs_action_index(tmodel, obs);
+    state_index = viterbi_path[i];
+
+    num_printed = snprintf(&json_buffer[write_index], rem_space,
+        "[\"%s\";\"%s\";"I64_FORMAT"]%s",
+        tmodel->state_space[state_index],
+        tmodel->obs_space[obs_index],
+        I64_PRINTF_ARG(delay),
+        (i == path_len-1) ? "" : ";");
+
+    if(num_printed <= 0) {
+      free(json_buffer);
+      log_warn(LD_GENERAL, "Problem printing json for observation %u", i);
+      return NULL;
+    } else {
+      rem_space -= (size_t)num_printed;
+      write_index += (size_t)num_printed;
+    }
+  }
+
+  /* get the final string and truncate the buffer */
+  char* json = NULL;
+  num_printed = tor_asprintf(&json, "[%s]", json_buffer);
+
+  free(json_buffer);
+
+  if(num_printed <= 0) {
+    log_warn(LD_GENERAL, "Problem truncating json buffer");
+    return NULL;
+  } else {
+    return json;
+  }
+}
+
+static double _compute_delay_dx(int64_t delay) {
+  if(delay <= 2) {
+    return (double)1.0;
+  }
+
+  double ld = log((double)delay);
+  int64_t li = (int64_t)ld;
+
+  double ed = exp((double)li);
+  int64_t ei = (int64_t)ed;
+
+  return (double)ei;
+}
+
+static double _compute_delay_log(double dx, double mu, double sigma) {
+  const double sqrt2pi = (const double)TMODEL_SQRT_2_PI;
+  const double half = (const double)0.5;
+  const double two = (const double)2.0;
+
+  double log_prob = -log(dx*sigma*sqrt2pi) - half*pow(((log(dx)-mu)/sigma), two);
+  return log_prob;
+}
+
 static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
   tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
-  return NULL;
+  /* our goal is to find the viterbi path and encode it as a json string */
+  char* viterbi_json = NULL;
+
+  const uint n_states = tmodel->num_states;
+  const uint n_obs = (uint)smartlist_len(tstream->observations);
+
+  /* initialize the auxiliary tables:
+   *   table1 stores max probs
+   *   table2 stores state index of max probs  */
+  double** table1 = calloc(n_states, sizeof(double*));
+  uint** table2 = calloc(n_states, sizeof(uint*));
+  for(uint i = 0; i < n_states; i++) {
+    table1[i] = calloc(n_obs, sizeof(double));
+    table2[i] = calloc(n_obs, sizeof(uint));
+  }
+
+  /* list of most probable states for each observation.
+   * we store indices into our state space string array. */
+  uint* optimal_states = calloc(n_obs, sizeof(uint));
+  memset(optimal_states, UINT_MAX, sizeof(uint) * n_obs);
+
+  /* get some info about the first packet */
+  int64_t encoded_delay = (int64_t)smartlist_get(tstream->observations, 0);
+  tmodel_action_t obs;
+  int64_t delay = _tmodel_decode_delay(encoded_delay, &obs);
+
+  double dx = _compute_delay_dx(delay);
+
+  /* if the first packet is the last packet, it should be 'F' */
+  if(n_obs == 1) {
+    obs = TMODEL_OBS_DONE;
+  }
+
+  /* get the obs name index in the obs space */
+  uint obs_index = _tmodel_get_obs_action_index(tmodel, obs);
+  if(obs_index >= tmodel->num_obs) {
+    log_warn(LD_GENERAL, "Bug in viterbi: obs_index (%u) is out of range "
+        "for observation 0", obs_index);
+    goto cleanup; // will return NULL
+  }
+
+  for(uint i = 0; i < n_states; i++) {
+    if(tmodel->start_prob[i] <= 0) {
+      continue;
+    }
+
+    double dp = tmodel->emit_dp[i][obs_index];
+    double mu = tmodel->emit_mu[i][obs_index];
+    double sigma = tmodel->emit_sigma[i][obs_index];
+
+    if(dp <= 0 || sigma <= 0) {
+      continue;
+    }
+
+    double log_prob = _compute_delay_log(dx, mu, sigma);
+    double fit_prob = log(dp) + log_prob;
+    double prob = log(tmodel->start_prob[i]) + fit_prob;
+
+    table1[i][0] = prob;
+  }
+
+  /* loop through all observations (except the first) */
+  for(uint i = 1; i < n_obs; i++) {
+    encoded_delay = (int64_t)smartlist_get(tstream->observations, i);
+    delay = _tmodel_decode_delay(encoded_delay, &obs);
+
+    dx = _compute_delay_dx(delay);
+
+    /* if this is the last packet, it should be 'F' */
+    if(i == n_obs-1) {
+      obs = TMODEL_OBS_DONE;
+    }
+
+    /* get the obs name index in the obs space */
+    obs_index = _tmodel_get_obs_action_index(tmodel, obs);
+    if(obs_index >= tmodel->num_obs) {
+      log_warn(LD_GENERAL, "Bug in viterbi: obs_index (%u) is out of range "
+          "for observation %u", obs_index, i);
+      goto cleanup; // will return NULL
+    }
+
+    /* loop through the state space */
+    for(uint j = 0; j < n_states; j++) {
+      double dp = tmodel->emit_dp[j][obs_index];
+      double mu = tmodel->emit_mu[j][obs_index];
+      double sigma = tmodel->emit_sigma[j][obs_index];
+
+      if(dp <= 0 || sigma <= 0) {
+        continue;
+      }
+
+      double log_prob = _compute_delay_log(dx, mu, sigma);
+      double fit_prob = log(dp) + log_prob;
+
+      double max_trans_prob = 0;
+      double max_prob = 0;
+      uint max_prob_prev_state_index = UINT_MAX;
+
+      /* loop through every transition */
+      for(uint k = 0; k < n_states; k++) {
+        if(tmodel->trans_prob[k][j] <= 0) {
+          continue;
+        }
+
+        /* find the state k with the max transition prob from
+         * the prev most probable state (at obs i-1) to state k */
+        double trans_prob = table1[k][i-1] + log(tmodel->trans_prob[k][j]);
+
+        if(trans_prob > max_trans_prob) {
+          max_trans_prob = trans_prob;
+          max_prob = trans_prob + fit_prob;
+          max_prob_prev_state_index = k;
+        }
+      }
+
+      /* make sure we got a valid index */
+      if(max_prob_prev_state_index >= n_states) {
+        log_warn(LD_GENERAL, "Bug in viterbi: max_prob_prev_state_index (%u) is out of range "
+            "for observation %u in state %u", max_prob_prev_state_index, i, j);
+        goto cleanup; // will return NULL
+      }
+
+      /* store the max prob and prev state index for this observation */
+      table1[j][i] = max_prob;
+      table2[j][i] = max_prob_prev_state_index;
+    }
+  }
+
+  /* get most probable final state */
+  double optimal_prob = 0;
+  for(uint k = 0; k < n_states; k++) {
+    if(table1[k][n_obs-1] > optimal_prob) {
+      optimal_prob = table1[k][n_obs-1];
+      optimal_states[n_obs-1] = k;
+    }
+  }
+
+  /* sanity check */
+  if(optimal_states[n_obs-1] >= n_states) {
+    log_warn(LD_GENERAL, "Bug in viterbi: optimal_states index (%u) is out of range "
+        "for observation %u", optimal_states[n_obs-1], n_obs-1);
+    goto cleanup; // will return NULL
+  }
+
+  /* now work backward for the remaining observations */
+  for(uint i = n_obs-1; i > 0; i--) {
+    uint opt_state = optimal_states[i];
+    uint prev_opt_state = table2[opt_state][i];
+
+    /* sanity check */
+    if(prev_opt_state >= n_states) {
+      log_warn(LD_GENERAL, "Bug in viterbi: optimal_states index (%u) is out of range "
+          "for observation %u", prev_opt_state, i);
+    }
+
+    optimal_states[i-1] = prev_opt_state;
+  }
+
+  /* convert to json */
+  viterbi_json = _encode_viterbi_path(tmodel, tstream, &optimal_states[0], n_obs);
+
+  log_info(LD_GENERAL, "Found optimal viterbi prob %f path %s",
+      optimal_prob, viterbi_json ? viterbi_json : "NULL");
+
+cleanup:
+  tor_assert(table1);
+  tor_assert(table2);
+  tor_assert(optimal_states);
+
+  for(uint i = 0; i < n_states; i++) {
+    tor_assert(table1[i]);
+    tor_assert(table2[i]);
+    free(table1[i]);
+    free(table2[i]);
+  }
+  free(table1);
+  free(table2);
+  free(optimal_states);
+
+  return viterbi_json;
 }
 
 static void _tmodel_commit_packets(tmodel_stream_t* tstream) {
@@ -1031,17 +1348,34 @@ tmodel_stream_t* tmodel_stream_new(void) {
   return tstream;
 }
 
+/* process a finished stream.
+ * run viterbi to get the likliest paths for this stream, and then
+ * send the json result string to PrivCount over the control port. */
+static void _tmodel_process_stream(tmodel_stream_t* tstream) {
+  tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
+
+  char* viterbi_json = _tmodel_run_viterbi(global_traffic_model, tstream);
+
+  if(viterbi_json != NULL) {
+    /* send the viterbi json result */
+    control_event_privcount_viterbi(viterbi_json);
+    free(viterbi_json);
+  } else {
+    /* send a json empty list to signal an error */
+    char* empty_list = strndup("[]", 2);
+    control_event_privcount_viterbi(empty_list);
+    free(empty_list);
+  }
+}
+
 /* notify the traffic model that the stream closed and should
  * be processed and freed. */
 void tmodel_stream_free(tmodel_stream_t* tstream) {
   tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
-  /* the stream is finished, we have all of the data we are going to get.
-   * run viterbi to get the likliest paths for this stream, and then
-   * send the json result string to PrivCount over the control port. */
+  /* the stream is finished, we have all of the data we are going to get. */
   if (tmodel_is_active()) {
-    char* viterbi_result = _tmodel_run_viterbi(global_traffic_model, tstream);
-    control_event_privcount_viterbi(viterbi_result);
+    _tmodel_process_stream(tstream);
   }
 
   /* we had no need to allocate any memory other than the
@@ -1051,69 +1385,3 @@ void tmodel_stream_free(tmodel_stream_t* tstream) {
   tstream->magic = 0;
   tor_free_(tstream);
 }
-
-//def handle_stream(self, circuit_id, stream_id, stream_end_ts, secure_counters):
-//    # use our observations to find the most likely path through the HMM,
-//    # and then count some aggregate statistics about that path
-//
-//    if circuit_id in self.packets:
-//        if stream_id in self.packets[circuit_id]:
-//            # get the list of packet bundles
-//            bundles = self.packets[circuit_id].pop(stream_id)
-//            if bundles is not None and len(bundles) > 0:
-//                # add the ending state
-//                prev_packet_bundle = bundles[-1]
-//
-//                secs_since_prev_cell = stream_end_ts - prev_packet_bundle[2]
-//                micros_since_prev_cell = max(long(0), long(secs_since_prev_cell * 1000000))
-//
-//                end_bundle = [None, micros_since_prev_cell, stream_end_ts, 1, 0]
-//                bundles.append(end_bundle)
-//
-//                # we log a warning here in case PrivCount hangs in vitterbi
-//                # (it could hang processing packets, but that's very unlikely)
-//                stream_packet_count = sum(bundle[3] for bundle in bundles)
-//                if stream_packet_count > TrafficModel.MAX_STREAM_PACKET_COUNT:
-//                    # round the packet count to the nearest
-//                    # TrafficModel.MAX_STREAM_PACKET_COUNT, for at least a little user
-//                    # protection
-//                    rounded_stream_packet_count = TrafficModel._integer_round(
-//                                                  stream_packet_count,
-//                                                  TrafficModel.MAX_STREAM_PACKET_COUNT)
-//                    logging.info("Large stream packet count: ~{} packets in {} bundles. Stream packet limit is {} packets."
-//                                 .format(rounded_stream_packet_count,
-//                                         len(bundles),
-//                                         TrafficModel.MAX_STREAM_PACKET_COUNT))
-//
-//                # run viterbi to get the likliest path through our model given the observed delays
-//                viterbi_start_time = clock()
-//                likliest_states = self._run_viterbi(bundles)
-//
-//                # increment result counters
-//                counter_start_time = clock()
-//                if likliest_states is not None and len(likliest_states) > 0:
-//                    self._increment_traffic_counters(bundles, likliest_states, secure_counters)
-//
-//                algo_end_time = clock()
-//                algo_elapsed = algo_end_time - viterbi_start_time
-//                viterbi_elapsed = counter_start_time - viterbi_start_time
-//                counter_elapsed = algo_end_time - counter_start_time
-//
-//                if algo_elapsed > TrafficModel.MAX_STREAM_PROCESSING_TIME:
-//                    rounded_num_packets = TrafficModel._integer_round(
-//                                                  stream_packet_count,
-//                                                  TrafficModel.MAX_STREAM_PACKET_COUNT)
-//                    logging.warning("Long stream processing time: {:.1f} seconds to process ~{} packets exceeds limit of {:.1f} seconds. Breakdown: viterbi {:.1f} counter {:.1f}."
-//                                    .format(algo_elapsed, rounded_num_packets,
-//                                            TrafficModel.MAX_STREAM_PROCESSING_TIME,
-//                                            viterbi_elapsed, counter_elapsed))
-//                # TODO: secure delete?
-//                #del likliest_states
-//            # TODO: secure delete?
-//            #del bundles
-//
-//        if len(self.packets[circuit_id]) == 0:
-//            self.packets.pop(circuit_id, None)
-//
-//    # take this opportunity to clear any streams that stuck around too long
-//    self._clear_expired_bundles()
