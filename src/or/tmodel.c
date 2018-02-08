@@ -953,6 +953,7 @@ int tmodel_set_traffic_model(uint32_t len, char *body) {
   /* before we edit the global model, init the lock if needed */
   if(!global_traffic_model_lock) {
     global_traffic_model_lock = tor_malloc_zero_(sizeof(tor_mutex_t));
+    tor_mutex_init(global_traffic_model_lock);
   }
 
   /* we always free the previous model if the length is too
