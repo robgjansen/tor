@@ -59,7 +59,7 @@ struct tmodel_stream_s {
   tmodel_action_t buf_obs;
 
   /* committed observations */
-  smartlist_t* observations;
+  smartlist_t* packets;
 
   /* for memory checking */
   uint magic;
@@ -1074,8 +1074,8 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
   tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
-  if(!tstream->observations || !viterbi_path ||
-      path_len != (uint)smartlist_len(tstream->observations)) {
+  if(!tstream->packets || !viterbi_path ||
+      path_len != (uint)smartlist_len(tstream->packets)) {
     log_warn(LD_BUG, "Problem verifying input params before "
         "encoding viterbi path as json");
     return NULL;
@@ -1094,17 +1094,17 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
    *   20 chars, the most that an int64_t value will consume
    *       (INT64 range is -9223372036854775808 to 9223372036854775807)
    *   --------
-   *   max total per observation is = 30 + n
+   *   max total per packet is = 30 + n
    *
-   * so for o observations, we need at most:
-   *   o * (30 + n) characters
+   * so for p packets, we need at most:
+   *   p * (30 + n) characters
    *
    * if n is 7, that's 37 bytes per observation
    * we may go up to 100,000 or more packets on a really heavy stream
    *   which would be 3700000 bytes or about 3.7 MB in a pessimistic case
    *   this will get freed as soon as it is send to PrivCount
    * instead, we use the large buffer to build the string, and then
-   *   truncate it before sending to PrivCount.
+   *   truncate it before sending to the main thread (and then to PrivCount).
    */
   size_t n = tmodel->max_state_str_length;
   size_t json_buffer_len = (size_t)(path_len * (30 + n));
@@ -1116,7 +1116,7 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
   int num_printed = 0;
 
   for(uint i = 0; i < path_len; i++) {
-    encoded_delay = (int64_t)smartlist_get(tstream->observations, i);
+    encoded_delay = (int64_t)smartlist_get(tstream->packets, i);
     delay = _tmodel_decode_delay(encoded_delay, &obs);
 
     obs_index = _tmodel_get_obs_action_index(tmodel, obs);
@@ -1125,9 +1125,9 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
     /* sanity check */
     if(obs_index >= tmodel->num_obs || state_index >= tmodel->num_states) {
       /* these would overflow the respective arrays */
-      log_warn(LD_BUG, "Can't print viterbi path json for observation %u "
+      log_warn(LD_BUG, "Can't print viterbi path json for packet %u/%u "
           "because obs_index (%u) or state_index (%u) is out of range",
-          i, obs_index, state_index);
+          i, path_len-1, obs_index, state_index);
       free(json_buffer);
       return NULL;
     }
@@ -1142,7 +1142,7 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
     if(num_printed <= 0) {
       free(json_buffer);
       log_warn(LD_BUG, "Problem printing viterbi path json for "
-          "observation %u: snprintf returned %d", i, num_printed);
+          "packet %u/%u: snprintf returned %d", i, path_len-1, num_printed);
       return NULL;
     } else {
       rem_space -= (size_t)num_printed;
@@ -1196,10 +1196,11 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   char* viterbi_json = NULL;
 
   const uint n_states = tmodel->num_states;
-  const uint n_obs = (uint)smartlist_len(tstream->observations);
+  const uint n_packets = (uint)smartlist_len(tstream->packets);
 
   /* don't do any unnecessary work, and prevent array index underflow */
-  if(n_obs <= 0) {
+  if(n_packets <= 0) {
+    log_info(LD_GENERAL, "Not running viterbi algorithm on stream with no packets.");
     return viterbi_json;
   }
 
@@ -1209,34 +1210,34 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   double** table1 = calloc(n_states, sizeof(double*));
   uint** table2 = calloc(n_states, sizeof(uint*));
   for(uint i = 0; i < n_states; i++) {
-    table1[i] = calloc(n_obs, sizeof(double));
-    table2[i] = calloc(n_obs, sizeof(uint));
+    table1[i] = calloc(n_packets, sizeof(double));
+    table2[i] = calloc(n_packets, sizeof(uint));
   }
 
   /* list of most probable states for each observation.
    * we store indices into our state space string array. */
-  uint* optimal_states = calloc(n_obs, sizeof(uint));
-  memset(optimal_states, UINT_MAX, sizeof(uint) * n_obs);
+  uint* optimal_states = calloc(n_packets, sizeof(uint));
+  memset(optimal_states, UINT_MAX, sizeof(uint) * n_packets);
 
   log_info(LD_GENERAL, "State setup done, running viterbi algorithm now");
 
   /* get some info about the first packet */
-  int64_t encoded_delay = (int64_t)smartlist_get(tstream->observations, 0);
+  int64_t encoded_delay = (int64_t)smartlist_get(tstream->packets, 0);
   tmodel_action_t obs;
   int64_t delay = _tmodel_decode_delay(encoded_delay, &obs);
 
   double dx = _compute_delay_dx(delay);
 
-  /* if the first packet is the last packet, it should be 'F' */
-  if(n_obs == 1) {
+  /* if the first packet is the last packet, obs should be 'F' */
+  if(n_packets == 1) {
     obs = TMODEL_OBS_DONE;
   }
 
-  /* get the obs name index in the obs space */
+  /* get the obs name index into the obs space */
   uint obs_index = _tmodel_get_obs_action_index(tmodel, obs);
   if(obs_index >= tmodel->num_obs) {
     log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
-        "for observation 0", obs_index);
+        "for packet 0/%u", obs_index, n_packets-1);
     goto cleanup; // will return NULL
   }
 
@@ -1260,15 +1261,15 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     table1[i][0] = prob;
   }
 
-  /* loop through all observations (except the first) */
-  for(uint i = 1; i < n_obs; i++) {
-    encoded_delay = (int64_t)smartlist_get(tstream->observations, i);
+  /* loop through all packets (except the first) */
+  for(uint i = 1; i < n_packets; i++) {
+    encoded_delay = (int64_t)smartlist_get(tstream->packets, i);
     delay = _tmodel_decode_delay(encoded_delay, &obs);
 
     dx = _compute_delay_dx(delay);
 
     /* if this is the last packet, it should be 'F' */
-    if(i == n_obs-1) {
+    if(i == n_packets-1) {
       obs = TMODEL_OBS_DONE;
     }
 
@@ -1276,7 +1277,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     obs_index = _tmodel_get_obs_action_index(tmodel, obs);
     if(obs_index >= tmodel->num_obs) {
       log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
-          "for observation %u", obs_index, i);
+          "for packet %u/%u", obs_index, i, n_packets-1);
       goto cleanup; // will return NULL
     }
 
@@ -1293,8 +1294,8 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
       double log_prob = _compute_delay_log(dx, mu, sigma);
       double fit_prob = log(dp) + log_prob;
 
-      double max_trans_prob = 0;
-      double max_prob = 0;
+      double max_trans_prob = -INFINITY;
+      double max_prob = -INFINITY;
       uint max_prob_prev_state_index = 0;
 
       /* loop through every transition */
@@ -1314,7 +1315,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
         }
       }
 
-      /* store the max prob and prev state index for this observation.
+      /* store the max prob and prev state index for this packet.
        * note that the case that this state has no positive trans_prob
        * is valid and it's OK if the max_prob is 0 for some states. */
       table1[j][i] = max_prob;
@@ -1323,30 +1324,32 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   }
 
   /* get most probable final state */
-  double optimal_prob = 0;
+  double optimal_prob = -INFINITY;
   for(uint k = 0; k < n_states; k++) {
-    if(table1[k][n_obs-1] > optimal_prob) {
-      optimal_prob = table1[k][n_obs-1];
-      optimal_states[n_obs-1] = k;
+    if(table1[k][n_packets-1] > optimal_prob) {
+      optimal_prob = table1[k][n_packets-1];
+      optimal_states[n_packets-1] = k;
     }
   }
 
   /* sanity check */
-  if(optimal_states[n_obs-1] >= n_states) {
+  if(optimal_states[n_packets-1] >= n_states) {
     log_warn(LD_BUG, "Bug in viterbi: optimal_states index (%u) is out of range "
-        "for observation %u", optimal_states[n_obs-1], n_obs-1);
+        "for packet %u/%u, optimal probability was %f",
+        optimal_states[n_packets-1], n_packets-1, n_packets-1, optimal_prob);
     goto cleanup; // will return NULL
   }
 
-  /* now work backward for the remaining observations */
-  for(uint i = n_obs-1; i > 0; i--) {
+  /* now work backward for the remaining packets */
+  for(uint i = n_packets-1; i > 0; i--) {
     uint opt_state = optimal_states[i];
     uint prev_opt_state = table2[opt_state][i];
 
     /* sanity check */
     if(prev_opt_state >= n_states) {
       log_warn(LD_BUG, "Bug in viterbi: optimal_states index (%u) is out of range "
-          "for observation %u", prev_opt_state, i);
+          "for packet %u/%u",
+          prev_opt_state, i-1, n_packets-1);
       goto cleanup; // will return NULL
     }
 
@@ -1356,7 +1359,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   log_info(LD_GENERAL, "Finished running viterbi, encoding json result path now");
 
   /* convert to json */
-  viterbi_json = _encode_viterbi_path(tmodel, tstream, &optimal_states[0], n_obs);
+  viterbi_json = _encode_viterbi_path(tmodel, tstream, &optimal_states[0], n_packets);
 
   log_info(LD_GENERAL, "Found optimal viterbi path; prob=%f path=%s",
       optimal_prob, viterbi_json ? viterbi_json : "NULL");
@@ -1391,7 +1394,7 @@ static void _tmodel_stream_commit_packets(tmodel_stream_t* tstream) {
   int64_t delay = _tmodel_encode_delay(tstream->buf_delay, tstream->buf_obs);
 
   /* 'commit' the packet */
-  smartlist_add(tstream->observations, (void*) delay);
+  smartlist_add(tstream->packets, (void*) delay);
 
   /* consume the packet length worth of data */
   if (tstream->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
@@ -1406,7 +1409,7 @@ static void _tmodel_stream_commit_packets(tmodel_stream_t* tstream) {
     delay = _tmodel_encode_delay((int64_t) 0, tstream->buf_obs);
 
     /* 'commit' the packet */
-    smartlist_add(tstream->observations, (void*) delay);
+    smartlist_add(tstream->packets, (void*) delay);
 
     /* consume the packet length worth of data */
     if (tstream->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
@@ -1475,7 +1478,7 @@ tmodel_stream_t* tmodel_stream_new(void) {
   tstream->prev_emit_time = tstream->creation_time;
 
   /* store packet delay times in the element pointers */
-  tstream->observations = smartlist_new();
+  tstream->packets = smartlist_new();
 
   return tstream;
 }
@@ -1498,7 +1501,7 @@ static void _tmodel_stream_free_helper(tmodel_stream_t* tstream) {
 
   /* we had no need to dynamically allocate any memory other
    * than the element pointers used internally by the list. */
-  smartlist_free(tstream->observations);
+  smartlist_free(tstream->packets);
 
   tstream->magic = 0;
   tor_free_(tstream);
