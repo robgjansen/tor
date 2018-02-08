@@ -119,8 +119,9 @@ tor_mutex_t* global_traffic_model_lock;
 
 /* forward declarations so the traffic model code can utilize
  * the viterbi worker thread pool.  */
-static void _viterbi_workers_sync(void);
 static int _viterbi_workers_init(uint num_workers);
+static void _viterbi_workers_sync(void);
+static int _viterbi_thread_pool_is_ready(void);
 static void _viterbi_worker_assign_stream(tmodel_stream_t* tstream);
 
 /* returns true if we want to know about cells on exit streams,
@@ -1069,10 +1070,13 @@ static uint _tmodel_get_obs_action_index(tmodel_t* tmodel, tmodel_action_t obs) 
 
 static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
     uint* viterbi_path, uint path_len) {
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
   tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
   if(!tstream->observations || !viterbi_path ||
       path_len != (uint)smartlist_len(tstream->observations)) {
+    log_warn(LD_BUG, "Problem verifying input params before "
+        "encoding viterbi path as json");
     return NULL;
   }
 
@@ -1117,6 +1121,16 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
     obs_index = _tmodel_get_obs_action_index(tmodel, obs);
     state_index = viterbi_path[i];
 
+    /* sanity check */
+    if(obs_index >= tmodel->num_obs || state_index >= tmodel->num_states) {
+      /* these would overflow the respective arrays */
+      log_warn(LD_BUG, "Can't print viterbi path json for observation %u "
+          "because obs_index (%u) or state_index (%u) is out of range",
+          i, obs_index, state_index);
+      free(json_buffer);
+      return NULL;
+    }
+
     num_printed = snprintf(&json_buffer[write_index], rem_space,
         "[\"%s\";\"%s\";"I64_FORMAT"]%s",
         tmodel->state_space[state_index],
@@ -1126,7 +1140,8 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
 
     if(num_printed <= 0) {
       free(json_buffer);
-      log_warn(LD_GENERAL, "Problem printing json for observation %u", i);
+      log_warn(LD_BUG, "Problem printing viterbi path json for "
+          "observation %u: snprintf returned %d", i, num_printed);
       return NULL;
     } else {
       rem_space -= (size_t)num_printed;
@@ -1141,7 +1156,8 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
   free(json_buffer);
 
   if(num_printed <= 0) {
-    log_warn(LD_GENERAL, "Problem truncating json buffer");
+    log_warn(LD_BUG, "Problem truncating viterbi path json buffer: "
+        "tor_asprintf returned %d", num_printed);
     return NULL;
   } else {
     return json;
@@ -1195,6 +1211,8 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
    * we store indices into our state space string array. */
   uint* optimal_states = calloc(n_obs, sizeof(uint));
   memset(optimal_states, UINT_MAX, sizeof(uint) * n_obs);
+
+  log_info(LD_GENERAL, "State setup done, running viterbi algorithm now");
 
   /* get some info about the first packet */
   int64_t encoded_delay = (int64_t)smartlist_get(tstream->observations, 0);
@@ -1329,10 +1347,12 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     optimal_states[i-1] = prev_opt_state;
   }
 
+  log_info(LD_GENERAL, "Finished running viterbi, encoding json result path now");
+
   /* convert to json */
   viterbi_json = _encode_viterbi_path(tmodel, tstream, &optimal_states[0], n_obs);
 
-  log_info(LD_GENERAL, "Found optimal viterbi prob %f path %s",
+  log_info(LD_GENERAL, "Found optimal viterbi path; prob=%f path=%s",
       optimal_prob, viterbi_json ? viterbi_json : "NULL");
 
 cleanup:
@@ -1496,7 +1516,9 @@ void tmodel_stream_free(tmodel_stream_t* tstream) {
        * make sure the thread pool is initialized (which
        * also would sync the traffic model in the process). */
       _viterbi_workers_init((uint)num_workers);
+    }
 
+    if(num_workers > 0 && _viterbi_thread_pool_is_ready()) {
       /* the thread pool will run the task, and the result will get
        * processed and then freed in _viterbi_worker_handle_reply. */
       _viterbi_worker_assign_stream(tstream);
@@ -1552,6 +1574,10 @@ static void _viterbi_job_free(viterbi_worker_job_t* job) {
     }
     free(job);
   }
+}
+
+static int _viterbi_thread_pool_is_ready(void) {
+  return viterbi_thread_pool ? 1 : 0;
 }
 
 static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* job_arg) {
@@ -1623,10 +1649,9 @@ static void _viterbi_worker_assign_stream(tmodel_stream_t* tstream) {
 }
 
 static void * _viterbi_worker_state_new(void *arg) {
-  viterbi_worker_state_t* state;
   (void) arg;
 
-  state = tor_malloc_zero(sizeof(viterbi_worker_state_t));
+  viterbi_worker_state_t* state = tor_malloc_zero(sizeof(viterbi_worker_state_t));
 
   /* we need to reference the global traffic model here
    * to make sure we have the latest version. */
@@ -1640,13 +1665,15 @@ static void * _viterbi_worker_state_new(void *arg) {
 }
 
 static void _viterbi_worker_state_free(void *arg) {
-  viterbi_worker_state_t *state = arg;
+  viterbi_worker_state_t* state = arg;
 
-  if(state->thread_traffic_model) {
-    _tmodel_free(state->thread_traffic_model);
+  if(state) {
+    if(state->thread_traffic_model) {
+      _tmodel_free(state->thread_traffic_model);
+    }
+
+    tor_free(state);
   }
-
-  tor_free(state);
 }
 
 /* this function is run in a worker thread */
@@ -1707,6 +1734,17 @@ static int _viterbi_workers_init(uint num_workers) {
   if (!viterbi_thread_pool) {
     viterbi_thread_pool = threadpool_new(num_workers, viterbi_reply_queue,
         _viterbi_worker_state_new, _viterbi_worker_state_free, NULL);
+
+    if(viterbi_thread_pool) {
+      log_notice(LD_GENERAL, "Successfully created viterbi thread pool "
+          "with %u worker threads.", num_workers);
+    } else {
+      log_warn(LD_GENERAL, "Failed to create viterbi thread pool "
+                "with %u worker threads. We will try again soon and"
+                "otherwise fall back to running viterbi in the main "
+                "thread.", num_workers);
+    }
+
     return 1;
   } else {
     return 0;
