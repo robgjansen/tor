@@ -1271,7 +1271,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
 
       double max_trans_prob = 0;
       double max_prob = 0;
-      uint max_prob_prev_state_index = UINT_MAX;
+      uint max_prob_prev_state_index = 0;
 
       /* loop through every transition */
       for(uint k = 0; k < n_states; k++) {
@@ -1290,14 +1290,9 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
         }
       }
 
-      /* make sure we got a valid index */
-      if(max_prob_prev_state_index >= n_states) {
-        log_warn(LD_BUG, "Bug in viterbi: max_prob_prev_state_index (%u) is out of range "
-            "for observation %u in state %u", max_prob_prev_state_index, i, j);
-        goto cleanup; // will return NULL
-      }
-
-      /* store the max prob and prev state index for this observation */
+      /* store the max prob and prev state index for this observation.
+       * note that the case that this state has no positive trans_prob
+       * is valid and it's OK if the max_prob is 0 for some states. */
       table1[j][i] = max_prob;
       table2[j][i] = max_prob_prev_state_index;
     }
