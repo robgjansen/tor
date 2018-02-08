@@ -19,6 +19,7 @@
 #include "torlog.h"
 #include "util.h"
 #include "util_bug.h"
+#include "workqueue.h"
 
 #define TRAFFIC_MODEL_MAGIC 0xAABBCCDD
 #define TRAFFIC_STREAM_MAGIC 0xDDCCBBAA
@@ -69,7 +70,10 @@ struct tmodel_stream_s {
  * tmodel class. */
 typedef struct tmodel_s tmodel_t;
 
-/* the tmodel internal elements */
+/* the tmodel internal elements.
+ * WARNING if any elements change, we must update tmodel_deepcopy
+ * to make sure the new memory gets duplicated correctly for the
+ * viterbi workers. */
 struct tmodel_s {
   /* array of strings holding names of each observation
    * in the observation space */
@@ -110,7 +114,14 @@ struct tmodel_s {
 };
 
 /* global pointer to traffic model state */
-tmodel_t* global_traffic_model = NULL;
+static tmodel_t* global_traffic_model = NULL;
+tor_mutex_t* global_traffic_model_lock;
+
+/* forward declarations so the traffic model code can utilize
+ * the viterbi worker thread pool.  */
+static void _viterbi_workers_sync(void);
+static int _viterbi_workers_init(uint num_workers);
+static void _viterbi_worker_assign_stream(tmodel_stream_t* tstream);
 
 /* returns true if we want to know about cells on exit streams,
  * false otherwise. */
@@ -727,32 +738,6 @@ static void _tmodel_log_model(tmodel_t* tmodel) {
   }
 }
 
-static void _tmodel_allocate_arrays(tmodel_t* tmodel) {
-  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
-
-  tmodel->start_prob = calloc((size_t) tmodel->num_states, sizeof(double));
-
-  tmodel->trans_prob = calloc((size_t) tmodel->num_states, sizeof(double*));
-  for (uint i = 0; i < tmodel->num_states; i++) {
-    tmodel->trans_prob[i] = calloc((size_t) tmodel->num_states, sizeof(double));
-  }
-
-  tmodel->emit_dp = calloc((size_t) tmodel->num_states, sizeof(double*));
-  for (uint i = 0; i < tmodel->num_states; i++) {
-    tmodel->emit_dp[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
-  }
-
-  tmodel->emit_mu = calloc((size_t) tmodel->num_states, sizeof(double*));
-  for (uint i = 0; i < tmodel->num_states; i++) {
-    tmodel->emit_mu[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
-  }
-
-  tmodel->emit_sigma = calloc((size_t) tmodel->num_states, sizeof(double*));
-  for (uint i = 0; i < tmodel->num_states; i++) {
-    tmodel->emit_sigma[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
-  }
-}
-
 static void _tmodel_free(tmodel_t* tmodel) {
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
 
@@ -818,6 +803,87 @@ static void _tmodel_free(tmodel_t* tmodel) {
   tor_free_(tmodel);
 }
 
+static void _tmodel_allocate_arrays(tmodel_t* tmodel) {
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MODEL_MAGIC);
+
+  tmodel->start_prob = calloc((size_t) tmodel->num_states, sizeof(double));
+
+  tmodel->trans_prob = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->trans_prob[i] = calloc((size_t) tmodel->num_states, sizeof(double));
+  }
+
+  tmodel->emit_dp = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->emit_dp[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
+  }
+
+  tmodel->emit_mu = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->emit_mu[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
+  }
+
+  tmodel->emit_sigma = calloc((size_t) tmodel->num_states, sizeof(double*));
+  for (uint i = 0; i < tmodel->num_states; i++) {
+    tmodel->emit_sigma[i] = calloc((size_t) tmodel->num_obs, sizeof(double));
+  }
+}
+
+
+static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
+  if(tmodel->magic != TRAFFIC_MODEL_MAGIC ||
+      !tmodel->state_space || !tmodel->obs_space ||
+      !tmodel->trans_prob || !tmodel->emit_dp ||
+      !tmodel->emit_mu || !tmodel->emit_sigma) {
+    return NULL;
+  }
+
+  tmodel_t* copy = tor_malloc_zero_(sizeof(struct tmodel_s));
+
+  copy->magic = tmodel->magic;
+  copy->num_states = tmodel->num_states;
+  copy->num_obs = tmodel->num_obs;
+  copy->max_state_str_length = tmodel->max_state_str_length;
+
+  copy->state_space = calloc(copy->num_states, sizeof(char*));
+  copy->obs_space = calloc(copy->num_obs, sizeof(char*));
+  _tmodel_allocate_arrays(copy);
+
+  for (uint i = 0; i < copy->num_states; i++) {
+    copy->state_space[i] = strndup(tmodel->state_space[i], tmodel->max_state_str_length);
+  }
+
+  for (uint i = 0; i < copy->num_obs; i++) {
+    copy->obs_space[i] = strndup(tmodel->obs_space[i], 8);
+  }
+
+  for (uint i = 0; i < copy->num_states; i++) {
+    for(uint j = 0; j < copy->num_states; j++) {
+      copy->trans_prob[i][j] = tmodel->trans_prob[i][j];
+    }
+  }
+
+  for (uint i = 0; i < copy->num_states; i++) {
+    for(uint j = 0; j < copy->num_obs; j++) {
+      copy->emit_dp[i][j] = tmodel->emit_dp[i][j];
+    }
+  }
+
+  for (uint i = 0; i < copy->num_states; i++) {
+    for(uint j = 0; j < copy->num_obs; j++) {
+      copy->emit_mu[i][j] = tmodel->emit_mu[i][j];
+    }
+  }
+
+  for (uint i = 0; i < copy->num_states; i++) {
+    for(uint j = 0; j < copy->num_obs; j++) {
+      copy->emit_sigma[i][j] = tmodel->emit_sigma[i][j];
+    }
+  }
+
+  return copy;
+}
+
 static tmodel_t* _tmodel_new(const char* model_json) {
   tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
   tmodel->magic = TRAFFIC_MODEL_MAGIC;
@@ -862,6 +928,7 @@ int tmodel_set_traffic_model(uint32_t len, char *body) {
    *                model that we have stored.
    */
   char* model_json = NULL;
+  int return_code = 0;
 
   /* check if we have a model */
   if (len >= 5 && strncasecmp(body, "TRUE ", 5) == 0) {
@@ -869,30 +936,73 @@ int tmodel_set_traffic_model(uint32_t len, char *body) {
     model_json = &body[5];
   }
 
-  /* we always free the previous model- if the length is too
-   * short or we have a 'FALSE' command, or we are creating
-   * a new model object. */
-  if (global_traffic_model != NULL) {
-    _tmodel_free(global_traffic_model);
-    global_traffic_model = NULL;
-    log_notice(LD_GENERAL,
-        "Successfully freed a previously loaded traffic model");
-  }
-
-  /* now create a new one only if we had valid command input */
+  /* create a new model only if we had valid command input */
+  tmodel_t* traffic_model = NULL;
   if (model_json != NULL) {
-    global_traffic_model = _tmodel_new(model_json);
-    if (global_traffic_model) {
+    traffic_model = _tmodel_new(model_json);
+    if (traffic_model) {
       log_notice(LD_GENERAL,
           "Successfully loaded a new traffic model from PrivCount");
     } else {
       log_warn(LD_GENERAL, "Unable to load traffic model from PrivCount");
-      return 1;
+      return_code = 1;
     }
   }
 
-  return 0;
+  /* before we edit the global model, init the lock if needed */
+  if(!global_traffic_model_lock) {
+    global_traffic_model_lock = tor_malloc_zero_(sizeof(tor_mutex_t));
+  }
+
+  /* we always free the previous model if the length is too
+   * short or we have a 'FALSE' command, or we are creating
+   * a new model object. */
+  tor_mutex_acquire(global_traffic_model_lock);
+
+  if (global_traffic_model != NULL) {
+    _tmodel_free(global_traffic_model);
+    global_traffic_model = NULL;
+
+    log_notice(LD_GENERAL,
+        "Successfully freed a previously loaded traffic model");
+  }
+
+  if (traffic_model != NULL) {
+    global_traffic_model = traffic_model;
+  }
+
+  tor_mutex_release(global_traffic_model_lock);
+
+  int num_workers = get_options()->PrivCountNumViterbiWorkers;
+  int sync_was_done = 0;
+  if (num_workers > 0) {
+    /* Initiate num_workers threads if needed, and record
+     * whether or not this call created a new thread pool
+     * and thus synchronized the latest traffic model on
+     * the workers.*/
+    sync_was_done = _viterbi_workers_init((uint)num_workers);
+  }
+
+  if(!sync_was_done) {
+    /* Make sure we attempt to synchronize the current
+     * global_traffic_model on all of the threads that we originally
+     * created (if any exist). If we stopped collecting traffic
+     * model stats, this will cause the threads will free their
+     * current traffic model instance and wait for another update.
+     * If we start collecting a second round, even though num_workers
+     * might be 0, we still sync the traffic model in case that the
+     * workers are re-enabled in the middle of a collection.
+     * (In any case, the workers won't run the jobs unless the
+     * config option is positive.) */
+    _viterbi_workers_sync();
+  }
+
+  return return_code;
 }
+
+/*************************************
+ ** Traffic model stream processing **
+ *************************************/
 
 static int64_t _tmodel_encode_delay(int64_t delay, tmodel_action_t obs) {
   int64_t encoded_delay = 0;
@@ -1101,7 +1211,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   /* get the obs name index in the obs space */
   uint obs_index = _tmodel_get_obs_action_index(tmodel, obs);
   if(obs_index >= tmodel->num_obs) {
-    log_warn(LD_GENERAL, "Bug in viterbi: obs_index (%u) is out of range "
+    log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
         "for observation 0", obs_index);
     goto cleanup; // will return NULL
   }
@@ -1141,7 +1251,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     /* get the obs name index in the obs space */
     obs_index = _tmodel_get_obs_action_index(tmodel, obs);
     if(obs_index >= tmodel->num_obs) {
-      log_warn(LD_GENERAL, "Bug in viterbi: obs_index (%u) is out of range "
+      log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
           "for observation %u", obs_index, i);
       goto cleanup; // will return NULL
     }
@@ -1182,7 +1292,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
 
       /* make sure we got a valid index */
       if(max_prob_prev_state_index >= n_states) {
-        log_warn(LD_GENERAL, "Bug in viterbi: max_prob_prev_state_index (%u) is out of range "
+        log_warn(LD_BUG, "Bug in viterbi: max_prob_prev_state_index (%u) is out of range "
             "for observation %u in state %u", max_prob_prev_state_index, i, j);
         goto cleanup; // will return NULL
       }
@@ -1204,7 +1314,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
 
   /* sanity check */
   if(optimal_states[n_obs-1] >= n_states) {
-    log_warn(LD_GENERAL, "Bug in viterbi: optimal_states index (%u) is out of range "
+    log_warn(LD_BUG, "Bug in viterbi: optimal_states index (%u) is out of range "
         "for observation %u", optimal_states[n_obs-1], n_obs-1);
     goto cleanup; // will return NULL
   }
@@ -1216,7 +1326,7 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
 
     /* sanity check */
     if(prev_opt_state >= n_states) {
-      log_warn(LD_GENERAL, "Bug in viterbi: optimal_states index (%u) is out of range "
+      log_warn(LD_BUG, "Bug in viterbi: optimal_states index (%u) is out of range "
           "for observation %u", prev_opt_state, i);
       goto cleanup; // will return NULL
     }
@@ -1248,7 +1358,7 @@ cleanup:
   return viterbi_json;
 }
 
-static void _tmodel_commit_packets(tmodel_stream_t* tstream) {
+static void _tmodel_stream_commit_packets(tmodel_stream_t* tstream) {
   tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
 
   /* do nothing if we have no packets */
@@ -1313,7 +1423,7 @@ void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, size_t length,
   if (tstream->buf_length > 0) {
     int64_t elapsed = monotime_diff_usec(&tstream->buf_emit_time, &now);
     if (elapsed >= TMODEL_PACKET_TIME_TOLERENCE || tstream->buf_obs != obs) {
-      _tmodel_commit_packets(tstream);
+      _tmodel_stream_commit_packets(tstream);
     }
   }
 
@@ -1349,14 +1459,7 @@ tmodel_stream_t* tmodel_stream_new(void) {
   return tstream;
 }
 
-/* process a finished stream.
- * run viterbi to get the likliest paths for this stream, and then
- * send the json result string to PrivCount over the control port. */
-static void _tmodel_process_stream(tmodel_stream_t* tstream) {
-  tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
-
-  char* viterbi_json = _tmodel_run_viterbi(global_traffic_model, tstream);
-
+static void _tmodel_handle_viterbi_result(char* viterbi_json) {
   if(viterbi_json != NULL) {
     /* send the viterbi json result */
     control_event_privcount_viterbi(viterbi_json);
@@ -1369,6 +1472,17 @@ static void _tmodel_process_stream(tmodel_stream_t* tstream) {
   }
 }
 
+static void _tmodel_stream_free_helper(tmodel_stream_t* tstream) {
+  tor_assert(tstream && tstream->magic == TRAFFIC_STREAM_MAGIC);
+
+  /* we had no need to dynamically allocate any memory other
+   * than the element pointers used internally by the list. */
+  smartlist_free(tstream->observations);
+
+  tstream->magic = 0;
+  tor_free_(tstream);
+}
+
 /* notify the traffic model that the stream closed and should
  * be processed and freed. */
 void tmodel_stream_free(tmodel_stream_t* tstream) {
@@ -1376,13 +1490,230 @@ void tmodel_stream_free(tmodel_stream_t* tstream) {
 
   /* the stream is finished, we have all of the data we are going to get. */
   if (tmodel_is_active()) {
-    _tmodel_process_stream(tstream);
+    /* process a finished stream.
+     * run viterbi to get the best HMM path for this stream, and then
+     * send the json result string to PrivCount over the control port. */
+    int num_workers = get_options()->PrivCountNumViterbiWorkers;
+    if(num_workers > 0) {
+      /* Run this task in the viterbi worker thread pool.
+       * If we started with no workers and then changed the
+       * config partway through a collection, we need to
+       * make sure the thread pool is initialized (which
+       * also would sync the traffic model in the process). */
+      _viterbi_workers_init((uint)num_workers);
+
+      /* the thread pool will run the task, and the result will get
+       * processed and then freed in _viterbi_worker_handle_reply. */
+      _viterbi_worker_assign_stream(tstream);
+    } else {
+      /* just run the task now in the main thread using the main
+       * thread instance of the traffic model. */
+      char* viterbi_json = _tmodel_run_viterbi(global_traffic_model, tstream);
+
+      /* send the appropriate event to PrivCount.
+       * after calling this function, viterbi_json is invalid. */
+      _tmodel_handle_viterbi_result(viterbi_json);
+
+      /* free the stream data */
+      _tmodel_stream_free_helper(tstream);
+    }
+  } else {
+    /* We are no longer active and don't need to process the
+     * stream. Just go ahead and free the memory. */
+    _tmodel_stream_free_helper(tstream);
+  }
+}
+
+/******************************
+ ** Viterbi work thread code **
+ ******************************/
+
+static replyqueue_t* viterbi_reply_queue = NULL;
+static threadpool_t* viterbi_thread_pool = NULL;
+static struct event* viterbi_reply_event = NULL;
+
+typedef struct viterbi_worker_state_s {
+  tmodel_t* thread_traffic_model;
+} viterbi_worker_state_t;
+
+typedef struct viterbi_worker_job_s {
+  tmodel_stream_t* tstream;
+  char* viterbit_result;
+} viterbi_worker_job_t;
+
+static viterbi_worker_job_t* _viterbi_job_new(tmodel_stream_t* tstream) {
+  viterbi_worker_job_t* job = calloc(1, sizeof(viterbi_worker_job_t));
+  job->tstream = tstream;
+  return job;
+}
+
+static void _viterbi_job_free(viterbi_worker_job_t* job) {
+  if(job) {
+    if(job->tstream) {
+      _tmodel_stream_free_helper(job->tstream);
+    }
+    if(job->viterbit_result) {
+      free(job->viterbit_result);
+    }
+    free(job);
+  }
+}
+
+static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* job_arg) {
+  viterbi_worker_state_t* state = state_arg;
+  viterbi_worker_job_t* job = job_arg;
+
+  if(!state) {
+    log_warn(LD_BUG, "Viterbi worker state is NULL in work function.");
+
   }
 
-  /* we had no need to allocate any memory other than the
-   * element pointers used internally by the list. */
-  smartlist_free(tstream->observations);
+  if(!state->thread_traffic_model) {
+    log_warn(LD_BUG, "Viterbi worker traffic model is NULL in work function.");
+  }
 
-  tstream->magic = 0;
-  tor_free_(tstream);
+  if(!job) {
+    log_warn(LD_BUG, "Viterbi worker job is NULL in work function.");
+  }
+
+  if(!job->tstream) {
+    log_warn(LD_BUG, "Viterbi worker traffic stream is NULL in work function.");
+  }
+
+  if(state && state->thread_traffic_model && job && job->tstream) {
+    /* if we make it here, we can run the viterbi algorithm.
+     * The result will be stored in the job object, and handled
+     * by the main thread in the handle_reply function. */
+    job->viterbit_result = _tmodel_run_viterbi(state->thread_traffic_model, job->tstream);
+  }
+
+  return WQ_RPL_REPLY;
+}
+
+/* Handle a reply from the worker threads.
+ * This function is run in the main thread. */
+static void _viterbi_worker_handle_reply(void* job_arg) {
+  viterbi_worker_job_t* job = job_arg;
+  if(job) {
+    /* count the result, and free the string. */
+    _tmodel_handle_viterbi_result(job->viterbit_result);
+    /* the above frees the string, so don't double free */
+    job->viterbit_result = NULL;
+    /* free the job */
+    _viterbi_job_free(job);
+  } else {
+    log_warn(LD_BUG, "Viterbi job is NULL in reply.");
+    /* count as failure */
+    _tmodel_handle_viterbi_result(NULL);
+  }
+}
+
+/* Pass the stream as a job for the thread pool.
+ * This function is run in the main thread. */
+static void _viterbi_worker_assign_stream(tmodel_stream_t* tstream) {
+  /* create job that has the stream in it */
+  viterbi_worker_job_t* job = _viterbi_job_new(tstream);
+
+  /* queue the job in the thread pool */
+  workqueue_entry_t* queue_entry = threadpool_queue_work(viterbi_thread_pool,
+      _viterbi_worker_work_threadfn, _viterbi_worker_handle_reply, job);
+
+  if(!queue_entry) {
+    log_warn(LD_BUG, "Unable to queue work on viterbi thread pool.");
+    /* count this as a failure */
+    _tmodel_handle_viterbi_result(NULL);
+    /* free the job */
+    _viterbi_job_free(job);
+  }
+}
+
+static void * _viterbi_worker_state_new(void *arg) {
+  viterbi_worker_state_t* state;
+  (void) arg;
+
+  state = tor_malloc_zero(sizeof(viterbi_worker_state_t));
+
+  /* we need to reference the global traffic model here
+   * to make sure we have the latest version. */
+  tor_mutex_acquire(global_traffic_model_lock);
+  if(global_traffic_model) {
+    state->thread_traffic_model = _tmodel_deepcopy(global_traffic_model);
+  }
+  tor_mutex_release(global_traffic_model_lock);
+
+  return state;
+}
+
+static void _viterbi_worker_state_free(void *arg) {
+  viterbi_worker_state_t *state = arg;
+
+  if(state->thread_traffic_model) {
+    _tmodel_free(state->thread_traffic_model);
+  }
+
+  tor_free(state);
+}
+
+/* this function is run in a worker thread */
+static workqueue_reply_t _viterbi_worker_update_threadfn(void* cur, void* upd) {
+  viterbi_worker_state_t* current_state = cur;
+  viterbi_worker_state_t* update_state = upd;
+
+  if(current_state->thread_traffic_model) {
+    _tmodel_free(current_state->thread_traffic_model);
+    current_state->thread_traffic_model = NULL;
+  }
+
+  if (update_state->thread_traffic_model) {
+    current_state->thread_traffic_model = update_state->thread_traffic_model;
+    update_state->thread_traffic_model = NULL;
+  }
+
+  _viterbi_worker_state_free(update_state);
+
+  return WQ_RPL_REPLY;
+}
+
+/* callback invoked by libevent when replies are waiting in
+ * in the reply queue. */
+static void _viterbi_process_cb(evutil_socket_t sock, short events, void *arg) {
+  replyqueue_t *rq = arg;
+  (void) sock;
+  (void) events;
+  /* loops through all replies and calls the reply function,
+   * _viterbi_worker_handle_reply, on each reply. */
+  replyqueue_process(rq);
+}
+
+static void _viterbi_workers_sync(void) {
+  if(!viterbi_thread_pool) {
+    return;
+  }
+
+  if (threadpool_queue_update(viterbi_thread_pool, _viterbi_worker_state_new,
+      _viterbi_worker_update_threadfn, _viterbi_worker_state_free, NULL) < 0) {
+    log_warn(LD_GENERAL,
+        "Failed to queue traffic model update for viterbi worker threads.");
+  }
+}
+
+static int _viterbi_workers_init(uint num_workers) {
+  if (!viterbi_reply_queue) {
+    viterbi_reply_queue = replyqueue_new(0);
+  }
+
+  if (!viterbi_reply_event) {
+    viterbi_reply_event = tor_event_new(tor_libevent_get_base(),
+        replyqueue_get_socket(viterbi_reply_queue),
+        EV_READ | EV_PERSIST, _viterbi_process_cb, viterbi_reply_queue);
+    event_add(viterbi_reply_event, NULL);
+  }
+
+  if (!viterbi_thread_pool) {
+    viterbi_thread_pool = threadpool_new(num_workers, viterbi_reply_queue,
+        _viterbi_worker_state_new, _viterbi_worker_state_free, NULL);
+    return 1;
+  } else {
+    return 0;
+  }
 }

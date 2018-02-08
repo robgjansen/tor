@@ -491,6 +491,7 @@ static config_var_t option_vars_[] = {
   V(EnablePrivCount,             BOOL,     "0"),
   V(PrivCountCircuitSampleRate,  DOUBLE,   "1.0"),
   V(PrivCountMaxCellEventsPerCircuit, INT, "-1"),
+  V(PrivCountNumViterbiWorkers,  INT,      "0"),
   V(ReachableAddresses,          LINELIST, NULL),
   V(ReachableDirAddresses,       LINELIST, NULL),
   V(ReachableORAddresses,        LINELIST, NULL),

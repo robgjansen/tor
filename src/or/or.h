@@ -4674,6 +4674,10 @@ typedef struct {
    * Cells with no associated circuit will always be emitted and not counted
    * against the cell limit for any circuit. */
   int PrivCountMaxCellEventsPerCircuit;
+  /* The number of worker threads to use during a PrivCount traffic model
+   * measurement. The workers run the expensive Viterbi computation and
+   * prepare the reply event string that will be sent to PrivCount. */
+  int PrivCountNumViterbiWorkers;
 
   int IPv6Exit; /**< Do we support exiting to IPv6 addresses? */
 
