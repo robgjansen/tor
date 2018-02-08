@@ -1662,6 +1662,18 @@ static void * _viterbi_worker_state_new(void *arg) {
   }
   tor_mutex_release(global_traffic_model_lock);
 
+  if(state->thread_traffic_model) {
+    log_notice(LD_GENERAL, "Successfully copied traffic model "
+          "with %u states in the state_space, %u actions in the "
+          "in the observation_space, and %u possible transitions "
+          "for a thread",
+          state->thread_traffic_model->num_states,
+          state->thread_traffic_model->num_obs,
+          state->thread_traffic_model->num_states*state->thread_traffic_model->num_states);
+  } else {
+    log_notice(LD_GENERAL, "Setting traffic model for a thread to NULL");
+  }
+
   return state;
 }
 
@@ -1717,6 +1729,9 @@ static void _viterbi_workers_sync(void) {
       _viterbi_worker_update_threadfn, _viterbi_worker_state_free, NULL) < 0) {
     log_warn(LD_GENERAL,
         "Failed to queue traffic model update for viterbi worker threads.");
+  } else {
+    log_notice(LD_GENERAL, "Successfully queued a traffic model update "
+        "on the viterbi threads");
   }
 }
 
