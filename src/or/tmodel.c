@@ -1198,6 +1198,11 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   const uint n_states = tmodel->num_states;
   const uint n_obs = (uint)smartlist_len(tstream->observations);
 
+  /* don't do any unnecessary work, and prevent array index underflow */
+  if(n_obs <= 0) {
+    return viterbi_json;
+  }
+
   /* initialize the auxiliary tables:
    *   table1 stores max probs
    *   table2 stores state index of max probs  */
@@ -1506,6 +1511,9 @@ void tmodel_stream_free(tmodel_stream_t* tstream) {
 
   /* the stream is finished, we have all of the data we are going to get. */
   if (tmodel_is_active()) {
+    /* commit any leftover data */
+    _tmodel_stream_commit_packets(tstream);
+
     /* process a finished stream.
      * run viterbi to get the best HMM path for this stream, and then
      * send the json result string to PrivCount over the control port. */
@@ -1711,7 +1719,7 @@ static workqueue_reply_t _viterbi_worker_update_threadfn(void* cur, void* upd) {
 
 /* callback invoked by libevent when replies are waiting in
  * in the reply queue. */
-static void _viterbi_process_cb(evutil_socket_t sock, short events, void *arg) {
+static void _viterbi_reply_queue_readable_cb(evutil_socket_t sock, short events, void *arg) {
   replyqueue_t *rq = arg;
   (void) sock;
   (void) events;
@@ -1742,8 +1750,8 @@ static int _viterbi_workers_init(uint num_workers) {
 
   if (!viterbi_reply_event) {
     viterbi_reply_event = tor_event_new(tor_libevent_get_base(),
-        replyqueue_get_socket(viterbi_reply_queue),
-        EV_READ | EV_PERSIST, _viterbi_process_cb, viterbi_reply_queue);
+        replyqueue_get_socket(viterbi_reply_queue), EV_READ | EV_PERSIST,
+        _viterbi_reply_queue_readable_cb, viterbi_reply_queue);
     event_add(viterbi_reply_event, NULL);
   }
 
