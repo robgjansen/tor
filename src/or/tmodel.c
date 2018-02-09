@@ -857,6 +857,7 @@ static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
 
   for (uint i = 0; i < copy->num_states; i++) {
     copy->state_space[i] = strndup(tmodel->state_space[i], tmodel->max_state_str_length);
+    copy->start_prob[i] = tmodel->start_prob[i];
   }
 
   for (uint i = 0; i < copy->num_obs; i++) {
