@@ -44,6 +44,11 @@
 /* SQRT_2_PI = math.sqrt(2*math.pi) */
 #define TMODEL_SQRT_2_PI 2.5066282746310002
 
+/* maximum length that PrivCount will accept without closing connection
+ * we subtract 64 to allow some room for the controller to add its
+ * event code and field name. */
+#define TMODEL_MAX_JSON_RESULT_LEN ((1024*1024*200)-64)
+
 /* the tmodel_stream internal elements (see tmodel.h for typedef) */
 struct tmodel_stream_s {
   /* Time the stream was created */
@@ -1161,7 +1166,16 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
         "tor_asprintf returned %d", num_printed);
     return NULL;
   } else {
-    return json;
+    if(json && num_printed > TMODEL_MAX_JSON_RESULT_LEN) {
+      log_warn(LD_GENERAL, "Encoded viterbi path json size is %ld, but the"
+          "maximum supported size is %ld. Dropping result so we don't "
+          "crash PrivCount.", num_printed, (long)TMODEL_MAX_JSON_RESULT_LEN);
+      free(json);
+      return NULL;
+    } else {
+      log_info("Encoded viterbi path as json string of size %ld", (long)num_printed);
+      return json;
+    }
   }
 }
 
@@ -1356,13 +1370,14 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     optimal_states[i-1] = prev_opt_state;
   }
 
-  log_info(LD_GENERAL, "Finished running viterbi, encoding json result path now");
+  log_info(LD_GENERAL, "Finished running viterbi. Found optimal path with %u "
+      "packets and %f prob. Encoding json result path now.", n_packets, optimal_prob);
 
   /* convert to json */
   viterbi_json = _encode_viterbi_path(tmodel, tstream, &optimal_states[0], n_packets);
 
-  log_info(LD_GENERAL, "Found optimal viterbi path; prob=%f path=%s",
-      optimal_prob, viterbi_json ? viterbi_json : "NULL");
+  log_debug(LD_GENERAL, "Final encoded viterbi path is: %s",
+      viterbi_json ? viterbi_json : "NULL");
 
 cleanup:
   tor_assert(table1);
