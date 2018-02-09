@@ -1169,11 +1169,12 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
     if(json && num_printed > TMODEL_MAX_JSON_RESULT_LEN) {
       log_warn(LD_GENERAL, "Encoded viterbi path json size is %ld, but the"
           "maximum supported size is %ld. Dropping result so we don't "
-          "crash PrivCount.", num_printed, (long)TMODEL_MAX_JSON_RESULT_LEN);
+          "crash PrivCount.", (long)num_printed, (long)TMODEL_MAX_JSON_RESULT_LEN);
       free(json);
       return NULL;
     } else {
-      log_info("Encoded viterbi path as json string of size %ld", (long)num_printed);
+      log_info(LD_GENERAL,
+          "Encoded viterbi path as json string of size %ld", (long)num_printed);
       return json;
     }
   }
@@ -1242,10 +1243,11 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
 
   double dx = _compute_delay_dx(delay);
 
-  /* if the first packet is the last packet, obs should be 'F' */
-  if(n_packets == 1) {
-    obs = TMODEL_OBS_DONE;
-  }
+  /* if the first packet is the last packet, obs should be 'F'.
+   * TODO currently, start states don't have an 'F' option... */
+//  if(n_packets == 1) {
+//    obs = TMODEL_OBS_DONE;
+//  }
 
   /* get the obs name index into the obs space */
   uint obs_index = _tmodel_get_obs_action_index(tmodel, obs);
@@ -1256,6 +1258,9 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   }
 
   for(uint i = 0; i < n_states; i++) {
+    table1[i][0] = -INFINITY;
+    table2[i][0] = UINT_MAX;
+
     if(tmodel->start_prob[i] <= 0) {
       continue;
     }
@@ -1276,14 +1281,14 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   }
 
   /* loop through all packets (except the first) */
-  for(uint i = 1; i < n_packets; i++) {
-    encoded_delay = (int64_t)smartlist_get(tstream->packets, i);
+  for(uint p = 1; p < n_packets; p++) {
+    encoded_delay = (int64_t)smartlist_get(tstream->packets, p);
     delay = _tmodel_decode_delay(encoded_delay, &obs);
 
     dx = _compute_delay_dx(delay);
 
     /* if this is the last packet, it should be 'F' */
-    if(i == n_packets-1) {
+    if(p == n_packets-1) {
       obs = TMODEL_OBS_DONE;
     }
 
@@ -1291,15 +1296,40 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
     obs_index = _tmodel_get_obs_action_index(tmodel, obs);
     if(obs_index >= tmodel->num_obs) {
       log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
-          "for packet %u/%u", obs_index, i, n_packets-1);
+          "for packet %u/%u", obs_index, p, n_packets-1);
       goto cleanup; // will return NULL
     }
 
     /* loop through the state space */
-    for(uint j = 0; j < n_states; j++) {
-      double dp = tmodel->emit_dp[j][obs_index];
-      double mu = tmodel->emit_mu[j][obs_index];
-      double sigma = tmodel->emit_sigma[j][obs_index];
+    for(uint i = 0; i < n_states; i++) {
+      table1[i][p] = -INFINITY;
+      table2[i][p] = UINT_MAX;
+
+      double max_trans_prob = -INFINITY;
+      uint max_trans_prob_prev_state = UINT_MAX;
+
+      /* Compute the maximum probability over all incoming edges
+       * to state i, using the probability of the state at the
+       * other end of the incoming edge (which we previously
+       * and stored in table1). */
+      for(uint j = 0; j < n_states; j++) {
+        if(tmodel->trans_prob[j][i] <= 0) {
+          continue;
+        }
+
+        double trans_prob = table1[j][p-1] + log(tmodel->trans_prob[j][i]);
+
+        if(trans_prob > max_trans_prob) {
+          max_trans_prob = trans_prob;
+          max_trans_prob_prev_state = j;
+        }
+      }
+
+      table2[i][p] = max_trans_prob_prev_state;
+
+      double dp = tmodel->emit_dp[i][obs_index];
+      double mu = tmodel->emit_mu[i][obs_index];
+      double sigma = tmodel->emit_sigma[i][obs_index];
 
       if(dp <= 0 || sigma <= 0) {
         continue;
@@ -1308,41 +1338,23 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
       double log_prob = _compute_delay_log(dx, mu, sigma);
       double fit_prob = log(dp) + log_prob;
 
-      double max_trans_prob = -INFINITY;
-      double max_prob = -INFINITY;
-      uint max_prob_prev_state_index = 0;
-
-      /* loop through every transition */
-      for(uint k = 0; k < n_states; k++) {
-        if(tmodel->trans_prob[k][j] <= 0) {
-          continue;
-        }
-
-        /* find the state k with the max transition prob from
-         * the prev most probable state (at obs i-1) to state k */
-        double trans_prob = table1[k][i-1] + log(tmodel->trans_prob[k][j]);
-
-        if(trans_prob > max_trans_prob) {
-          max_trans_prob = trans_prob;
-          max_prob = trans_prob + fit_prob;
-          max_prob_prev_state_index = k;
-        }
-      }
-
       /* store the max prob and prev state index for this packet.
        * note that the case that this state has no positive trans_prob
        * is valid and it's OK if the max_prob is 0 for some states. */
-      table1[j][i] = max_prob;
-      table2[j][i] = max_prob_prev_state_index;
+      table1[i][p] = max_trans_prob + fit_prob;
+
+      log_debug(LD_GENERAL,
+          "Viterbi probability for state %u at packet %u/%u is %f",
+          i, p, n_packets-1, table1[i][p]);
     }
   }
 
   /* get most probable final state */
   double optimal_prob = -INFINITY;
-  for(uint k = 0; k < n_states; k++) {
-    if(table1[k][n_packets-1] > optimal_prob) {
-      optimal_prob = table1[k][n_packets-1];
-      optimal_states[n_packets-1] = k;
+  for(uint i = 0; i < n_states; i++) {
+    if(table1[i][n_packets-1] > optimal_prob) {
+      optimal_prob = table1[i][n_packets-1];
+      optimal_states[n_packets-1] = i;
     }
   }
 
@@ -1355,19 +1367,22 @@ static char* _tmodel_run_viterbi(tmodel_t* tmodel, tmodel_stream_t* tstream) {
   }
 
   /* now work backward for the remaining packets */
-  for(uint i = n_packets-1; i > 0; i--) {
-    uint opt_state = optimal_states[i];
-    uint prev_opt_state = table2[opt_state][i];
+  for(uint p = n_packets-1; p > 0; p--) {
+    uint opt_state = optimal_states[p];
+    uint prev_opt_state = table2[opt_state][p];
 
     /* sanity check */
     if(prev_opt_state >= n_states) {
       log_warn(LD_BUG, "Bug in viterbi: optimal_states index (%u) is out of range "
           "for packet %u/%u",
-          prev_opt_state, i-1, n_packets-1);
+          prev_opt_state, p-1, n_packets-1);
       goto cleanup; // will return NULL
     }
 
-    optimal_states[i-1] = prev_opt_state;
+    optimal_states[p-1] = prev_opt_state;
+
+    log_debug(LD_GENERAL, "Found optimal transition for %u to %u with probability %f",
+        prev_opt_state, opt_state, table1[opt_state][p]);
   }
 
   log_info(LD_GENERAL, "Finished running viterbi. Found optimal path with %u "
