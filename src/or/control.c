@@ -9013,8 +9013,8 @@ control_event_privcount_connection(const or_connection_t *orconn)
   tor_free(remote_addr);
 }
 
-void
-control_event_privcount_viterbi(char* viterbi_result)
+MOCK_IMPL(void,
+control_event_privcount_viterbi,(char* viterbi_result))
 {
   /* Just in case */
   if (!get_options()->EnablePrivCount) {

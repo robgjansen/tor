@@ -176,7 +176,7 @@ void control_event_privcount_stream_bytes_transferred(
 void control_event_privcount_stream_ended(const edge_connection_t *exitconn);
 void control_event_privcount_connection(const or_connection_t *orconn);
 /* Tagged events */
-void control_event_privcount_viterbi(char* viterbi_result);
+MOCK_DECL(void, control_event_privcount_viterbi,(char* viterbi_result));
 /* Forward declaration to avoid including hs_cache.h */
 typedef struct hs_cache_dir_descriptor_t hs_cache_dir_descriptor_t;
 void control_event_privcount_hsdir_cache_store(

@@ -14,6 +14,7 @@
 #include "or.h"
 #include "config.h"
 #include "compat.h"
+#include "compat_time.h"
 #include "container.h"
 #include "control.h"
 #include "torlog.h"
@@ -925,7 +926,7 @@ static tmodel_t* _tmodel_new(const char* model_json) {
 /* returns 0 if the traffic model body is parsed correctly and
  * the traffic model is loaded and ready to run viterbi on
  * closed streams. returns 1 if there is an error. */
-int tmodel_set_traffic_model(uint32_t len, char *body) {
+int tmodel_set_traffic_model(uint32_t len, const char *body) {
   /* body is NULL terminated, valid command syntax is:
    *  'TRUE {}\r\n' : command is to set a new model, the {} part
    *                  represents the actual JSON representation
@@ -934,19 +935,12 @@ int tmodel_set_traffic_model(uint32_t len, char *body) {
    *  'FALSE\r\n' : command is to unset, or remove any existing
    *                model that we have stored.
    */
-  char* model_json = NULL;
   int return_code = 0;
-
-  /* check if we have a model */
-  if (len >= 5 && strncasecmp(body, "TRUE ", 5) == 0) {
-    /* this is a command to parse and store a new model */
-    model_json = &body[5];
-  }
 
   /* create a new model only if we had valid command input */
   tmodel_t* traffic_model = NULL;
-  if (model_json != NULL) {
-    traffic_model = _tmodel_new(model_json);
+  if (len >= 5 && strncasecmp(body, "TRUE ", 5) == 0) {
+    traffic_model = _tmodel_new(&body[5]);
     if (traffic_model) {
       log_notice(LD_GENERAL,
           "Successfully loaded a new traffic model from PrivCount");
@@ -1058,9 +1052,9 @@ static uint _tmodel_get_obs_action_index(tmodel_t* tmodel, tmodel_action_t obs) 
   const char* obs_str;
 
   if(obs == TMODEL_OBS_SENT_TO_ORIGIN) {
-    obs_str = TMODEL_OBS_SENT_STR;
-  } else if(obs == TMODEL_OBS_RECV_FROM_ORIGIN) {
     obs_str = TMODEL_OBS_RECV_STR;
+  } else if(obs == TMODEL_OBS_RECV_FROM_ORIGIN) {
+    obs_str = TMODEL_OBS_SENT_STR;
   } else {
     obs_str = TMODEL_OBS_DONE_STR;
   }
@@ -1124,6 +1118,11 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
   for(uint i = 0; i < path_len; i++) {
     encoded_delay = (int64_t)smartlist_get(tstream->packets, i);
     delay = _tmodel_decode_delay(encoded_delay, &obs);
+
+    /* last packet is 'F' */
+    if(i == path_len-1) {
+      obs = TMODEL_OBS_DONE;
+    }
 
     obs_index = _tmodel_get_obs_action_index(tmodel, obs);
     state_index = viterbi_path[i];

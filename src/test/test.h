@@ -247,6 +247,7 @@ extern struct testcase_t storagedir_tests[];
 extern struct testcase_t socks_tests[];
 extern struct testcase_t status_tests[];
 extern struct testcase_t thread_tests[];
+extern struct testcase_t tmodel_tests[];
 extern struct testcase_t tortls_tests[];
 extern struct testcase_t util_tests[];
 extern struct testcase_t util_format_tests[];

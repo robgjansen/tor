@@ -27,7 +27,7 @@ tmodel_stream_t* tmodel_stream_new(void);
 void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, size_t length, tmodel_action_t obs);
 void tmodel_stream_free(tmodel_stream_t* tstream);
 
-int tmodel_set_traffic_model(uint32_t len, char *body);
+int tmodel_set_traffic_model(uint32_t len, const char *body);
 int tmodel_is_active(void);
 
 #endif /* SRC_OR_TMODEL_H_ */
