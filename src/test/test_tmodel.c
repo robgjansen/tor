@@ -35,7 +35,54 @@ done:
   return;
 }
 
-static void test_load_traffic_model(void *arg) {
+/* Event base for scheduelr tests */
+static struct event_base *mock_event_base = NULL;
+/* Setup for mock event stuff */
+static void mock_event_free_all(void);
+static void mock_event_init(void);
+static void
+mock_event_free_all(void)
+{
+  tt_ptr_op(mock_event_base, OP_NE, NULL);
+
+  if (mock_event_base) {
+    event_base_free(mock_event_base);
+    mock_event_base = NULL;
+  }
+
+  tt_ptr_op(mock_event_base, OP_EQ, NULL);
+
+ done:
+  return;
+}
+
+static void
+mock_event_init(void)
+{
+  struct event_config *cfg = NULL;
+
+  tt_ptr_op(mock_event_base, OP_EQ, NULL);
+
+  if (!mock_event_base) {
+    cfg = event_config_new();
+    mock_event_base = event_base_new_with_config(cfg);
+    event_config_free(cfg);
+  }
+
+  tt_ptr_op(mock_event_base, OP_NE, NULL);
+
+ done:
+  return;
+}
+
+static struct event_base *
+tor_libevent_get_base_mock(void)
+{
+  return mock_event_base;
+}
+
+static void
+test_traffic_model_parse(void *arg) {
   (void) arg;
   or_options_t *options = get_options_mutable();
   options->EnablePrivCount = 1;
@@ -62,7 +109,55 @@ done:
   return;
 }
 
-static void test_traffic_model_stream(void *arg) {
+static void
+test_traffic_model_viterbi_threads(void *arg) {
+  (void) arg;
+  or_options_t *options = get_options_mutable();
+  options->EnablePrivCount = 1;
+  options->PrivCountNumViterbiWorkers = 1;
+
+  monotime_enable_test_mocking();
+
+  mock_event_init();
+  MOCK(tor_libevent_get_base, tor_libevent_get_base_mock);
+
+  int result = tmodel_set_traffic_model((uint32_t) strlen(tmodel_str),
+      tmodel_str);
+  tt_assert(result == 0);
+
+  for(int i = 0; i < 1000; i++) {
+    uint64_t now_ns = 1389631048 * (uint64_t) 1000000000;
+    monotime_coarse_set_mock_time_nsec(now_ns);
+
+    tmodel_stream_t* test_stream = tmodel_stream_new();
+    tt_assert(test_stream);
+
+    for(int j = 0; j < 10000; j++) {
+      tmodel_stream_cell_transferred(test_stream, 1434,
+          TMODEL_OBS_RECV_FROM_ORIGIN);
+      tmodel_stream_cell_transferred(test_stream, 1434,
+          TMODEL_OBS_SENT_TO_ORIGIN);
+    }
+
+    tmodel_stream_free(test_stream);
+
+    /* run the loop so we process thread result */
+    result = event_base_loop(tor_libevent_get_base_mock(), EVLOOP_ONCE);
+    tt_assert(result >= 0);
+  }
+
+  result = tmodel_set_traffic_model((uint32_t) 0, NULL);
+  tt_assert(result == 0);
+
+done:
+  mock_event_free_all();
+  UNMOCK(tor_libevent_get_base);
+  monotime_disable_test_mocking();
+  return;
+}
+
+static void
+test_traffic_model_viterbi(void *arg) {
   (void) arg;
   or_options_t *options = get_options_mutable();
   options->EnablePrivCount = 1;
@@ -73,7 +168,6 @@ static void test_traffic_model_stream(void *arg) {
   monotime_coarse_set_mock_time_nsec(now_ns);
 
   MOCK(control_event_privcount_viterbi, control_event_privcount_viterbi_mock);
-
 
   int result = tmodel_set_traffic_model((uint32_t) strlen(tmodel_str),
       tmodel_str);
@@ -124,7 +218,8 @@ done:
 }
 
 struct testcase_t tmodel_tests[] = {
-    { "parse", test_load_traffic_model, TT_FORK, NULL, NULL },
-    { "viterbi", test_traffic_model_stream, TT_FORK, NULL, NULL },
-    END_OF_TESTCASES
+  { "parse", test_traffic_model_parse, 0, NULL, NULL },
+  { "viterbi", test_traffic_model_viterbi, 0, NULL, NULL },
+  { "viterbi_threads", test_traffic_model_viterbi_threads, 0, NULL, NULL },
+  END_OF_TESTCASES
 };
