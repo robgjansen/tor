@@ -218,8 +218,8 @@ done:
 }
 
 struct testcase_t tmodel_tests[] = {
-  { "parse", test_traffic_model_parse, 0, NULL, NULL },
-  { "viterbi", test_traffic_model_viterbi, 0, NULL, NULL },
-  { "viterbi_threads", test_traffic_model_viterbi_threads, 0, NULL, NULL },
+  { "parse", test_traffic_model_parse, TT_FORK, NULL, NULL },
+  { "viterbi", test_traffic_model_viterbi, TT_FORK, NULL, NULL },
+  { "viterbi_threads", test_traffic_model_viterbi_threads, TT_FORK, NULL, NULL },
   END_OF_TESTCASES
 };

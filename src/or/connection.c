@@ -615,6 +615,11 @@ connection_free_(connection_t *conn)
   if (CONN_IS_EDGE(conn)) {
     rend_data_free(TO_EDGE_CONN(conn)->rend_data);
     hs_ident_edge_conn_free(TO_EDGE_CONN(conn)->hs_ident);
+    /* if we have a tmodel on this stream, process and free the results */
+    if (TO_EDGE_CONN(conn)->privcount_traffic_model_state) {
+      tmodel_stream_free(TO_EDGE_CONN(conn)->privcount_traffic_model_state);
+      TO_EDGE_CONN(conn)->privcount_traffic_model_state = NULL;
+    }
   }
   if (conn->type == CONN_TYPE_CONTROL) {
     control_connection_t *control_conn = TO_CONTROL_CONN(conn);

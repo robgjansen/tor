@@ -1120,7 +1120,7 @@ static char* _encode_viterbi_path(tmodel_t* tmodel, tmodel_stream_t* tstream,
     delay = _tmodel_decode_delay(encoded_delay, &obs);
 
     /* last packet is 'F' */
-    if(i == path_len-1) {
+    if(i > 0 && i == path_len-1) {
       obs = TMODEL_OBS_DONE;
     }
 
