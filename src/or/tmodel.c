@@ -1597,7 +1597,7 @@ typedef struct viterbi_worker_state_s {
 
 typedef struct viterbi_worker_job_s {
   tmodel_stream_t* tstream;
-  char* viterbit_result;
+  char* viterbi_result;
 } viterbi_worker_job_t;
 
 static viterbi_worker_job_t* _viterbi_job_new(tmodel_stream_t* tstream) {
@@ -1611,8 +1611,8 @@ static void _viterbi_job_free(viterbi_worker_job_t* job) {
     if(job->tstream) {
       _tmodel_stream_free_helper(job->tstream);
     }
-    if(job->viterbit_result) {
-      free(job->viterbit_result);
+    if(job->viterbi_result) {
+      free(job->viterbi_result);
     }
     free(job);
   }
@@ -1647,7 +1647,7 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
     /* if we make it here, we can run the viterbi algorithm.
      * The result will be stored in the job object, and handled
      * by the main thread in the handle_reply function. */
-    job->viterbit_result = _tmodel_run_viterbi(state->thread_traffic_model, job->tstream);
+    job->viterbi_result = _tmodel_run_viterbi(state->thread_traffic_model, job->tstream);
   }
 
   return WQ_RPL_REPLY;
@@ -1659,9 +1659,9 @@ static void _viterbi_worker_handle_reply(void* job_arg) {
   viterbi_worker_job_t* job = job_arg;
   if(job) {
     /* count the result, and free the string. */
-    _tmodel_handle_viterbi_result(job->viterbit_result);
+    _tmodel_handle_viterbi_result(job->viterbi_result);
     /* the above frees the string, so don't double free */
-    job->viterbit_result = NULL;
+    job->viterbi_result = NULL;
     /* free the job */
     _viterbi_job_free(job);
   } else {

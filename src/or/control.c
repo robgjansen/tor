@@ -9025,14 +9025,25 @@ control_event_privcount_viterbi,(char* viterbi_result))
     return;
   }
 
-  privcount_cleanse_tagged_str(viterbi_result);
+  unsigned long viterbi_len = 0;
+  if(viterbi_result) {
+    privcount_cleanse_tagged_str(viterbi_result);
+    viterbi_len = (unsigned long)strlen(viterbi_result);
+  }
+
+  char* ev_ts = privcount_timeval_now_to_epoch_str_dup("EventTimestamp=");
 
   log_info(LD_GENERAL, "Emitting control event with viterbi path "
-      "of length %lu", (unsigned long)strlen(viterbi_result));
+      "of length %lu", viterbi_len);
 
   send_control_event(EVENT_PRIVCOUNT_VITERBI,
-                     "650 PRIVCOUNT_VITERBI ViterbiPath=%s\r\n",
-                     viterbi_result);
+                     "650 PRIVCOUNT_VITERBI %s ViterbiPath=%s\r\n",
+                     ev_ts ? ev_ts : "0.0",
+                     viterbi_result ? viterbi_result : "[]");
+
+  if(ev_ts) {
+    tor_free(ev_ts);
+  }
 }
 
 /* Send a PrivCount HSDir onion service descriptor cache storage event using
