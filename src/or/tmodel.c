@@ -46,9 +46,9 @@
 #define TMODEL_SQRT_2_PI 2.5066282746310002
 
 /* maximum length that PrivCount will accept without closing connection
- * we subtract 64 to allow some room for the controller to add its
- * event code and field name. */
-#define TMODEL_MAX_JSON_RESULT_LEN ((1024*1024*200)-64)
+ * we subtract some bytes to allow some room for the controller to add its
+ * event code, timestamp, and field name. */
+#define TMODEL_MAX_JSON_RESULT_LEN ((1024*1024*200)-128)
 
 /* the tmodel_stream internal elements (see tmodel.h for typedef) */
 struct tmodel_stream_s {
