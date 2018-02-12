@@ -3544,8 +3544,9 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
   /* check if PrivCount is on and wants to model exit packet emissions */
   if(tmodel_is_active()) {
     /* Only process traffic model on streams whose circuit is not
-     * rejected due to the PrivCountCircuitSampleRate config. */
-    if(!circ || !circ->privcount_event_sample_reject) {
+     * rejected due to the PrivCountCircuitSampleRate config.
+     * Also, don't count BEGINDIR streams.  */
+    if(!bcell.is_begindir && (!circ || !circ->privcount_event_sample_reject)) {
       n_stream->privcount_traffic_model_state = tmodel_stream_new();
     }
   }
