@@ -32,7 +32,7 @@
 #define TMODEL_PACKET_BYTE_COUNT 1434
 /* assume a packet arrived at the same time if it arrived
  * within this many microseconds */
-#define TMODEL_PACKET_TIME_TOLERENCE 100
+#define TMODEL_PACKET_TIME_TOLERENCE 2
 
 /* default obs names */
 /* '+' means a packet was sent away from the client side */
