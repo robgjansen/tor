@@ -1728,7 +1728,7 @@ typedef struct edge_connection_t {
   /* Holds state information used to model cell emissions.
    * The state is stored during stream usage, and processed
    * when this object is freed (on stream destroy). */
-  tmodel_stream_t* privcount_traffic_model_state;
+  tmodel_packets_t* privcount_traffic_model_state;
 
   /* The number of the stream on the circuit. Starts at 1.
    * 0 for non-exit streams. */

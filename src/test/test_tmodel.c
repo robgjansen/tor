@@ -129,17 +129,17 @@ test_traffic_model_viterbi_threads(void *arg) {
     uint64_t now_ns = 1389631048 * (uint64_t) 1000000000;
     monotime_coarse_set_mock_time_nsec(now_ns);
 
-    tmodel_stream_t* test_stream = tmodel_stream_new();
+    tmodel_packets_t* test_stream = tmodel_packets_new();
     tt_assert(test_stream);
 
     for(int j = 0; j < 10000; j++) {
-      tmodel_stream_cell_transferred(test_stream, 1434,
+      tmodel_packets_cell_transferred(test_stream, 1434,
           TMODEL_OBS_RECV_FROM_ORIGIN);
-      tmodel_stream_cell_transferred(test_stream, 1434,
+      tmodel_packets_cell_transferred(test_stream, 1434,
           TMODEL_OBS_SENT_TO_ORIGIN);
     }
 
-    tmodel_stream_free(test_stream);
+    tmodel_packets_free(test_stream);
 
     /* run the loop so we process thread result */
     result = event_base_loop(tor_libevent_get_base_mock(), EVLOOP_ONCE);
@@ -173,43 +173,43 @@ test_traffic_model_viterbi(void *arg) {
       tmodel_str);
   tt_assert(result == 0);
 
-  tmodel_stream_t* test_stream = tmodel_stream_new();
+  tmodel_packets_t* test_stream = tmodel_packets_new();
   tt_assert(test_stream);
 
   /* now simulate some packets getting transferred */
   now_ns += 1000 * 1000;
   monotime_coarse_set_mock_time_nsec(now_ns);
 
-  tmodel_stream_cell_transferred(test_stream, 1434,
+  tmodel_packets_cell_transferred(test_stream, 1434,
       TMODEL_OBS_RECV_FROM_ORIGIN);
 
   now_ns += 1000 * 1000;
   monotime_coarse_set_mock_time_nsec(now_ns);
 
-  tmodel_stream_cell_transferred(test_stream, 1434,
+  tmodel_packets_cell_transferred(test_stream, 1434,
       TMODEL_OBS_RECV_FROM_ORIGIN);
 
   now_ns += 1000 * 1000;
   monotime_coarse_set_mock_time_nsec(now_ns);
 
-  tmodel_stream_cell_transferred(test_stream, 1434,
+  tmodel_packets_cell_transferred(test_stream, 1434,
       TMODEL_OBS_SENT_TO_ORIGIN);
 
   now_ns += 1000 * 1000;
   monotime_coarse_set_mock_time_nsec(now_ns);
 
-  tmodel_stream_cell_transferred(test_stream, 1434,
+  tmodel_packets_cell_transferred(test_stream, 1434,
       TMODEL_OBS_SENT_TO_ORIGIN);
 
   now_ns += 1000 * 1000;
   monotime_coarse_set_mock_time_nsec(now_ns);
 
-  tmodel_stream_cell_transferred(test_stream, 1434,
+  tmodel_packets_cell_transferred(test_stream, 1434,
       TMODEL_OBS_DONE);
 
   /* close the stream, which runs viterbi */
 
-  tmodel_stream_free(test_stream);
+  tmodel_packets_free(test_stream);
 
 done:
   UNMOCK(control_event_privcount_viterbi);

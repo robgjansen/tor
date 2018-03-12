@@ -18,14 +18,14 @@ enum tmodel_action_e {
     TMODEL_OBS_DONE,
 };
 
-/* An opaque structure representing stream model info. The internals
- * of this structure are not intended to be accessed outside of the
- * tmodel class. */
-typedef struct tmodel_stream_s tmodel_stream_t;
+/* An opaque structure representing traffic model info for packets
+ * on a stream. The internals of this structure are not intended
+ * to be accessed outside of the tmodel class. */
+typedef struct tmodel_packets_s tmodel_packets_t;
 
-tmodel_stream_t* tmodel_stream_new(void);
-void tmodel_stream_cell_transferred(tmodel_stream_t* tstream, size_t length, tmodel_action_t obs);
-void tmodel_stream_free(tmodel_stream_t* tstream);
+tmodel_packets_t* tmodel_packets_new(void);
+void tmodel_packets_cell_transferred(tmodel_packets_t* tpackets, size_t length, tmodel_action_t obs);
+void tmodel_packets_free(tmodel_packets_t* tpackets);
 
 int tmodel_set_traffic_model(uint32_t len, const char *body);
 int tmodel_is_active(void);

@@ -617,7 +617,7 @@ connection_free_(connection_t *conn)
     hs_ident_edge_conn_free(TO_EDGE_CONN(conn)->hs_ident);
     /* if we have a tmodel on this stream, process and free the results */
     if (TO_EDGE_CONN(conn)->privcount_traffic_model_state) {
-      tmodel_stream_free(TO_EDGE_CONN(conn)->privcount_traffic_model_state);
+      tmodel_packets_free(TO_EDGE_CONN(conn)->privcount_traffic_model_state);
       TO_EDGE_CONN(conn)->privcount_traffic_model_state = NULL;
     }
   }
