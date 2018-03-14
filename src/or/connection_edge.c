@@ -3548,6 +3548,13 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
      * Also, don't count BEGINDIR streams.  */
     if(!bcell.is_begindir && (!circ || !circ->privcount_event_sample_reject)) {
       n_stream->privcount_traffic_model_state = tmodel_packets_new();
+      if(circ) {
+        if(!circ->privcount_traffic_model_state) {
+          circ->privcount_traffic_model_state = tmodel_streams_new();
+        }
+        tmodel_streams_observation(circ->privcount_traffic_model_state,
+            TMODEL_OBSTYPE_STREAM_NEW);
+      }
     }
   }
 

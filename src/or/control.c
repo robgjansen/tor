@@ -1226,7 +1226,8 @@ static const struct control_event_t control_event_table[] = {
   { EVENT_PRIVCOUNT_CIRCUIT_CELL, "PRIVCOUNT_CIRCUIT_CELL" },
   { EVENT_PRIVCOUNT_CIRCUIT_CLOSE, "PRIVCOUNT_CIRCUIT_CLOSE" },
   { EVENT_PRIVCOUNT_CONNECTION_CLOSE, "PRIVCOUNT_CONNECTION_CLOSE" },
-  { EVENT_PRIVCOUNT_VITERBI, "PRIVCOUNT_VITERBI" },
+  { EVENT_PRIVCOUNT_VITERBI_PACKETS, "PRIVCOUNT_VITERBI_PACKETS" },
+  { EVENT_PRIVCOUNT_VITERBI_STREAMS, "PRIVCOUNT_VITERBI_STREAMS" },
   { 0, NULL },
 };
 
@@ -9014,14 +9015,14 @@ control_event_privcount_connection(const or_connection_t *orconn)
 }
 
 MOCK_IMPL(void,
-control_event_privcount_viterbi,(char* viterbi_result))
+control_event_privcount_viterbi_packets,(char* viterbi_result))
 {
   /* Just in case */
   if (!get_options()->EnablePrivCount) {
     return;
   }
 
-  if (!EVENT_IS_INTERESTING(EVENT_PRIVCOUNT_VITERBI)) {
+  if (!EVENT_IS_INTERESTING(EVENT_PRIVCOUNT_VITERBI_PACKETS)) {
     return;
   }
 
@@ -9033,11 +9034,44 @@ control_event_privcount_viterbi,(char* viterbi_result))
 
   char* ev_ts = privcount_timeval_now_to_epoch_str_dup("EventTimestamp=");
 
-  log_info(LD_GENERAL, "Emitting control event with viterbi path "
+  log_info(LD_GENERAL, "Emitting control event with viterbi packets path "
       "of length %lu", viterbi_len);
 
-  send_control_event(EVENT_PRIVCOUNT_VITERBI,
-                     "650 PRIVCOUNT_VITERBI %s ViterbiPath=%s\r\n",
+  send_control_event(EVENT_PRIVCOUNT_VITERBI_PACKETS,
+                     "650 PRIVCOUNT_VITERBI_PACKETS %s ViterbiPathPackets=%s\r\n",
+                     ev_ts ? ev_ts : "0.0",
+                     viterbi_result ? viterbi_result : "[]");
+
+  if(ev_ts) {
+    tor_free(ev_ts);
+  }
+}
+
+MOCK_IMPL(void,
+control_event_privcount_viterbi_streams,(char* viterbi_result))
+{
+  /* Just in case */
+  if (!get_options()->EnablePrivCount) {
+    return;
+  }
+
+  if (!EVENT_IS_INTERESTING(EVENT_PRIVCOUNT_VITERBI_STREAMS)) {
+    return;
+  }
+
+  unsigned long viterbi_len = 0;
+  if(viterbi_result) {
+    privcount_cleanse_tagged_str(viterbi_result);
+    viterbi_len = (unsigned long)strlen(viterbi_result);
+  }
+
+  char* ev_ts = privcount_timeval_now_to_epoch_str_dup("EventTimestamp=");
+
+  log_info(LD_GENERAL, "Emitting control event with viterbi streams path "
+      "of length %lu", viterbi_len);
+
+  send_control_event(EVENT_PRIVCOUNT_VITERBI_STREAMS,
+                     "650 PRIVCOUNT_VITERBI_STREAMS %s ViterbiPathStreams=%s\r\n",
                      ev_ts ? ev_ts : "0.0",
                      viterbi_result ? viterbi_result : "[]");
 

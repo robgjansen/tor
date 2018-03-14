@@ -3195,6 +3195,11 @@ typedef struct circuit_t {
    * have emitted to PrivCount via the control port. */
   uint64_t privcount_n_cell_events_emitted;
 
+  /* Holds state information used to model stream emissions.
+   * The state is stored during circuit usage, and processed
+   * when this object is freed (on circuit destroy). */
+  tmodel_streams_t* privcount_traffic_model_state;
+
   /** If set, points to an HS token that this circuit might be carrying.
    *  Used by the HS circuitmap.  */
   hs_token_t *hs_token;

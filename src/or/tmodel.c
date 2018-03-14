@@ -22,10 +22,13 @@
 #include "util_bug.h"
 #include "workqueue.h"
 
+/* magic for memory checking */
 #define TRAFFIC_MAGIC 0xAABBCCDD
-#define TRAFFIC_HMM_MAGIC 0xDDCCBBAA
-#define TRAFFIC_PACKETS_MAGIC 0xCCAABBDD
+#define TRAFFIC_MAGIC_HMM 0xBBDDAACC
+#define TRAFFIC_MAGIC_PACKETS 0xCCAABBDD
+#define TRAFFIC_MAGIC_STREAMS 0xCCBBAADD
 
+/* max lengths used for string parsing */
 #define TMODEL_MAX_STATE_STR_LEN 63
 #define TMODEL_MAX_OBS_STR_LEN 7
 
@@ -35,14 +38,6 @@
  * within this many microseconds */
 #define TMODEL_PACKET_TIME_TOLERENCE 2
 
-/* default obs names */
-/* '+' means a packet was sent away from the client side */
-#define TMODEL_OBS_SENT_STR "+"
-/* '-' means a packet was sent toward the client side */
-#define TMODEL_OBS_RECV_STR "-"
-/* 'F' means the stream is ended */
-#define TMODEL_OBS_DONE_STR "F"
-
 /* SQRT_2_PI = math.sqrt(2*math.pi) */
 #define TMODEL_SQRT_2_PI 2.5066282746310002
 
@@ -51,23 +46,49 @@
  * event code, timestamp, and field name. */
 #define TMODEL_MAX_JSON_RESULT_LEN ((1024*1024*200)-128)
 
-/* The tmodel_stream internal elements (see tmodel.h for typedef).
+/* traffic model observation code symbols */
+#define TMODEL_OBS_CODE_PACKET_TO_SERVER "+"
+#define TMODEL_OBS_CODE_PACKET_TO_ORIGIN "-"
+#define TMODEL_OBS_CODE_STREAM "$"
+#define TMODEL_OBS_CODE_END "F"
+#define TMODEL_OBS_CODE_UNKNOWN "?"
+
+typedef struct tmodel_delay_s {
+  int64_t delay;
+  tmodel_obs_type_t otype;
+} tmodel_delay_t;
+
+/* The tmodel_packets internal elements (see tmodel.h for typedef).
  * Holds information about packets sent on the stream. */
 struct tmodel_packets_s {
   /* Time the stream was created */
   monotime_t creation_time;
-  monotime_t prev_emit_time;
 
   /* uncommitted packet info. we hold info until a tolerence
    * so that we can count data that arrives at the same time
    * as part of the same packets. */
-  monotime_t buf_emit_time;
-  int64_t buf_delay;
+  monotime_t buf_time;
   size_t buf_length;
-  tmodel_action_t buf_obs;
+  tmodel_obs_type_t buf_obstype;
 
   /* committed observations */
   smartlist_t* packets;
+
+  /* for memory checking */
+  uint magic;
+};
+
+/* The tmodel_streams internal elements (see tmodel.h for typedef).
+ * Holds information about streams used on the circuit. */
+struct tmodel_streams_s {
+  /* Time the circuit was created */
+  monotime_t creation_time;
+
+  monotime_t buf_time;
+  tmodel_obs_type_t buf_obstype;
+
+  /* committed observations */
+  smartlist_t* streams;
 
   /* for memory checking */
   uint magic;
@@ -114,8 +135,11 @@ struct tmodel_hmm_s {
    * state_space[i] and observation obs_space[j]
    * is held in emit_val[i][j] */
   double** emit_dp;
+  /* lognormal distributions use mu and sigma */
   double** emit_mu;
   double** emit_sigma;
+  /* exponential distributions use lambda */
+  double** emit_lambda;
 
   /* for memory checking */
   uint magic;
@@ -131,8 +155,11 @@ typedef struct tmodel_s tmodel_t;
  * to make sure the new memory gets duplicated correctly for the
  * viterbi workers. */
 struct tmodel_s {
-  /* the models used for packets */
+  /* the model used for packets on a stream */
   tmodel_hmm_t* hmm_packets;
+
+  /* the model used for streams on a circuit */
+  tmodel_hmm_t* hmm_streams;
 
   /* for memory checking */
   uint magic;
@@ -147,7 +174,8 @@ tor_mutex_t* global_traffic_model_lock;
 static int _viterbi_workers_init(uint num_workers);
 static void _viterbi_workers_sync(void);
 static int _viterbi_thread_pool_is_ready(void);
-static void _viterbi_worker_assign_stream(tmodel_packets_t* tpackets);
+static void _viterbi_worker_assign(tmodel_packets_t* tpackets,
+    tmodel_streams_t* tstreams);
 
 /* returns true if we want to know about cells on exit streams,
  * false otherwise. */
@@ -159,8 +187,54 @@ int tmodel_is_active(void) {
   return 0;
 }
 
+/* return the string observation code encoding the type
+ * of distribution used to model the observation. */
+static const char* _tmodel_obstype_to_code(tmodel_obs_type_t obstype) {
+  switch(obstype) {
+    case TMODEL_OBSTYPE_PACKET_RECV_FROM_ORIGIN:
+      /* '+' means a packet was sent away from the client side.
+       * uses a lognorm distribution. */
+      return TMODEL_OBS_CODE_PACKET_TO_SERVER;
+    case TMODEL_OBSTYPE_PACKET_SENT_TO_ORIGIN:
+      /* '-' means a packet was sent toward the client side.
+       * uses a lognorm distribution. */
+      return TMODEL_OBS_CODE_PACKET_TO_ORIGIN;
+    case TMODEL_OBSTYPE_STREAM_NEW:
+      /* '$' means a stream was observed */
+      return TMODEL_OBS_CODE_STREAM;
+    case TMODEL_OBSTYPE_PACKETS_FINISHED:
+    case TMODEL_OBSTYPE_STREAMS_FINISHED:
+      /* 'F' means the stream or circuit ended */
+      return TMODEL_OBS_CODE_END;
+    default:
+    case TMODEL_OBSTYPE_NONE:
+      return TMODEL_OBS_CODE_UNKNOWN;
+  }
+}
+
+static uint _tmodel_hmm_obsstr_to_index(tmodel_hmm_t* hmm, const char* obs_name) {
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
+
+  for (uint i = 0; i < hmm->num_obs; i++) {
+    log_debug(LD_GENERAL, "Searching for '%s', obs space element '%s'",
+        obs_name, hmm->obs_space[i]);
+    if (strncasecmp(hmm->obs_space[i], obs_name, TMODEL_MAX_OBS_STR_LEN) == 0) {
+      return i;
+    }
+  }
+
+  log_warn(LD_GENERAL, "Unable to find index for observation string '%s'",
+      obs_name);
+  return UINT_MAX;
+}
+
+static uint _tmodel_hmm_obstype_to_index(tmodel_hmm_t* hmm, tmodel_obs_type_t otype) {
+  const char* obs_str = _tmodel_obstype_to_code(otype);
+  return _tmodel_hmm_obsstr_to_index(hmm, obs_str);
+}
+
 static uint _tmodel_hmm_get_state_index(tmodel_hmm_t* hmm, char* state_name) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   for (uint i = 0; i < hmm->num_states; i++) {
     if (strncasecmp(hmm->state_space[i], state_name, 63) == 0) {
@@ -168,20 +242,7 @@ static uint _tmodel_hmm_get_state_index(tmodel_hmm_t* hmm, char* state_name) {
     }
   }
 
-  log_warn(LD_GENERAL, "unable to find state index");
-  return UINT_MAX;
-}
-
-static uint _tmodel_hmm_get_obs_index(tmodel_hmm_t* hmm, char* obs_name) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
-
-  for (uint i = 0; i < hmm->num_obs; i++) {
-    if (strncasecmp(hmm->obs_space[i], obs_name, 7) == 0) {
-      return i;
-    }
-  }
-
-  log_warn(LD_GENERAL, "unable to find obs index");
+  log_warn(LD_GENERAL, "unable to find state index for state name '%s'", state_name);
   return UINT_MAX;
 }
 
@@ -365,27 +426,52 @@ static int _parse_json_emit_prob(const char* json, int obj_end_pos,
         return 1;
       }
 
-      int obs_index = _tmodel_hmm_get_obs_index(hmm, obs);
+      int obs_index = _tmodel_hmm_obsstr_to_index(hmm, obs);
       if (obs_index < 0) {
         log_warn(LD_GENERAL, "unable to find emit obs index");
         return 1;
       }
 
-      double dp = 0.0, mu = 0.0, sigma = 0.0;
-      n_assigned = sscanf(&json[i], "[%lf;%lf;%lf]", &dp, &mu, &sigma);
-      if (n_assigned != 3) {
-        log_warn(LD_GENERAL, "sscanf problem parsing emit values");
+      if (strncasecmp(obs, TMODEL_OBS_CODE_PACKET_TO_SERVER, 1) == 0 ||
+          strncasecmp(obs, TMODEL_OBS_CODE_PACKET_TO_ORIGIN, 1) == 0 ||
+          strncasecmp(obs, TMODEL_OBS_CODE_STREAM, 1) == 0) {
+        /* lognormal or exponential distribution params */
+        double dp = 0.0, mu = 0.0, sigma = 0.0, lambda = 0.0;
+        n_assigned = sscanf(&json[i], "[%lf;%lf;%lf;%lf]", &dp, &mu, &sigma, &lambda);
+        if (n_assigned != 4) {
+          log_warn(LD_GENERAL, "sscanf problem parsing emit values");
+          return 1;
+        }
+
+        /* process the items */
+        log_debug(LD_GENERAL,
+            "found emit for state '%s' and obs '%s': "
+            "dp='%f' mu='%f' sigma='%f' lambda='%f'",
+            state_name, obs, dp, mu, sigma, lambda);
+
+        hmm->emit_dp[state_index][obs_index] = dp;
+        hmm->emit_mu[state_index][obs_index] = mu;
+        hmm->emit_sigma[state_index][obs_index] = sigma;
+        hmm->emit_lambda[state_index][obs_index] = lambda;
+      } else if(strncasecmp(obs, TMODEL_OBS_CODE_END, 1) == 0) {
+        /* state 'F' */
+        double dp = 0.0;
+        n_assigned = sscanf(&json[i], "[%lf]", &dp);
+        if (n_assigned != 1) {
+          log_warn(LD_GENERAL, "sscanf problem parsing emit values");
+          return 1;
+        }
+
+        /* process the items */
+        log_debug(LD_GENERAL,
+            "found emit for state '%s' and obs '%s': dp='%f'",
+            state_name, obs, dp);
+
+        hmm->emit_dp[state_index][obs_index] = dp;
+      } else {
+        log_warn(LD_GENERAL, "found unsupported observation code '%s", obs);
         return 1;
       }
-
-      /* process the items */
-      log_debug(LD_GENERAL,
-          "found emit for state '%s' and obs '%s': dp='%f' mu='%f' sigma='%f'",
-          state_name, obs, dp, mu, sigma);
-
-      hmm->emit_dp[state_index][obs_index] = dp;
-      hmm->emit_mu[state_index][obs_index] = mu;
-      hmm->emit_sigma[state_index][obs_index] = sigma;
 
       /* fast forward to one past the end of the list */
       i += emit_vals_list_len;
@@ -584,9 +670,9 @@ static int _parse_json_start_prob(const char* json, int obj_end_pos,
  * pass, we parse the trans_prob, emit_prob, an start_prob
  * objects, given the space and observation spaces that we
  * parsed in the first step. */
-static int _parse_json_objects(const char* json, int parse_spaces,
-    tmodel_hmm_t* hmm) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
+static int _parse_json_hmm_objects(const char* json,
+    int obj_end_pos, int parse_spaces, tmodel_hmm_t* hmm) {
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   int i = 0, j = 0;
   if (json[i] != '{') {
@@ -595,7 +681,7 @@ static int _parse_json_objects(const char* json, int parse_spaces,
     i++;
   }
 
-  while (json[i] != '}') {
+  while (json[i] != '}' && i <= obj_end_pos) {
     /* static buffer to hold the parsed type */
     char input_type[32];
     memset(input_type, 0, 32);
@@ -704,8 +790,145 @@ static int _parse_json_objects(const char* json, int parse_spaces,
   return 0;
 }
 
+static void _tmodel_hmm_allocate_arrays(tmodel_hmm_t* hmm) {
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
+
+  hmm->start_prob = calloc((size_t) hmm->num_states, sizeof(double));
+
+  hmm->trans_prob = calloc((size_t) hmm->num_states, sizeof(double*));
+  for (uint i = 0; i < hmm->num_states; i++) {
+    hmm->trans_prob[i] = calloc((size_t) hmm->num_states, sizeof(double));
+  }
+
+  hmm->emit_dp = calloc((size_t) hmm->num_states, sizeof(double*));
+  for (uint i = 0; i < hmm->num_states; i++) {
+    hmm->emit_dp[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+  }
+
+  hmm->emit_mu = calloc((size_t) hmm->num_states, sizeof(double*));
+  for (uint i = 0; i < hmm->num_states; i++) {
+    hmm->emit_mu[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+  }
+
+  hmm->emit_sigma = calloc((size_t) hmm->num_states, sizeof(double*));
+  for (uint i = 0; i < hmm->num_states; i++) {
+    hmm->emit_sigma[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+  }
+
+  hmm->emit_lambda = calloc((size_t) hmm->num_states, sizeof(double*));
+  for (uint i = 0; i < hmm->num_states; i++) {
+    hmm->emit_lambda[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+  }
+}
+
+static int _parse_json_hmm(const char* json,
+    int i, int j, tmodel_hmm_t** hmm, const char* name) {
+  (*hmm) = tor_malloc_zero_(sizeof(struct tmodel_hmm_s));
+  (*hmm)->magic = TRAFFIC_MAGIC_HMM;
+
+  int ret = _parse_json_hmm_objects(&json[i], j, 1, *hmm);
+  if (ret == 0) {
+    log_info(LD_GENERAL, "success parsing %s state and obs spaces", name);
+
+    /* now we know the state and obs counts, allocate arrays */
+    _tmodel_hmm_allocate_arrays(*hmm);
+
+    /* now parse again, filling the arrays with probs */
+    ret = _parse_json_hmm_objects(&json[i], j, 0, *hmm);
+    if (ret == 0) {
+      log_info(LD_GENERAL, "success parsing %s trans, emit, and start probs", name);
+    } else {
+      log_warn(LD_GENERAL, "problem parsing %s trans, emit, and start probs", name);
+      (*hmm)->magic = 0;
+      tor_free_(*hmm);
+      (*hmm) = NULL;
+    }
+  } else {
+    log_warn(LD_GENERAL, "problem parsing %s state and obs spaces", name);
+    (*hmm)->magic = 0;
+    tor_free_(*hmm);
+    (*hmm) = NULL;
+  }
+
+  return ret;
+}
+
+/* we loop twice, once to parse the state space and observation
+ * space which is only done if parse_spaces=1. on the second
+ * pass, we parse the trans_prob, emit_prob, an start_prob
+ * objects, given the space and observation spaces that we
+ * parsed in the first step. */
+static int _parse_json_objects(const char* json, tmodel_t* tmodel) {
+  tor_assert(tmodel && tmodel->magic == TRAFFIC_MAGIC);
+
+  int i = 0, j = 0;
+  if (json[i] != '{') {
+    return 1;
+  } else {
+    i++;
+  }
+
+  while (json[i] != '}') {
+    /* static buffer to hold the parsed type */
+    char model_type[32];
+    memset(model_type, 0, 32);
+
+    /* read the type. will be one of the following:
+     *   '"packet_model"', or '"stream_model"',
+     * they may appear in any order.
+     */
+    int n_assigned = sscanf(&json[i], "\"%30[^\"]", model_type);
+    if (n_assigned != 1) {
+      return 1;
+    }
+
+    /* fast forward to the object starting position,
+     * which will be at 1 past the ':' character.
+     * add 3 for the "": chars */
+    i += strnlen(model_type, 30) + 3;
+
+    /* find the end of the object */
+    j = _json_find_object_end_pos(&json[i]);
+    if (j < 0) {
+      return 1;
+    }
+
+    log_info(LD_GENERAL, "found object '%s' of length %d", model_type, j);
+
+    /* handle each object type */
+    if (json[i] == '{' &&
+        strncasecmp(model_type, "packet_model", 12) == 0) {
+      int ret = _parse_json_hmm(json, i, j, &tmodel->hmm_packets, "packet model");
+      if(ret != 0) {
+        return 1;
+      }
+    } else if (json[i] == '{' &&
+        strncasecmp(model_type, "stream_model", 12) == 0) {
+      int ret = _parse_json_hmm(json, i, j, &tmodel->hmm_streams, "stream model");
+      if(ret != 0) {
+        return 1;
+      }
+    } else {
+      return 1;
+    }
+
+    /* Jump to the end of the object, and add 1 to
+     * get the the start of the next item. */
+    i += j;
+
+    /* check if we have another element, which is normally
+     * separated by a comma, but we separate by a ';'. */
+    if (json[i] == ';') {
+      i++;
+    }
+  }
+
+  /* success! */
+  return 0;
+}
+
 static void _tmodel_log_hmm(tmodel_hmm_t* hmm, const char* hmm_name) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   if (hmm->state_space) {
     log_info(LD_GENERAL, "Logging %s state space", hmm_name);
@@ -747,10 +970,10 @@ static void _tmodel_log_hmm(tmodel_hmm_t* hmm, const char* hmm_name) {
     }
   }
 
-  if (hmm->emit_dp && hmm->emit_mu && hmm->emit_sigma) {
+  if (hmm->emit_dp && hmm->emit_mu && hmm->emit_sigma && hmm->emit_lambda) {
     log_info(LD_GENERAL, "Logging %s emission values", hmm_name);
     for (uint i = 0; i < hmm->num_states; i++) {
-      if (hmm->emit_dp[i] && hmm->emit_mu[i] && hmm->emit_sigma[i]) {
+      if (hmm->emit_dp[i] && hmm->emit_mu[i] && hmm->emit_sigma[i] && hmm->emit_lambda[i]) {
         for (uint j = 0; j < hmm->num_obs; j++) {
           log_info(LD_GENERAL, "found emit_dp[%i][%i] '%f'", i, j,
               hmm->emit_dp[i][j]);
@@ -758,6 +981,8 @@ static void _tmodel_log_hmm(tmodel_hmm_t* hmm, const char* hmm_name) {
               hmm->emit_mu[i][j]);
           log_info(LD_GENERAL, "found emit_sigma[%i][%i] '%f'", i, j,
               hmm->emit_sigma[i][j]);
+          log_info(LD_GENERAL, "found emit_lambda[%i][%i] '%f'", i, j,
+              hmm->emit_lambda[i][j]);
         }
       }
     }
@@ -766,11 +991,16 @@ static void _tmodel_log_hmm(tmodel_hmm_t* hmm, const char* hmm_name) {
 
 static void _tmodel_log_model(tmodel_t* tmodel) {
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MAGIC);
-  _tmodel_log_hmm(tmodel->hmm_packets, "packet model");
+  if(tmodel->hmm_packets) {
+    _tmodel_log_hmm(tmodel->hmm_packets, "packet model");
+  }
+  if(tmodel->hmm_streams) {
+    _tmodel_log_hmm(tmodel->hmm_streams, "stream model");
+  }
 }
 
 static void _tmodel_hmm_free(tmodel_hmm_t* hmm) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   if (hmm->start_prob) {
     free(hmm->start_prob);
@@ -812,6 +1042,15 @@ static void _tmodel_hmm_free(tmodel_hmm_t* hmm) {
     free(hmm->emit_sigma);
   }
 
+  if (hmm->emit_lambda) {
+    for (uint i = 0; i < hmm->num_states; i++) {
+      if (hmm->emit_lambda[i]) {
+        free(hmm->emit_lambda[i]);
+      }
+    }
+    free(hmm->emit_lambda);
+  }
+
   if (hmm->state_space) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->state_space[i]) {
@@ -837,43 +1076,22 @@ static void _tmodel_hmm_free(tmodel_hmm_t* hmm) {
 static void _tmodel_free(tmodel_t* tmodel) {
   tor_assert(tmodel && tmodel->magic == TRAFFIC_MAGIC);
 
-  _tmodel_hmm_free(tmodel->hmm_packets);
+  if(tmodel->hmm_packets) {
+    _tmodel_hmm_free(tmodel->hmm_packets);
+  }
+  if(tmodel->hmm_streams) {
+    _tmodel_hmm_free(tmodel->hmm_streams);
+  }
 
   tmodel->magic = 0;
   tor_free_(tmodel);
 }
 
-static void _tmodel_hmm_allocate_arrays(tmodel_hmm_t* hmm) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
-
-  hmm->start_prob = calloc((size_t) hmm->num_states, sizeof(double));
-
-  hmm->trans_prob = calloc((size_t) hmm->num_states, sizeof(double*));
-  for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->trans_prob[i] = calloc((size_t) hmm->num_states, sizeof(double));
-  }
-
-  hmm->emit_dp = calloc((size_t) hmm->num_states, sizeof(double*));
-  for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_dp[i] = calloc((size_t) hmm->num_obs, sizeof(double));
-  }
-
-  hmm->emit_mu = calloc((size_t) hmm->num_states, sizeof(double*));
-  for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_mu[i] = calloc((size_t) hmm->num_obs, sizeof(double));
-  }
-
-  hmm->emit_sigma = calloc((size_t) hmm->num_states, sizeof(double*));
-  for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_sigma[i] = calloc((size_t) hmm->num_obs, sizeof(double));
-  }
-}
-
 static tmodel_hmm_t* _tmodel_hmm_deepcopy(tmodel_hmm_t* hmm) {
-  if(hmm == NULL || hmm->magic != TRAFFIC_HMM_MAGIC ||
+  if(hmm == NULL || hmm->magic != TRAFFIC_MAGIC_HMM ||
       !hmm->state_space || !hmm->obs_space ||
       !hmm->trans_prob || !hmm->emit_dp ||
-      !hmm->emit_mu || !hmm->emit_sigma) {
+      !hmm->emit_mu || !hmm->emit_sigma || !hmm->emit_lambda) {
     return NULL;
   }
 
@@ -921,6 +1139,12 @@ static tmodel_hmm_t* _tmodel_hmm_deepcopy(tmodel_hmm_t* hmm) {
     }
   }
 
+  for (uint i = 0; i < copy->num_states; i++) {
+    for(uint j = 0; j < copy->num_obs; j++) {
+      copy->emit_lambda[i][j] = hmm->emit_lambda[i][j];
+    }
+  }
+
   return copy;
 }
 
@@ -933,7 +1157,12 @@ static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
 
   copy->magic = tmodel->magic;
 
-  copy->hmm_packets = _tmodel_hmm_deepcopy(tmodel->hmm_packets);
+  if(tmodel->hmm_packets) {
+    copy->hmm_packets = _tmodel_hmm_deepcopy(tmodel->hmm_packets);
+  }
+  if(tmodel->hmm_streams) {
+    copy->hmm_streams = _tmodel_hmm_deepcopy(tmodel->hmm_streams);
+  }
 
   return copy;
 }
@@ -941,25 +1170,12 @@ static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
 static tmodel_t* _tmodel_new(const char* model_json) {
   tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
   tmodel->magic = TRAFFIC_MAGIC;
-  tmodel->hmm_packets = tor_malloc_zero_(sizeof(struct tmodel_hmm_s));
-  tmodel->hmm_packets->magic = TRAFFIC_HMM_MAGIC;
 
-  int ret = _parse_json_objects(model_json, 1, tmodel->hmm_packets);
+  int ret = _parse_json_objects(model_json, tmodel);
   if (ret == 0) {
-    log_info(LD_GENERAL, "success parsing state and obs spaces");
-
-    /* now we know the state and obs counts, allocate arrays */
-    _tmodel_hmm_allocate_arrays(tmodel->hmm_packets);
-
-    /* now parse again, filling the arrays with probs */
-    ret = _parse_json_objects(model_json, 0, tmodel->hmm_packets);
-    if (ret == 0) {
-      log_info(LD_GENERAL, "success parsing trans, emit, and start probs");
-    } else {
-      log_warn(LD_GENERAL, "problem parsing trans, emit, and start probs");
-    }
+    log_info(LD_GENERAL, "success parsing hidden markov model(s)");
   } else {
-    log_warn(LD_GENERAL, "problem parsing state and obs spaces");
+    log_warn(LD_GENERAL, "problem parsing hidden markov model(s)");
   }
 
   if (ret == 0) {
@@ -1054,72 +1270,9 @@ int tmodel_set_traffic_model(uint32_t len, const char *body) {
  ** Traffic model stream processing **
  *************************************/
 
-static int64_t _tmodel_encode_delay(int64_t delay, tmodel_action_t obs) {
-  int64_t encoded_delay = 0;
-
-  if (obs == TMODEL_OBS_SENT_TO_ORIGIN) {
-    /* '-' gets encoded as a negative delay */
-    encoded_delay = (delay == 0) ? INTPTR_MIN : -delay;
-  } else { /* TMODEL_OBS_RECV_FROM_ORIGIN */
-    /* '+' gets encoded as a positive delay */
-    encoded_delay = (delay == 0) ? INTPTR_MAX : delay;
-  }
-
-  return encoded_delay;
-}
-
-static int64_t _tmodel_decode_delay(int64_t encoded_delay,
-    tmodel_action_t* obs_out) {
-  tmodel_action_t obs = TMODEL_OBS_NONE;
-  int64_t delay = 0;
-
-  if (encoded_delay == INTPTR_MIN) {
-    delay = 0;
-    obs = TMODEL_OBS_SENT_TO_ORIGIN;
-  } else if (encoded_delay == INTPTR_MAX) {
-    delay = 0;
-    obs = TMODEL_OBS_RECV_FROM_ORIGIN;
-  } else if (encoded_delay < 0) {
-    delay = -encoded_delay;
-    obs = TMODEL_OBS_SENT_TO_ORIGIN;
-  } else {
-    delay = encoded_delay;
-    obs = TMODEL_OBS_RECV_FROM_ORIGIN;
-  }
-
-  if (obs_out) {
-    *obs_out = obs;
-  }
-
-  return delay;
-}
-
-static uint _tmodel_hmm_get_obs_action_index(tmodel_hmm_t* hmm, tmodel_action_t obs) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
-
-  const char* obs_str;
-
-  if(obs == TMODEL_OBS_SENT_TO_ORIGIN) {
-    obs_str = TMODEL_OBS_RECV_STR;
-  } else if(obs == TMODEL_OBS_RECV_FROM_ORIGIN) {
-    obs_str = TMODEL_OBS_SENT_STR;
-  } else {
-    obs_str = TMODEL_OBS_DONE_STR;
-  }
-
-  for(uint i = 0; i < hmm->num_obs; i++) {
-    if (strncasecmp(obs_str, hmm->obs_space[i], TMODEL_MAX_OBS_STR_LEN) == 0) {
-      return i;
-    }
-  }
-
-  log_warn(LD_GENERAL, "Unable to find index for observation code %i", (int)obs);
-  return UINT_MAX;
-}
-
 static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
     uint* viterbi_path, uint path_len) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   if(!observations || !viterbi_path ||
       path_len != (uint)smartlist_len(observations)) {
@@ -1128,9 +1281,7 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
     return NULL;
   }
 
-  tmodel_action_t obs;
   uint obs_index, state_index;
-  int64_t delay, encoded_delay;
 
   /* our json object will be something like:
    *   [["m10s1";"+";35432];["m2s4";"+";0];["m4s2";"-";100];["m4sEnd";"F";0]]
@@ -1163,15 +1314,9 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
   int num_printed = 0;
 
   for(uint i = 0; i < path_len; i++) {
-    encoded_delay = (int64_t)smartlist_get(observations, i);
-    delay = _tmodel_decode_delay(encoded_delay, &obs);
+    tmodel_delay_t* d = smartlist_get(observations, i);
 
-    /* last packet is 'F' */
-    if(i > 0 && i == path_len-1) {
-      obs = TMODEL_OBS_DONE;
-    }
-
-    obs_index = _tmodel_hmm_get_obs_action_index(hmm, obs);
+    obs_index = _tmodel_hmm_obstype_to_index(hmm, d->otype);
     state_index = viterbi_path[i];
 
     /* sanity check */
@@ -1188,7 +1333,7 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
         "[\"%s\";\"%s\";"I64_FORMAT"]%s",
         hmm->state_space[state_index],
         hmm->obs_space[obs_index],
-        I64_PRINTF_ARG(delay),
+        I64_PRINTF_ARG(d->delay),
         (i == path_len-1) ? "" : ";");
 
     if(num_printed <= 0) {
@@ -1251,7 +1396,7 @@ static double _compute_delay_log(double dx, double mu, double sigma) {
 }
 
 static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_HMM_MAGIC);
+  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   /* our goal is to find the viterbi path and encode it as a json string */
   char* viterbi_json = NULL;
@@ -1259,9 +1404,10 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   const uint n_states = hmm->num_states;
   const uint n_obs = (uint)smartlist_len(observations);
 
-  /* don't do any unnecessary work, and prevent array index underflow */
-  if(n_obs <= 0) {
-    log_info(LD_GENERAL, "Not running viterbi algorithm on stream with no packets.");
+  /* don't do any unnecessary work, and prevent array index underflow.
+   * we must have at least one of ('+','-') or ('$') and also an ('F') event */
+  if(n_obs <= 1) {
+    log_info(LD_GENERAL, "Not running viterbi algorithm with no observations.");
     return viterbi_json;
   }
 
@@ -1283,20 +1429,12 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   log_info(LD_GENERAL, "State setup done, running viterbi algorithm now");
 
   /* get some info about the first packet */
-  int64_t encoded_delay = (int64_t)smartlist_get(observations, 0);
-  tmodel_action_t obs_type;
-  int64_t delay = _tmodel_decode_delay(encoded_delay, &obs_type);
+  tmodel_delay_t* d = smartlist_get(observations, 0);
 
-  double dx = _compute_delay_dx(delay);
-
-  /* if the first packet is the last packet, obs should be 'F'.
-   * TODO currently, start states don't have an 'F' option... */
-//  if(n_packets == 1) {
-//    obs = TMODEL_OBS_DONE;
-//  }
+  double dx = _compute_delay_dx(d->delay);
 
   /* get the obs name index into the obs space */
-  uint obs_index = _tmodel_hmm_get_obs_action_index(hmm, obs_type);
+  uint obs_index = _tmodel_hmm_obstype_to_index(hmm, d->otype);
   if(obs_index >= hmm->num_obs) {
     log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
         "for observation 0/%u", obs_index, n_obs-1);
@@ -1314,45 +1452,49 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
     double dp = hmm->emit_dp[i][obs_index];
     double mu = hmm->emit_mu[i][obs_index];
     double sigma = hmm->emit_sigma[i][obs_index];
+    double lambda = hmm->emit_lambda[i][obs_index];
 
-    if(dp <= 0 || sigma <= 0) {
+    if(dp <= 0 || (sigma <= 0 && lambda <= 0)) {
       continue;
     }
 
-    double log_prob = _compute_delay_log(dx, mu, sigma);
-    double fit_prob = log(dp) + log_prob;
-    double prob = log(hmm->start_prob[i]) + fit_prob;
+    /* compute the probability of this observation occurring
+     * in this state given the observed delay value. */
+    double fit_logprob = 0.0;
 
-    table1[i][0] = prob;
+    if(sigma > 0) {
+      /* this state uses a lognormal distribution */
+      fit_logprob = log(dp) + _compute_delay_log(dx, mu, sigma);
+    } else {
+      /* this state uses an exponential distribution */
+      //double streams_per_microsecond = ((double)1.0) / ((double)d->delay);
+      fit_logprob = log(dp) + 0; // XXX FIXME TODO replace 0 with correct val
+    }
+
+    table1[i][0] = log(hmm->start_prob[i]) + fit_logprob;
   }
 
   /* loop through all packets/streams (except the first) */
-  for(uint p = 1; p < n_obs; p++) {
-    encoded_delay = (int64_t)smartlist_get(observations, p);
-    delay = _tmodel_decode_delay(encoded_delay, &obs_type);
+  for(uint o = 1; o < n_obs; o++) {
+    d = smartlist_get(observations, o);
 
-    dx = _compute_delay_dx(delay);
-
-    /* if this is the last packet/stream, it should be 'F' */
-    if(p == n_obs-1) {
-      obs_type = TMODEL_OBS_DONE;
-    }
+    dx = _compute_delay_dx(d->delay);
 
     /* get the obs name index in the obs space */
-    obs_index = _tmodel_hmm_get_obs_action_index(hmm, obs_type);
+    obs_index = _tmodel_hmm_obstype_to_index(hmm, d->otype);
     if(obs_index >= hmm->num_obs) {
       log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
-          "for observation %u/%u", obs_index, p, n_obs-1);
+          "for observation %u/%u", obs_index, o, n_obs-1);
       goto cleanup; // will return NULL
     }
 
     /* loop through the state space */
     for(uint i = 0; i < n_states; i++) {
-      table1[i][p] = -INFINITY;
-      table2[i][p] = UINT_MAX;
+      table1[i][o] = -INFINITY;
+      table2[i][o] = UINT_MAX;
 
-      double max_trans_prob = -INFINITY;
-      uint max_trans_prob_prev_state = UINT_MAX;
+      double max_trans_logprob = -INFINITY;
+      uint max_trans_logprob_prev_state = UINT_MAX;
 
       /* Compute the maximum probability over all incoming edges
        * to state i, using the probability of the state at the
@@ -1363,35 +1505,58 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
           continue;
         }
 
-        double trans_prob = table1[j][p-1] + log(hmm->trans_prob[j][i]);
+        double trans_prob = table1[j][o-1] + log(hmm->trans_prob[j][i]);
 
-        if(trans_prob > max_trans_prob) {
-          max_trans_prob = trans_prob;
-          max_trans_prob_prev_state = j;
+        if(trans_prob > max_trans_logprob) {
+          max_trans_logprob = trans_prob;
+          max_trans_logprob_prev_state = j;
         }
       }
 
-      table2[i][p] = max_trans_prob_prev_state;
+      table2[i][o] = max_trans_logprob_prev_state;
 
       double dp = hmm->emit_dp[i][obs_index];
-      double mu = hmm->emit_mu[i][obs_index];
-      double sigma = hmm->emit_sigma[i][obs_index];
 
-      if(dp <= 0 || sigma <= 0) {
+      if(dp <= 0) {
         continue;
       }
 
-      double log_prob = _compute_delay_log(dx, mu, sigma);
-      double fit_prob = log(dp) + log_prob;
+      if(d->otype == TMODEL_OBSTYPE_PACKETS_FINISHED ||
+          d->otype == TMODEL_OBSTYPE_STREAMS_FINISHED) {
+        /* for 'F', we have no delay or distribution params */
+        table1[i][o] = max_trans_logprob + log(dp);
+        continue;
+      }
+
+      double mu = hmm->emit_mu[i][obs_index];
+      double sigma = hmm->emit_sigma[i][obs_index];
+      double lambda = hmm->emit_lambda[i][obs_index];
+
+      if(sigma <= 0 && lambda <= 0) {
+        continue;
+      }
+
+      /* compute the probability of this observation occurring
+       * in this state given the observed delay value. */
+      double fit_logprob = 0.0;
+
+      if(sigma > 0) {
+        /* this state uses a lognormal distribution */
+        fit_logprob = log(dp) + _compute_delay_log(dx, mu, sigma);
+      } else {
+        /* this state uses an exponential distribution */
+        //double streams_per_microsecond = ((double)1.0) / ((double)d->delay);
+        fit_logprob = log(dp) + 0; // XXX FIXME TODO replace 0 with correct val
+      }
 
       /* store the max prob and prev state index for this packet/stream.
        * note that the case that this state has no positive trans_prob
        * is valid and it's OK if the max_prob is 0 for some states. */
-      table1[i][p] = max_trans_prob + fit_prob;
+      table1[i][o] = max_trans_logprob + fit_logprob;
 
       log_debug(LD_GENERAL,
           "Viterbi probability for state %u at observation %u/%u is %f",
-          i, p, n_obs-1, table1[i][p]);
+          i, o, n_obs-1, table1[i][o]);
     }
   }
 
@@ -1458,84 +1623,92 @@ cleanup:
   return viterbi_json;
 }
 
-static void _tmodel_packets_commit_packets(tmodel_packets_t* tpackets) {
-  tor_assert(tpackets && tpackets->magic == TRAFFIC_PACKETS_MAGIC);
+static void _tmodel_packets_commit_packets(tmodel_packets_t* tpackets,
+    int64_t elapsed) {
+  tor_assert(tpackets && tpackets->magic == TRAFFIC_MAGIC_PACKETS);
 
   /* do nothing if we have no packets */
   if (tpackets->buf_length <= 0) {
     return;
   }
 
-  /* first 'packet' gets all of the accumulated delay */
-  int64_t delay = _tmodel_encode_delay(tpackets->buf_delay, tpackets->buf_obs);
-
-  /* 'commit' the packet */
-  smartlist_add(tpackets->packets, (void*) delay);
-
-  /* consume the packet length worth of data */
-  if (tpackets->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
-    tpackets->buf_length -= TMODEL_PACKET_BYTE_COUNT;
-  } else {
-    tpackets->buf_length = 0;
-  }
-
-  /* now process any remaining packets */
-  while (tpackets->buf_length > 0) {
+  /* all but the last packet have no delay until the following packet */
+  while (tpackets->buf_length > TMODEL_PACKET_BYTE_COUNT) {
     /* consecutive packets have no delay */
-    delay = _tmodel_encode_delay((int64_t) 0, tpackets->buf_obs);
-
-    /* 'commit' the packet */
-    smartlist_add(tpackets->packets, (void*) delay);
+    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
+    d->delay = 0;
+    d->otype = tpackets->buf_obstype;
+    smartlist_add(tpackets->packets, d);
 
     /* consume the packet length worth of data */
-    if (tpackets->buf_length >= TMODEL_PACKET_BYTE_COUNT) {
-      tpackets->buf_length -= TMODEL_PACKET_BYTE_COUNT;
-    } else {
-      tpackets->buf_length = 0;
-    }
+    tpackets->buf_length -= TMODEL_PACKET_BYTE_COUNT;
   }
 
-  /* update this emission time as the previous emit time
-   * so we can compute delays for future packets. */
-  tpackets->prev_emit_time = tpackets->buf_emit_time;
+  /* then the last packet gets assigned all of the elasped delay
+   * from when we started 'buffering' until now */
+  tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
+  d->delay = elapsed;
+  d->otype = tpackets->buf_obstype;
+  smartlist_add(tpackets->packets, d);
 
   /* all of the buffered data has been committed */
   tpackets->buf_length = 0;
-  memset(&tpackets->buf_emit_time, 0, sizeof(monotime_t));
-  tpackets->buf_delay = 0;
-  tpackets->buf_obs = TMODEL_OBS_NONE;
 }
 
-/* notify the traffic model that a stream transmitted a cell. */
-void tmodel_packets_cell_transferred(tmodel_packets_t* tpackets, size_t length,
-    tmodel_action_t obs) {
-  tor_assert(tpackets && tpackets->magic == TRAFFIC_PACKETS_MAGIC);
+void tmodel_packets_observation(tmodel_packets_t* tpackets,
+    tmodel_obs_type_t otype, size_t payload_length) {
+  tor_assert(tpackets && tpackets->magic == TRAFFIC_MAGIC_PACKETS);
 
   /* just in case, don't do unnecessary work */
   if (!tmodel_is_active()) {
     return;
   }
 
+  /* make sure we actually have a payload */
+  if(otype != TMODEL_OBSTYPE_PACKETS_FINISHED &&
+      payload_length == 0) {
+    return;
+  }
+
+  /* should be a packet-related observation */
+  if(otype != TMODEL_OBSTYPE_PACKET_RECV_FROM_ORIGIN &&
+      otype != TMODEL_OBSTYPE_PACKET_SENT_TO_ORIGIN &&
+      otype != TMODEL_OBSTYPE_PACKETS_FINISHED) {
+    return;
+  }
+
   monotime_t now;
   monotime_get(&now);
 
-  /* check if we need to 'commit' any previous data */
   if (tpackets->buf_length > 0) {
-    int64_t elapsed = monotime_diff_usec(&tpackets->buf_emit_time, &now);
-    if (elapsed >= TMODEL_PACKET_TIME_TOLERENCE || tpackets->buf_obs != obs) {
-      _tmodel_packets_commit_packets(tpackets);
+    /* check if we need to 'commit' any previously 'buffered' data */
+    int64_t elapsed = monotime_diff_usec(&tpackets->buf_time, &now);
+
+    /* we commit previous data if enough time has passed,
+     * or the observation type changes */
+    if (elapsed >= TMODEL_PACKET_TIME_TOLERENCE ||
+        tpackets->buf_obstype != otype) {
+      log_debug(LD_GENERAL, "Committing packets of type %i with elapsed %lli, buf type %i",
+          (int)otype, (long long int)elapsed, (int)tpackets->buf_obstype);
+      _tmodel_packets_commit_packets(tpackets, elapsed);
     }
   }
 
-  /* start tracking new data */
-  if (length > 0) {
-    if (tpackets->buf_length == 0) {
-      tpackets->buf_obs = obs;
-      tpackets->buf_emit_time = now;
-      tpackets->buf_delay = monotime_diff_usec(&tpackets->prev_emit_time,
-          &tpackets->buf_emit_time);
-    }
-    tpackets->buf_length += length;
+  /* initialize the buffer if empty */
+  if (tpackets->buf_length == 0) {
+    tpackets->buf_obstype = otype;
+    tpackets->buf_time = now;
+  }
+
+  if(otype == TMODEL_OBSTYPE_PACKETS_FINISHED) {
+    /* 'commit' the observation */
+    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
+    d->delay = 0;
+    d->otype = TMODEL_OBSTYPE_PACKETS_FINISHED;
+    smartlist_add(tpackets->packets, (void*) d);
+  } else {
+    /* start tracking the new data */
+    tpackets->buf_length += payload_length;
   }
 }
 
@@ -1548,10 +1721,9 @@ tmodel_packets_t* tmodel_packets_new(void) {
   }
 
   tmodel_packets_t* tpackets = tor_malloc_zero_(sizeof(struct tmodel_packets_s));
-  tpackets->magic = TRAFFIC_PACKETS_MAGIC;
+  tpackets->magic = TRAFFIC_MAGIC_PACKETS;
 
   monotime_get(&tpackets->creation_time);
-  tpackets->prev_emit_time = tpackets->creation_time;
 
   /* store packet delay times in the element pointers */
   tpackets->packets = smartlist_new();
@@ -1559,75 +1731,189 @@ tmodel_packets_t* tmodel_packets_new(void) {
   return tpackets;
 }
 
-static void _tmodel_handle_viterbi_result(char* viterbi_json) {
+static void _tmodel_handle_viterbi_result(char* viterbi_json,
+    tmodel_packets_t* tpackets, tmodel_streams_t* tstreams) {
   if(viterbi_json != NULL) {
     /* send the viterbi json result */
-    control_event_privcount_viterbi(viterbi_json);
+    if(tpackets) {
+      control_event_privcount_viterbi_packets(viterbi_json);
+    } else if(tstreams) {
+      control_event_privcount_viterbi_streams(viterbi_json);
+    }
     free(viterbi_json);
   } else {
     /* send a json empty list to signal an error */
     char* empty_list = strndup("[]", 2);
-    control_event_privcount_viterbi(empty_list);
+    if(tpackets) {
+      control_event_privcount_viterbi_packets(empty_list);
+    } else if(tstreams) {
+      control_event_privcount_viterbi_streams(empty_list);
+    }
     free(empty_list);
   }
 }
 
 static void _tmodel_packets_free_helper(tmodel_packets_t* tpackets) {
-  tor_assert(tpackets && tpackets->magic == TRAFFIC_PACKETS_MAGIC);
+  tor_assert(tpackets && tpackets->magic == TRAFFIC_MAGIC_PACKETS);
 
-  /* we had no need to dynamically allocate any memory other
-   * than the element pointers used internally by the list. */
+  SMARTLIST_FOREACH_BEGIN(tpackets->packets, tmodel_delay_t*, delay) {
+    if(delay) {
+      tor_free_(delay);
+    }
+  } SMARTLIST_FOREACH_END(delay);
+
   smartlist_free(tpackets->packets);
 
   tpackets->magic = 0;
   tor_free_(tpackets);
 }
 
-/* notify the traffic model that the stream closed and should
- * be processed and freed. */
-void tmodel_packets_free(tmodel_packets_t* tpackets) {
-  tor_assert(tpackets && tpackets->magic == TRAFFIC_PACKETS_MAGIC);
+static void _tmodel_streams_free_helper(tmodel_streams_t* tstreams) {
+  tor_assert(tstreams && tstreams->magic == TRAFFIC_MAGIC_STREAMS);
 
-  /* the stream is finished, we have all of the data we are going to get. */
-  if (tmodel_is_active()) {
-    /* commit any leftover data */
-    _tmodel_packets_commit_packets(tpackets);
-
-    /* process a finished stream.
-     * run viterbi to get the best HMM path for this stream, and then
-     * send the json result string to PrivCount over the control port. */
-    int num_workers = get_options()->PrivCountNumViterbiWorkers;
-    if(num_workers > 0) {
-      /* Run this task in the viterbi worker thread pool.
-       * If we started with no workers and then changed the
-       * config partway through a collection, we need to
-       * make sure the thread pool is initialized (which
-       * also would sync the traffic model in the process). */
-      _viterbi_workers_init((uint)num_workers);
+  SMARTLIST_FOREACH_BEGIN(tstreams->streams, tmodel_delay_t*, delay) {
+    if(delay) {
+      tor_free_(delay);
     }
+  } SMARTLIST_FOREACH_END(delay);
 
-    if(num_workers > 0 && _viterbi_thread_pool_is_ready()) {
-      /* the thread pool will run the task, and the result will get
-       * processed and then freed in _viterbi_worker_handle_reply. */
-      _viterbi_worker_assign_stream(tpackets);
-    } else {
-      /* just run the task now in the main thread using the main
-       * thread instance of the traffic model. */
+  smartlist_free(tstreams->streams);
+
+  tstreams->magic = 0;
+  tor_free_(tstreams);
+}
+
+static void _tmodel_process_models(tmodel_packets_t* tpackets,
+    tmodel_streams_t* tstreams) {
+  /* process a finished stream.
+   * run viterbi to get the best HMM path for this stream, and then
+   * send the json result string to PrivCount over the control port. */
+  int num_workers = get_options()->PrivCountNumViterbiWorkers;
+  if(num_workers > 0) {
+    /* Run this task in the viterbi worker thread pool.
+     * If we started with no workers and then changed the
+     * config partway through a collection, we need to
+     * make sure the thread pool is initialized (which
+     * also would sync the traffic model in the process). */
+    _viterbi_workers_init((uint)num_workers);
+  }
+
+  if(num_workers > 0 && _viterbi_thread_pool_is_ready()) {
+    /* the thread pool will run the task, and the result will get
+     * processed and then freed in _viterbi_worker_handle_reply. */
+    _viterbi_worker_assign(tpackets, tstreams);
+  } else {
+    /* just run the task now in the main thread using the main
+     * thread instance of the traffic model. */
+    if(tpackets) {
       char* viterbi_json = _tmodel_run_viterbi(
           global_traffic_model->hmm_packets, tpackets->packets);
 
       /* send the appropriate event to PrivCount.
        * after calling this function, viterbi_json is invalid. */
-      _tmodel_handle_viterbi_result(viterbi_json);
+      _tmodel_handle_viterbi_result(viterbi_json, tpackets, NULL);
 
-      /* free the stream data */
+      /* free the data */
       _tmodel_packets_free_helper(tpackets);
     }
+
+    if(tstreams) {
+      char* viterbi_json = _tmodel_run_viterbi(
+          global_traffic_model->hmm_streams, tstreams->streams);
+
+      /* send the appropriate event to PrivCount.
+       * after calling this function, viterbi_json is invalid. */
+      _tmodel_handle_viterbi_result(viterbi_json, NULL, tstreams);
+
+      /* free the data */
+      _tmodel_streams_free_helper(tstreams);
+    }
+  }
+}
+
+/* notify the traffic model that the stream closed and should
+ * be processed and freed. */
+void tmodel_packets_free(tmodel_packets_t* tpackets) {
+  tor_assert(tpackets && tpackets->magic == TRAFFIC_MAGIC_PACKETS);
+
+  /* the stream is finished, we have all of the data we are going to get. */
+  if (tmodel_is_active()) {
+    /* process a finished list of observed packets. */
+    _tmodel_process_models(tpackets, NULL);
   } else {
     /* We are no longer active and don't need to process the
-     * stream. Just go ahead and free the memory. */
+     * packet list. Just go ahead and free the memory. */
     _tmodel_packets_free_helper(tpackets);
   }
+}
+
+void tmodel_streams_free(tmodel_streams_t* tstreams) {
+  tor_assert(tstreams && tstreams->magic == TRAFFIC_MAGIC_STREAMS);
+
+  /* the stream is finished, we have all of the data we are going to get. */
+  if (tmodel_is_active()) {
+    /* process a finished list of observed packets. */
+    _tmodel_process_models(NULL, tstreams);
+  } else {
+    /* We are no longer active and don't need to process the
+     * packet list. Just go ahead and free the memory. */
+    _tmodel_streams_free_helper(tstreams);
+  }
+}
+
+void tmodel_streams_observation(tmodel_streams_t* tstreams,
+    tmodel_obs_type_t otype) {
+  tor_assert(tstreams && tstreams->magic == TRAFFIC_MAGIC_STREAMS);
+
+  /* just in case, don't do unnecessary work */
+  if (!tmodel_is_active()) {
+    return;
+  }
+
+  /* should be a stream-related observation */
+  if(otype != TMODEL_OBSTYPE_STREAM_NEW &&
+      otype != TMODEL_OBSTYPE_STREAMS_FINISHED) {
+    return;
+  }
+
+  monotime_t now;
+  monotime_get(&now);
+
+  if(tstreams->buf_obstype != 0) {
+    /* commit the previous stream info */
+    int64_t elapsed = monotime_diff_usec(&tstreams->buf_time, &now);
+    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
+    d->delay = elapsed;
+    d->otype = tstreams->buf_obstype;
+    smartlist_add(tstreams->streams, d);
+  }
+
+  tstreams->buf_obstype = otype;
+  tstreams->buf_time = now;
+
+  if(otype == TMODEL_OBSTYPE_STREAMS_FINISHED) {
+    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
+    d->delay = 0;
+    d->otype = TMODEL_OBSTYPE_STREAMS_FINISHED;
+    smartlist_add(tstreams->streams, d);
+  }
+}
+
+tmodel_streams_t* tmodel_streams_new(void) {
+  /* just in case, don't do unnecessary work */
+  if (!tmodel_is_active()) {
+    return NULL;
+  }
+
+  tmodel_streams_t* tstreams = tor_malloc_zero_(sizeof(struct tmodel_streams_s));
+  tstreams->magic = TRAFFIC_MAGIC_STREAMS;
+
+  monotime_get(&tstreams->creation_time);
+
+  /* store stream delay times in the element pointers */
+  tstreams->streams = smartlist_new();
+
+  return tstreams;
 }
 
 /******************************
@@ -1644,12 +1930,15 @@ typedef struct viterbi_worker_state_s {
 
 typedef struct viterbi_worker_job_s {
   tmodel_packets_t* tpackets;
+  tmodel_streams_t* tstreams;
   char* viterbi_result;
 } viterbi_worker_job_t;
 
-static viterbi_worker_job_t* _viterbi_job_new(tmodel_packets_t* tpackets) {
+static viterbi_worker_job_t* _viterbi_job_new(
+    tmodel_packets_t* tpackets, tmodel_streams_t* tstreams) {
   viterbi_worker_job_t* job = calloc(1, sizeof(viterbi_worker_job_t));
   job->tpackets = tpackets;
+  job->tstreams = tstreams;
   return job;
 }
 
@@ -1657,6 +1946,9 @@ static void _viterbi_job_free(viterbi_worker_job_t* job) {
   if(job) {
     if(job->tpackets) {
       _tmodel_packets_free_helper(job->tpackets);
+    }
+    if(job->tstreams) {
+      _tmodel_streams_free_helper(job->tstreams);
     }
     if(job->viterbi_result) {
       free(job->viterbi_result);
@@ -1675,27 +1967,30 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
 
   if(!state) {
     log_warn(LD_BUG, "Viterbi worker state is NULL in work function.");
-
-  }
-
-  if(!state->thread_traffic_model) {
-    log_warn(LD_BUG, "Viterbi worker traffic model is NULL in work function.");
   }
 
   if(!job) {
     log_warn(LD_BUG, "Viterbi worker job is NULL in work function.");
   }
 
-  if(!job->tpackets) {
-    log_warn(LD_BUG, "Viterbi worker traffic stream is NULL in work function.");
+  if(!job->tpackets && !job->tstreams) {
+    log_warn(LD_BUG, "Viterbi worker packets and streams are both NULL in work function.");
   }
 
-  if(state && state->thread_traffic_model && job && job->tpackets) {
+  /* its OK if the traffic model is NULL, it means we synced with
+   * a NULL model while we still had jobs to finish */
+  if(state && state->thread_traffic_model && job &&
+      (job->tpackets || job->tstreams)) {
     /* if we make it here, we can run the viterbi algorithm.
      * The result will be stored in the job object, and handled
      * by the main thread in the handle_reply function. */
-    job->viterbi_result = _tmodel_run_viterbi(
-        state->thread_traffic_model->hmm_packets, job->tpackets->packets);
+    if(job->tpackets) {
+      job->viterbi_result = _tmodel_run_viterbi(
+          state->thread_traffic_model->hmm_packets, job->tpackets->packets);
+    } else if(job->tstreams) {
+      job->viterbi_result = _tmodel_run_viterbi(
+          state->thread_traffic_model->hmm_streams, job->tstreams->streams);
+    }
   }
 
   return WQ_RPL_REPLY;
@@ -1707,15 +2002,13 @@ static void _viterbi_worker_handle_reply(void* job_arg) {
   viterbi_worker_job_t* job = job_arg;
   if(job) {
     /* count the result, and free the string. */
-    _tmodel_handle_viterbi_result(job->viterbi_result);
+    _tmodel_handle_viterbi_result(job->viterbi_result, job->tpackets, job->tstreams);
     /* the above frees the string, so don't double free */
     job->viterbi_result = NULL;
     /* free the job */
     _viterbi_job_free(job);
   } else {
     log_warn(LD_BUG, "Viterbi job is NULL in reply.");
-    /* count as failure */
-    _tmodel_handle_viterbi_result(NULL);
   }
 }
 
@@ -1729,7 +2022,7 @@ static void _viterbi_worker_assign_job(viterbi_worker_job_t* job) {
   if(!queue_entry) {
     log_warn(LD_BUG, "Unable to queue work on viterbi thread pool.");
     /* count this as a failure */
-    _tmodel_handle_viterbi_result(NULL);
+    _tmodel_handle_viterbi_result(NULL, job->tpackets, job->tstreams);
     /* free the job */
     _viterbi_job_free(job);
   }
@@ -1737,10 +2030,22 @@ static void _viterbi_worker_assign_job(viterbi_worker_job_t* job) {
 
 /* Create a job for the thread pool.
  * This function is run in the main thread. */
-static void _viterbi_worker_assign_stream(tmodel_packets_t* tpackets) {
+static void _viterbi_worker_assign(tmodel_packets_t* tpackets,
+    tmodel_streams_t* tstreams) {
   /* create job that has the stream in it */
-  viterbi_worker_job_t* job = _viterbi_job_new(tpackets);
+  viterbi_worker_job_t* job = _viterbi_job_new(tpackets, tstreams);
   _viterbi_worker_assign_job(job);
+}
+
+static void _viterbi_worker_log_model(tmodel_hmm_t* hmm, const char* name) {
+  if(hmm) {
+    log_notice(LD_GENERAL, "Successfully copied traffic %s model "
+              "with %u states in the state_space, %u actions in the "
+              "in the observation_space, and %u possible transitions "
+              "for a thread",
+              name, hmm->num_states, hmm->num_obs,
+              hmm->num_states*hmm->num_states);
+  }
 }
 
 static void * _viterbi_worker_state_new(void *arg) {
@@ -1756,14 +2061,9 @@ static void * _viterbi_worker_state_new(void *arg) {
   }
   tor_mutex_release(global_traffic_model_lock);
 
-  if(state->thread_traffic_model && state->thread_traffic_model->hmm_packets) {
-    log_notice(LD_GENERAL, "Successfully copied traffic model "
-          "with %u states in the state_space, %u actions in the "
-          "in the observation_space, and %u possible transitions "
-          "for a thread",
-          state->thread_traffic_model->hmm_packets->num_states,
-          state->thread_traffic_model->hmm_packets->num_obs,
-          state->thread_traffic_model->hmm_packets->num_states*state->thread_traffic_model->hmm_packets->num_states);
+  if(state->thread_traffic_model){
+    _viterbi_worker_log_model(state->thread_traffic_model->hmm_packets, "packet");
+    _viterbi_worker_log_model(state->thread_traffic_model->hmm_streams, "stream");
   } else {
     log_notice(LD_GENERAL, "Setting traffic model for a thread to NULL");
   }
