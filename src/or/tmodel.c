@@ -1468,7 +1468,7 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
     } else {
       /* this state uses an exponential distribution */
       //double streams_per_microsecond = ((double)1.0) / ((double)d->delay);
-      fit_logprob = log(dp) + 0; // XXX FIXME TODO replace 0 with correct val
+      fit_logprob = log(dp) + log(lambda) - lambda*dx;
     }
 
     table1[i][0] = log(hmm->start_prob[i]) + fit_logprob;
@@ -1546,7 +1546,7 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
       } else {
         /* this state uses an exponential distribution */
         //double streams_per_microsecond = ((double)1.0) / ((double)d->delay);
-        fit_logprob = log(dp) + 0; // XXX FIXME TODO replace 0 with correct val
+        fit_logprob = log(dp) + log(lambda) - lambda*dx;
       }
 
       /* store the max prob and prev state index for this packet/stream.
