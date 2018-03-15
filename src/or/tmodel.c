@@ -1805,7 +1805,7 @@ static void _tmodel_process_models(tmodel_packets_t* tpackets,
   } else {
     /* just run the task now in the main thread using the main
      * thread instance of the traffic model. */
-    if(tpackets) {
+    if(tpackets && global_traffic_model->hmm_packets) {
       char* viterbi_json = _tmodel_run_viterbi(
           global_traffic_model->hmm_packets, tpackets->packets);
 
@@ -1817,7 +1817,7 @@ static void _tmodel_process_models(tmodel_packets_t* tpackets,
       _tmodel_packets_free_helper(tpackets);
     }
 
-    if(tstreams) {
+    if(tstreams && global_traffic_model->hmm_streams) {
       char* viterbi_json = _tmodel_run_viterbi(
           global_traffic_model->hmm_streams, tstreams->streams);
 
@@ -1984,10 +1984,10 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
     /* if we make it here, we can run the viterbi algorithm.
      * The result will be stored in the job object, and handled
      * by the main thread in the handle_reply function. */
-    if(job->tpackets) {
+    if(job->tpackets && state->thread_traffic_model->hmm_packets) {
       job->viterbi_result = _tmodel_run_viterbi(
           state->thread_traffic_model->hmm_packets, job->tpackets->packets);
-    } else if(job->tstreams) {
+    } else if(job->tstreams && state->thread_traffic_model->hmm_streams) {
       job->viterbi_result = _tmodel_run_viterbi(
           state->thread_traffic_model->hmm_streams, job->tstreams->streams);
     }
@@ -2062,8 +2062,12 @@ static void * _viterbi_worker_state_new(void *arg) {
   tor_mutex_release(global_traffic_model_lock);
 
   if(state->thread_traffic_model){
-    _viterbi_worker_log_model(state->thread_traffic_model->hmm_packets, "packet");
-    _viterbi_worker_log_model(state->thread_traffic_model->hmm_streams, "stream");
+    if(state->thread_traffic_model->hmm_packets) {
+      _viterbi_worker_log_model(state->thread_traffic_model->hmm_packets, "packet");
+    }
+    if(state->thread_traffic_model->hmm_streams) {
+      _viterbi_worker_log_model(state->thread_traffic_model->hmm_streams, "stream");
+    }
   } else {
     log_notice(LD_GENERAL, "Setting traffic model for a thread to NULL");
   }
