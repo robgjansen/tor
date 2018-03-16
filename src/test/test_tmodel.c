@@ -16,7 +16,7 @@
 #include "test_helpers.h"
 
 #define PACKET_MODEL_DICT "{\"observation_space\":[\"+\";\"-\";\"F\"];\"emission_probability\":{\"s1\":{\"+\":[0.1;3.8;1.7;0.0];\"-\":[0.9;1.4;0.9;0.0]};\"s0\":{\"+\":[0.8;12.0;0.01;0.0];\"-\":[0.2;5.5;3.0;0.0]};\"End\":{\"F\":[1.0]}};\"state_space\":[\"s0\";\"s1\";\"End\"];\"transition_probability\":{\"s1\":{\"s0\":0.5;\"End\":0.5};\"s0\":{\"s1\":0.25;\"s0\":0.75};\"End\":{}};\"start_probability\":{\"s1\":0.8;\"s0\":0.2}}"
-#define STREAM_MODEL_DICT "{\"observation_space\":[\"$\";\"F\"];\"emission_probability\":{\"s2End\":{\"F\":[1.0]};\"s1Dwell\":{\"$\":[1.0;2980957.987041;1.36;0.0]};\"s0Active\":{\"$\":[1.0;0.0;0.0;0.00015]}};\"state_space\":[\"s0Active\";\"s1Dwell\";\"s2End\"];\"transition_probability\":{\"s2End\":{};\"s1Dwell\":{\"s2End\":0.34;\"s1Dwell\":0.495;\"s0Active\":0.165};\"s0Active\":{\"s2End\":0.34;\"s1Dwell\":0.165;\"s0Active\":0.495}};\"start_probability\":{\"s2End\":0.0;\"s1Dwell\":0.5;\"s0Active\":0.5}}"
+#define STREAM_MODEL_DICT "{\"observation_space\":[\"$\";\"F\"];\"emission_probability\":{\"s2End\":{\"F\":[1.0]};\"s1Dwell\":{\"$\":[1.0;14.907755;1.36;0.0]};\"s0Active\":{\"$\":[1.0;0.0;0.0;0.00015]}};\"state_space\":[\"s0Active\";\"s1Dwell\";\"s2End\"];\"transition_probability\":{\"s2End\":{};\"s1Dwell\":{\"s2End\":0.34;\"s1Dwell\":0.495;\"s0Active\":0.165};\"s0Active\":{\"s2End\":0.34;\"s1Dwell\":0.165;\"s0Active\":0.495}};\"start_probability\":{\"s2End\":0.0;\"s1Dwell\":0.5;\"s0Active\":0.5}}"
 const char* tmodel_str =
     "TRUE {\"packet_model\":"PACKET_MODEL_DICT";\"stream_model\":"STREAM_MODEL_DICT"}";
 const char* packet_model_str =
@@ -28,10 +28,24 @@ const char* viterbi_packets_str =
     "[[\"s1\";\"+\";1000];[\"s0\";\"+\";1000];[\"s0\";\"-\";1000];[\"s1\";\"-\";1000];[\"End\";\"F\";0]]";
 const char* viterbi_streams_str =
     "[[\"s0Active\";\"$\";1000];[\"s0Active\";\"$\";1000];[\"s0Active\";\"$\";1000];[\"s2End\";\"F\";0]]";
+const char* viterbi_streams_dwell_str =
+    "[[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s2End\";\"F\";0]]";
+
 
 static void
 control_event_privcount_viterbi_mock(char* viterbi_result) {
   tt_assert(viterbi_result != NULL);
+done:
+  return;
+}
+
+static void
+control_event_privcount_viterbi_dwell_mock(char* viterbi_result) {
+  printf("Viterbi result\n%s\n", viterbi_result ? viterbi_result : "[]");
+  tt_assert(viterbi_result != NULL);
+  int str_result_comp = strncasecmp(viterbi_result,
+      viterbi_streams_dwell_str, strlen(viterbi_streams_dwell_str));
+  tt_assert(str_result_comp == 0);
 done:
   return;
 }
@@ -380,6 +394,40 @@ done:
   return;
 }
 
+static void
+test_traffic_model_viterbi_streams_dwell(void *arg) {
+  (void) arg;
+
+  uint64_t now_ns = test_traffic_model_common_setup_helper(0,
+      control_event_privcount_viterbi_mock,
+      control_event_privcount_viterbi_dwell_mock);
+
+  int result = tmodel_set_traffic_model((uint32_t) strlen(tmodel_str),
+      tmodel_str);
+  tt_assert(result == 0);
+
+  tmodel_streams_t* test_circuit = tmodel_streams_new();
+  tt_assert(test_circuit);
+
+
+  for(int i = 0; i < 5; i++) {
+    tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM_NEW);
+
+    now_ns += ((uint64_t)1000) * ((uint64_t)2957929); // should cause dwell state
+    monotime_set_mock_time_nsec(now_ns);
+  }
+
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED);
+  tmodel_streams_free(test_circuit);
+
+  result = tmodel_set_traffic_model((uint32_t) 5, "FALSE");
+  tt_assert(result == 0);
+
+done:
+  test_traffic_model_common_teardown();
+  return;
+}
+
 struct testcase_t tmodel_tests[] = {
   { "parse_full", test_traffic_model_parse_full, TT_FORK, NULL, NULL },
   { "parse_streams", test_traffic_model_parse_stream_only, TT_FORK, NULL, NULL },
@@ -402,5 +450,6 @@ struct testcase_t tmodel_tests[] = {
   { "viterbi_packets_full_threads", test_traffic_model_viterbi_packets_full_threads, TT_FORK, NULL, NULL },
 
   { "viterbi_heavy_threads", test_traffic_model_viterbi_heavy_threads, TT_FORK, NULL, NULL },
+  { "viterbi_stream_dwell", test_traffic_model_viterbi_streams_dwell, TT_FORK, NULL, NULL },
   END_OF_TESTCASES
 };
