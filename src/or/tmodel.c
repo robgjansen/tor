@@ -1753,6 +1753,11 @@ tmodel_packets_t* tmodel_packets_new(void) {
     return NULL;
   }
 
+  /* if we don't want to count a packet model, we don't need to track */
+  if(global_traffic_model == NULL || global_traffic_model->hmm_packets == NULL) {
+    return NULL;
+  }
+
   tmodel_packets_t* tpackets = tor_malloc_zero_(sizeof(struct tmodel_packets_s));
   tpackets->magic = TRAFFIC_MAGIC_PACKETS;
   num_outstanding_packets++;
@@ -1940,6 +1945,11 @@ void tmodel_streams_observation(tmodel_streams_t* tstreams,
 tmodel_streams_t* tmodel_streams_new(void) {
   /* just in case, don't do unnecessary work */
   if (!tmodel_is_active()) {
+    return NULL;
+  }
+
+  /* if we don't want to count a stream model, we don't need to track */
+  if(global_traffic_model == NULL || global_traffic_model->hmm_streams == NULL) {
     return NULL;
   }
 
