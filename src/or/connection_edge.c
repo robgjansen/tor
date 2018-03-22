@@ -3552,8 +3552,10 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
         if(!circ->privcount_traffic_model_state) {
           circ->privcount_traffic_model_state = tmodel_streams_new();
         }
-        tmodel_streams_observation(circ->privcount_traffic_model_state,
-            TMODEL_OBSTYPE_STREAM_NEW);
+        if(circ->privcount_traffic_model_state) {
+          tmodel_streams_observation(circ->privcount_traffic_model_state,
+              TMODEL_OBSTYPE_STREAM_NEW);
+        }
       }
     }
   }
