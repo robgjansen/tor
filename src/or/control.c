@@ -9034,8 +9034,10 @@ control_event_privcount_viterbi_packets,(char* viterbi_result))
 
   char* ev_ts = privcount_timeval_now_to_epoch_str_dup("EventTimestamp=");
 
+  int cq_len = smartlist_len(queued_control_events);
+
   log_info(LD_GENERAL, "Emitting control event with viterbi packets path "
-      "of length %lu", viterbi_len);
+      "of length %lu, control queue length is %d", viterbi_len, cq_len);
 
   send_control_event(EVENT_PRIVCOUNT_VITERBI_PACKETS,
                      "650 PRIVCOUNT_VITERBI_PACKETS %s ViterbiPathPackets=%s\r\n",
@@ -9067,8 +9069,10 @@ control_event_privcount_viterbi_streams,(char* viterbi_result))
 
   char* ev_ts = privcount_timeval_now_to_epoch_str_dup("EventTimestamp=");
 
+  int cq_len = smartlist_len(queued_control_events);
+
   log_info(LD_GENERAL, "Emitting control event with viterbi streams path "
-      "of length %lu", viterbi_len);
+      "of length %lu, control queue length is %d", viterbi_len, cq_len);
 
   send_control_event(EVENT_PRIVCOUNT_VITERBI_STREAMS,
                      "650 PRIVCOUNT_VITERBI_STREAMS %s ViterbiPathStreams=%s\r\n",

@@ -53,9 +53,11 @@
 #define TMODEL_OBS_CODE_END "F"
 #define TMODEL_OBS_CODE_UNKNOWN "?"
 
+/* the total size of this struct should fit inside a void* pointer
+ * because we are storing this inside smartlist pointers. */
 typedef struct tmodel_delay_s {
-  int64_t delay;
-  tmodel_obs_type_t otype;
+  tmodel_obs_type_t otype : 3;
+  long unsigned int delay : ((sizeof(void*)*8)-3);
 } tmodel_delay_t;
 
 /* The tmodel_packets internal elements (see tmodel.h for typedef).
@@ -168,6 +170,11 @@ struct tmodel_s {
 /* global pointer to traffic model state */
 static tmodel_t* global_traffic_model = NULL;
 tor_mutex_t* global_traffic_model_lock;
+
+uint64_t num_outstanding_models = 0;
+uint64_t num_outstanding_packets = 0;
+uint64_t num_outstanding_streams = 0;
+uint64_t num_outstanding_jobs = 0;
 
 /* forward declarations so the traffic model code can utilize
  * the viterbi worker thread pool.  */
@@ -1085,6 +1092,10 @@ static void _tmodel_free(tmodel_t* tmodel) {
 
   tmodel->magic = 0;
   tor_free_(tmodel);
+
+  if(num_outstanding_models > 0) {
+    num_outstanding_models--;
+  }
 }
 
 static tmodel_hmm_t* _tmodel_hmm_deepcopy(tmodel_hmm_t* hmm) {
@@ -1164,12 +1175,15 @@ static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
     copy->hmm_streams = _tmodel_hmm_deepcopy(tmodel->hmm_streams);
   }
 
+  num_outstanding_models++;
+
   return copy;
 }
 
 static tmodel_t* _tmodel_new(const char* model_json) {
   tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
   tmodel->magic = TRAFFIC_MAGIC;
+  num_outstanding_models++;
 
   int ret = _parse_json_objects(model_json, tmodel);
   if (ret == 0) {
@@ -1263,6 +1277,14 @@ int tmodel_set_traffic_model(uint32_t len, const char *body) {
     _viterbi_workers_sync();
   }
 
+  log_notice(LD_GENERAL, "Outstanding traffic model objects: "
+      "models="U64_FORMAT" streams="U64_FORMAT" "
+      "packets="U64_FORMAT" jobs="U64_FORMAT,
+      U64_PRINTF_ARG(num_outstanding_models),
+      U64_PRINTF_ARG(num_outstanding_streams),
+      U64_PRINTF_ARG(num_outstanding_packets),
+      U64_PRINTF_ARG(num_outstanding_jobs));
+
   return return_code;
 }
 
@@ -1314,9 +1336,11 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
   int num_printed = 0;
 
   for(uint i = 0; i < path_len; i++) {
-    tmodel_delay_t* d = smartlist_get(observations, i);
+    void* element = smartlist_get(observations, i);
+    tmodel_delay_t d;
+    memmove(&d, &element, sizeof(void*));
 
-    obs_index = _tmodel_hmm_obstype_to_index(hmm, d->otype);
+    obs_index = _tmodel_hmm_obstype_to_index(hmm, d.otype);
     state_index = viterbi_path[i];
 
     /* sanity check */
@@ -1330,10 +1354,10 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
     }
 
     num_printed = snprintf(&json_buffer[write_index], rem_space,
-        "[\"%s\";\"%s\";"I64_FORMAT"]%s",
+        "[\"%s\";\"%s\";%lu]%s",
         hmm->state_space[state_index],
         hmm->obs_space[obs_index],
-        I64_PRINTF_ARG(d->delay),
+        (long unsigned int)d.delay,
         (i == path_len-1) ? "" : ";");
 
     if(num_printed <= 0) {
@@ -1372,16 +1396,16 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
   }
 }
 
-static double _compute_delay_dx(int64_t delay) {
+static double _compute_delay_dx(long unsigned int delay) {
   if(delay <= 2) {
     return (double)1.0;
   }
 
   double ld = log((double)delay);
-  int64_t li = (int64_t)ld;
+  long unsigned int li = (long unsigned int)ld;
 
   double ed = exp((double)li);
-  int64_t ei = (int64_t)ed;
+  long unsigned int ei = (long unsigned int)ed;
 
   return (double)ei;
 }
@@ -1429,12 +1453,14 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   log_info(LD_GENERAL, "State setup done, running viterbi algorithm now");
 
   /* get some info about the first packet */
-  tmodel_delay_t* d = smartlist_get(observations, 0);
+  void* element = smartlist_get(observations, 0);
+  tmodel_delay_t d;
+  memmove(&d, &element, sizeof(void*));
 
-  double dx = _compute_delay_dx(d->delay);
+  double dx = _compute_delay_dx(d.delay);
 
   /* get the obs name index into the obs space */
-  uint obs_index = _tmodel_hmm_obstype_to_index(hmm, d->otype);
+  uint obs_index = _tmodel_hmm_obstype_to_index(hmm, d.otype);
   if(obs_index >= hmm->num_obs) {
     log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
         "for observation 0/%u", obs_index, n_obs-1);
@@ -1467,7 +1493,7 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
       fit_logprob = log(dp) + _compute_delay_log(dx, mu, sigma);
     } else {
       /* this state uses an exponential distribution */
-      //double streams_per_microsecond = ((double)1.0) / ((double)d->delay);
+      //double streams_per_microsecond = ((double)1.0) / ((double)d.delay);
       fit_logprob = log(dp) + log(lambda) - lambda*dx;
     }
 
@@ -1476,12 +1502,13 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
 
   /* loop through all packets/streams (except the first) */
   for(uint o = 1; o < n_obs; o++) {
-    d = smartlist_get(observations, o);
+    element = smartlist_get(observations, o);
+    memmove(&d, &element, sizeof(void*));
 
-    dx = _compute_delay_dx(d->delay);
+    dx = _compute_delay_dx(d.delay);
 
     /* get the obs name index in the obs space */
-    obs_index = _tmodel_hmm_obstype_to_index(hmm, d->otype);
+    obs_index = _tmodel_hmm_obstype_to_index(hmm, d.otype);
     if(obs_index >= hmm->num_obs) {
       log_warn(LD_BUG, "Bug in viterbi: obs_index (%u) is out of range "
           "for observation %u/%u", obs_index, o, n_obs-1);
@@ -1521,8 +1548,8 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
         continue;
       }
 
-      if(d->otype == TMODEL_OBSTYPE_PACKETS_FINISHED ||
-          d->otype == TMODEL_OBSTYPE_STREAMS_FINISHED) {
+      if(d.otype == TMODEL_OBSTYPE_PACKETS_FINISHED ||
+          d.otype == TMODEL_OBSTYPE_STREAMS_FINISHED) {
         /* for 'F', we have no delay or distribution params */
         table1[i][o] = max_trans_logprob + log(dp);
         continue;
@@ -1545,7 +1572,7 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
         fit_logprob = log(dp) + _compute_delay_log(dx, mu, sigma);
       } else {
         /* this state uses an exponential distribution */
-        //double streams_per_microsecond = ((double)1.0) / ((double)d->delay);
+        //double streams_per_microsecond = ((double)1.0) / ((double)d.delay);
         fit_logprob = log(dp) + log(lambda) - lambda*dx;
       }
 
@@ -1635,10 +1662,12 @@ static void _tmodel_packets_commit_packets(tmodel_packets_t* tpackets,
   /* all but the last packet have no delay until the following packet */
   while (tpackets->buf_length > TMODEL_PACKET_BYTE_COUNT) {
     /* consecutive packets have no delay */
-    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
-    d->delay = 0;
-    d->otype = tpackets->buf_obstype;
-    smartlist_add(tpackets->packets, d);
+    tmodel_delay_t d;
+    d.delay = 0;
+    d.otype = tpackets->buf_obstype;
+    void* element;
+    memmove(&element, &d, sizeof(void*));
+    smartlist_add(tpackets->packets, element);
 
     /* consume the packet length worth of data */
     tpackets->buf_length -= TMODEL_PACKET_BYTE_COUNT;
@@ -1646,10 +1675,12 @@ static void _tmodel_packets_commit_packets(tmodel_packets_t* tpackets,
 
   /* then the last packet gets assigned all of the elasped delay
    * from when we started 'buffering' until now */
-  tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
-  d->delay = elapsed;
-  d->otype = tpackets->buf_obstype;
-  smartlist_add(tpackets->packets, d);
+  tmodel_delay_t d;
+  d.delay = (elapsed <= 0) ? 0 : (long unsigned int)elapsed;
+  d.otype = tpackets->buf_obstype;
+  void* element;
+  memmove(&element, &d, sizeof(void*));
+  smartlist_add(tpackets->packets, element);
 
   /* all of the buffered data has been committed */
   tpackets->buf_length = 0;
@@ -1702,10 +1733,12 @@ void tmodel_packets_observation(tmodel_packets_t* tpackets,
 
   if(otype == TMODEL_OBSTYPE_PACKETS_FINISHED) {
     /* 'commit' the observation */
-    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
-    d->delay = 0;
-    d->otype = TMODEL_OBSTYPE_PACKETS_FINISHED;
-    smartlist_add(tpackets->packets, (void*) d);
+    tmodel_delay_t d;
+    d.delay = 0;
+    d.otype = TMODEL_OBSTYPE_PACKETS_FINISHED;
+    void* element;
+    memmove(&element, &d, sizeof(void*));
+    smartlist_add(tpackets->packets, element);
   } else {
     /* start tracking the new data */
     tpackets->buf_length += payload_length;
@@ -1722,6 +1755,7 @@ tmodel_packets_t* tmodel_packets_new(void) {
 
   tmodel_packets_t* tpackets = tor_malloc_zero_(sizeof(struct tmodel_packets_s));
   tpackets->magic = TRAFFIC_MAGIC_PACKETS;
+  num_outstanding_packets++;
 
   monotime_get(&tpackets->creation_time);
 
@@ -1756,31 +1790,31 @@ static void _tmodel_handle_viterbi_result(char* viterbi_json,
 static void _tmodel_packets_free_helper(tmodel_packets_t* tpackets) {
   tor_assert(tpackets && tpackets->magic == TRAFFIC_MAGIC_PACKETS);
 
-  SMARTLIST_FOREACH_BEGIN(tpackets->packets, tmodel_delay_t*, delay) {
-    if(delay) {
-      tor_free_(delay);
-    }
-  } SMARTLIST_FOREACH_END(delay);
-
+  /* the packet data is stored in the packet element pointers,
+   * which will be freed by the smartlist. */
   smartlist_free(tpackets->packets);
 
   tpackets->magic = 0;
   tor_free_(tpackets);
+
+  if(num_outstanding_packets > 0) {
+    num_outstanding_packets--;
+  }
 }
 
 static void _tmodel_streams_free_helper(tmodel_streams_t* tstreams) {
   tor_assert(tstreams && tstreams->magic == TRAFFIC_MAGIC_STREAMS);
 
-  SMARTLIST_FOREACH_BEGIN(tstreams->streams, tmodel_delay_t*, delay) {
-    if(delay) {
-      tor_free_(delay);
-    }
-  } SMARTLIST_FOREACH_END(delay);
-
+  /* the stream data is stored in the packet element pointers,
+   * which will be freed by the smartlist. */
   smartlist_free(tstreams->streams);
 
   tstreams->magic = 0;
   tor_free_(tstreams);
+
+  if(num_outstanding_streams > 0) {
+    num_outstanding_streams--;
+  }
 }
 
 static void _tmodel_process_models(tmodel_packets_t* tpackets,
@@ -1882,20 +1916,24 @@ void tmodel_streams_observation(tmodel_streams_t* tstreams,
   if(tstreams->buf_obstype != 0) {
     /* commit the previous stream info */
     int64_t elapsed = monotime_diff_usec(&tstreams->buf_time, &now);
-    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
-    d->delay = elapsed;
-    d->otype = tstreams->buf_obstype;
-    smartlist_add(tstreams->streams, d);
+    tmodel_delay_t d;
+    d.delay = (elapsed <= 0) ? 0 : (long unsigned int)elapsed;
+    d.otype = tstreams->buf_obstype;
+    void* element;
+    memmove(&element, &d, sizeof(void*));
+    smartlist_add(tstreams->streams, element);
   }
 
   tstreams->buf_obstype = otype;
   tstreams->buf_time = now;
 
   if(otype == TMODEL_OBSTYPE_STREAMS_FINISHED) {
-    tmodel_delay_t* d = tor_calloc(1, sizeof(tmodel_delay_t));
-    d->delay = 0;
-    d->otype = TMODEL_OBSTYPE_STREAMS_FINISHED;
-    smartlist_add(tstreams->streams, d);
+    tmodel_delay_t d;
+    d.delay = 0;
+    d.otype = TMODEL_OBSTYPE_STREAMS_FINISHED;
+    void* element;
+    memmove(&element, &d, sizeof(void*));
+    smartlist_add(tstreams->streams, element);
   }
 }
 
@@ -1907,6 +1945,7 @@ tmodel_streams_t* tmodel_streams_new(void) {
 
   tmodel_streams_t* tstreams = tor_malloc_zero_(sizeof(struct tmodel_streams_s));
   tstreams->magic = TRAFFIC_MAGIC_STREAMS;
+  num_outstanding_streams++;
 
   monotime_get(&tstreams->creation_time);
 
@@ -1939,6 +1978,7 @@ static viterbi_worker_job_t* _viterbi_job_new(
   viterbi_worker_job_t* job = calloc(1, sizeof(viterbi_worker_job_t));
   job->tpackets = tpackets;
   job->tstreams = tstreams;
+  num_outstanding_jobs++;
   return job;
 }
 
@@ -1954,6 +1994,9 @@ static void _viterbi_job_free(viterbi_worker_job_t* job) {
       free(job->viterbi_result);
     }
     free(job);
+    if(num_outstanding_jobs > 0) {
+      num_outstanding_jobs--;
+    }
   }
 }
 
@@ -1961,6 +2004,7 @@ static int _viterbi_thread_pool_is_ready(void) {
   return viterbi_thread_pool ? 1 : 0;
 }
 
+/* this function is run in a worker thread */
 static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* job_arg) {
   viterbi_worker_state_t* state = state_arg;
   viterbi_worker_job_t* job = job_arg;
@@ -2037,6 +2081,7 @@ static void _viterbi_worker_assign(tmodel_packets_t* tpackets,
   _viterbi_worker_assign_job(job);
 }
 
+/* this function is run in a worker thread */
 static void _viterbi_worker_log_model(tmodel_hmm_t* hmm, const char* name) {
   if(hmm) {
     log_notice(LD_GENERAL, "Successfully copied traffic %s model "
@@ -2048,6 +2093,7 @@ static void _viterbi_worker_log_model(tmodel_hmm_t* hmm, const char* name) {
   }
 }
 
+/* this function is run in a worker thread */
 static void * _viterbi_worker_state_new(void *arg) {
   (void) arg;
 
@@ -2075,6 +2121,7 @@ static void * _viterbi_worker_state_new(void *arg) {
   return state;
 }
 
+/* this function is run in a worker thread */
 static void _viterbi_worker_state_free(void *arg) {
   viterbi_worker_state_t* state = arg;
 
@@ -2122,6 +2169,9 @@ static void _viterbi_workers_sync(void) {
   if(!viterbi_thread_pool) {
     return;
   }
+
+  log_notice(LD_GENERAL, "Now attempting to queue a traffic model update "
+          "on the viterbi threads");
 
   if (threadpool_queue_update(viterbi_thread_pool, _viterbi_worker_state_new,
       _viterbi_worker_update_threadfn, _viterbi_worker_state_free, NULL) < 0) {

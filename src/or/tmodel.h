@@ -18,6 +18,8 @@ enum tmodel_obs_type_e {
   TMODEL_OBSTYPE_PACKETS_FINISHED,
   TMODEL_OBSTYPE_STREAM_NEW,
   TMODEL_OBSTYPE_STREAMS_FINISHED,
+  /* if we add another element, we need to increase the amount used
+  to store this type in the obs bitfield in tmodel_delay_t */
 };
 
 /* An opaque structure representing traffic model info for packets
