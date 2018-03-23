@@ -308,7 +308,7 @@ static uint _parse_json_state_space(const char* json, int obj_end_pos,
     /* process the state name */
     log_debug(LD_GENERAL, "found state '%s'", state_name);
     if (hmm) {
-      hmm->state_space[count] = strndup(state_name, 63);
+      hmm->state_space[count] = tor_strndup(state_name, 63);
       size_t state_str_len = strnlen(hmm->state_space[count], 64);
       if(state_str_len > hmm->max_state_str_length) {
         hmm->max_state_str_length = state_str_len;
@@ -350,7 +350,7 @@ static uint _parse_json_obs_space(const char* json, int obj_end_pos,
     /* process the state name */
     log_debug(LD_GENERAL, "found observation '%s'", obs_name);
     if (hmm) {
-      hmm->obs_space[count] = strndup(obs_name, 7);
+      hmm->obs_space[count] = tor_strndup(obs_name, 7);
     }
     count++;
 
@@ -729,7 +729,7 @@ static int _parse_json_hmm_objects(const char* json,
 
         /* allocate the state array */
         hmm->num_states = num_states;
-        hmm->state_space = calloc(hmm->num_states, sizeof(char*));
+        hmm->state_space = tor_calloc(hmm->num_states, sizeof(char*));
 
         /* now actually store the values by giving a model */
         num_states = _parse_json_state_space(&json[i], j, hmm);
@@ -751,7 +751,7 @@ static int _parse_json_hmm_objects(const char* json,
 
         /* allocate the obs array */
         hmm->num_obs = num_obs;
-        hmm->obs_space = calloc(hmm->num_obs, sizeof(char*));
+        hmm->obs_space = tor_calloc(hmm->num_obs, sizeof(char*));
 
         /* now actually store the values by giving a model */
         num_obs = _parse_json_obs_space(&json[i], j, hmm);
@@ -800,37 +800,37 @@ static int _parse_json_hmm_objects(const char* json,
 static void _tmodel_hmm_allocate_arrays(tmodel_hmm_t* hmm) {
   tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
-  hmm->start_prob = calloc((size_t) hmm->num_states, sizeof(double));
+  hmm->start_prob = tor_calloc((size_t) hmm->num_states, sizeof(double));
 
-  hmm->trans_prob = calloc((size_t) hmm->num_states, sizeof(double*));
+  hmm->trans_prob = tor_calloc((size_t) hmm->num_states, sizeof(double*));
   for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->trans_prob[i] = calloc((size_t) hmm->num_states, sizeof(double));
+    hmm->trans_prob[i] = tor_calloc((size_t) hmm->num_states, sizeof(double));
   }
 
-  hmm->emit_dp = calloc((size_t) hmm->num_states, sizeof(double*));
+  hmm->emit_dp = tor_calloc((size_t) hmm->num_states, sizeof(double*));
   for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_dp[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+    hmm->emit_dp[i] = tor_calloc((size_t) hmm->num_obs, sizeof(double));
   }
 
-  hmm->emit_mu = calloc((size_t) hmm->num_states, sizeof(double*));
+  hmm->emit_mu = tor_calloc((size_t) hmm->num_states, sizeof(double*));
   for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_mu[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+    hmm->emit_mu[i] = tor_calloc((size_t) hmm->num_obs, sizeof(double));
   }
 
-  hmm->emit_sigma = calloc((size_t) hmm->num_states, sizeof(double*));
+  hmm->emit_sigma = tor_calloc((size_t) hmm->num_states, sizeof(double*));
   for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_sigma[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+    hmm->emit_sigma[i] = tor_calloc((size_t) hmm->num_obs, sizeof(double));
   }
 
-  hmm->emit_lambda = calloc((size_t) hmm->num_states, sizeof(double*));
+  hmm->emit_lambda = tor_calloc((size_t) hmm->num_states, sizeof(double*));
   for (uint i = 0; i < hmm->num_states; i++) {
-    hmm->emit_lambda[i] = calloc((size_t) hmm->num_obs, sizeof(double));
+    hmm->emit_lambda[i] = tor_calloc((size_t) hmm->num_obs, sizeof(double));
   }
 }
 
 static int _parse_json_hmm(const char* json,
     int i, int j, tmodel_hmm_t** hmm, const char* name) {
-  (*hmm) = tor_malloc_zero_(sizeof(struct tmodel_hmm_s));
+  (*hmm) = tor_malloc_zero(sizeof(struct tmodel_hmm_s));
   (*hmm)->magic = TRAFFIC_MAGIC_HMM;
 
   int ret = _parse_json_hmm_objects(&json[i], j, 1, *hmm);
@@ -847,13 +847,13 @@ static int _parse_json_hmm(const char* json,
     } else {
       log_warn(LD_GENERAL, "problem parsing %s trans, emit, and start probs", name);
       (*hmm)->magic = 0;
-      tor_free_(*hmm);
+      tor_free(*hmm);
       (*hmm) = NULL;
     }
   } else {
     log_warn(LD_GENERAL, "problem parsing %s state and obs spaces", name);
     (*hmm)->magic = 0;
-    tor_free_(*hmm);
+    tor_free(*hmm);
     (*hmm) = NULL;
   }
 
@@ -1010,74 +1010,74 @@ static void _tmodel_hmm_free(tmodel_hmm_t* hmm) {
   tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
   if (hmm->start_prob) {
-    free(hmm->start_prob);
+    tor_free(hmm->start_prob);
   }
 
   if (hmm->trans_prob) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->trans_prob[i]) {
-        free(hmm->trans_prob[i]);
+        tor_free(hmm->trans_prob[i]);
       }
     }
-    free(hmm->trans_prob);
+    tor_free(hmm->trans_prob);
   }
 
   if (hmm->emit_dp) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->emit_dp[i]) {
-        free(hmm->emit_dp[i]);
+        tor_free(hmm->emit_dp[i]);
       }
     }
-    free(hmm->emit_dp);
+    tor_free(hmm->emit_dp);
   }
 
   if (hmm->emit_mu) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->emit_mu[i]) {
-        free(hmm->emit_mu[i]);
+        tor_free(hmm->emit_mu[i]);
       }
     }
-    free(hmm->emit_mu);
+    tor_free(hmm->emit_mu);
   }
 
   if (hmm->emit_sigma) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->emit_sigma[i]) {
-        free(hmm->emit_sigma[i]);
+        tor_free(hmm->emit_sigma[i]);
       }
     }
-    free(hmm->emit_sigma);
+    tor_free(hmm->emit_sigma);
   }
 
   if (hmm->emit_lambda) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->emit_lambda[i]) {
-        free(hmm->emit_lambda[i]);
+        tor_free(hmm->emit_lambda[i]);
       }
     }
-    free(hmm->emit_lambda);
+    tor_free(hmm->emit_lambda);
   }
 
   if (hmm->state_space) {
     for (uint i = 0; i < hmm->num_states; i++) {
       if (hmm->state_space[i]) {
-        free(hmm->state_space[i]);
+        tor_free(hmm->state_space[i]);
       }
     }
-    free(hmm->state_space);
+    tor_free(hmm->state_space);
   }
 
   if (hmm->obs_space) {
     for (uint i = 0; i < hmm->num_obs; i++) {
       if (hmm->obs_space[i]) {
-        free(hmm->obs_space[i]);
+        tor_free(hmm->obs_space[i]);
       }
     }
-    free(hmm->obs_space);
+    tor_free(hmm->obs_space);
   }
 
   hmm->magic = 0;
-  tor_free_(hmm);
+  tor_free(hmm);
 }
 
 static void _tmodel_free(tmodel_t* tmodel) {
@@ -1091,7 +1091,7 @@ static void _tmodel_free(tmodel_t* tmodel) {
   }
 
   tmodel->magic = 0;
-  tor_free_(tmodel);
+  tor_free(tmodel);
 
   if(num_outstanding_models > 0) {
     num_outstanding_models--;
@@ -1106,24 +1106,24 @@ static tmodel_hmm_t* _tmodel_hmm_deepcopy(tmodel_hmm_t* hmm) {
     return NULL;
   }
 
-  tmodel_hmm_t* copy = tor_malloc_zero_(sizeof(struct tmodel_hmm_s));
+  tmodel_hmm_t* copy = tor_malloc_zero(sizeof(struct tmodel_hmm_s));
 
   copy->magic = hmm->magic;
   copy->num_states = hmm->num_states;
   copy->num_obs = hmm->num_obs;
   copy->max_state_str_length = hmm->max_state_str_length;
 
-  copy->state_space = calloc(copy->num_states, sizeof(char*));
-  copy->obs_space = calloc(copy->num_obs, sizeof(char*));
+  copy->state_space = tor_calloc(copy->num_states, sizeof(char*));
+  copy->obs_space = tor_calloc(copy->num_obs, sizeof(char*));
   _tmodel_hmm_allocate_arrays(copy);
 
   for (uint i = 0; i < copy->num_states; i++) {
-    copy->state_space[i] = strndup(hmm->state_space[i], hmm->max_state_str_length);
+    copy->state_space[i] = tor_strndup(hmm->state_space[i], hmm->max_state_str_length);
     copy->start_prob[i] = hmm->start_prob[i];
   }
 
   for (uint i = 0; i < copy->num_obs; i++) {
-    copy->obs_space[i] = strndup(hmm->obs_space[i], 8);
+    copy->obs_space[i] = tor_strndup(hmm->obs_space[i], 8);
   }
 
   for (uint i = 0; i < copy->num_states; i++) {
@@ -1164,7 +1164,7 @@ static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
     return NULL;
   }
 
-  tmodel_t* copy = tor_malloc_zero_(sizeof(struct tmodel_s));
+  tmodel_t* copy = tor_malloc_zero(sizeof(struct tmodel_s));
 
   copy->magic = tmodel->magic;
 
@@ -1181,7 +1181,7 @@ static tmodel_t* _tmodel_deepcopy(tmodel_t* tmodel) {
 }
 
 static tmodel_t* _tmodel_new(const char* model_json) {
-  tmodel_t* tmodel = tor_malloc_zero_(sizeof(struct tmodel_s));
+  tmodel_t* tmodel = tor_malloc_zero(sizeof(struct tmodel_s));
   tmodel->magic = TRAFFIC_MAGIC;
   num_outstanding_models++;
 
@@ -1230,7 +1230,7 @@ int tmodel_set_traffic_model(uint32_t len, const char *body) {
 
   /* before we edit the global model, init the lock if needed */
   if(!global_traffic_model_lock) {
-    global_traffic_model_lock = tor_malloc_zero_(sizeof(tor_mutex_t));
+    global_traffic_model_lock = tor_malloc_zero(sizeof(tor_mutex_t));
     tor_mutex_init(global_traffic_model_lock);
   }
 
@@ -1329,7 +1329,7 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
   size_t n = hmm->max_state_str_length;
   size_t json_buffer_len = (size_t)(path_len * (30 + n));
 
-  char* json_buffer = calloc(json_buffer_len, 1);
+  char* json_buffer = tor_calloc(json_buffer_len, 1);
   size_t write_index = 0;
   size_t rem_space = json_buffer_len-1;
 
@@ -1349,11 +1349,11 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
       log_warn(LD_BUG, "Can't print viterbi path json for packet %u/%u "
           "because obs_index (%u) or state_index (%u) is out of range",
           i, path_len-1, obs_index, state_index);
-      free(json_buffer);
+      tor_free(json_buffer);
       return NULL;
     }
 
-    num_printed = snprintf(&json_buffer[write_index], rem_space,
+    num_printed = tor_snprintf(&json_buffer[write_index], rem_space,
         "[\"%s\";\"%s\";%lu]%s",
         hmm->state_space[state_index],
         hmm->obs_space[obs_index],
@@ -1361,9 +1361,9 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
         (i == path_len-1) ? "" : ";");
 
     if(num_printed <= 0) {
-      free(json_buffer);
+      tor_free(json_buffer);
       log_warn(LD_BUG, "Problem printing viterbi path json for "
-          "packet %u/%u: snprintf returned %d", i, path_len-1, num_printed);
+          "packet %u/%u: tor_snprintf returned %d", i, path_len-1, num_printed);
       return NULL;
     } else {
       rem_space -= (size_t)num_printed;
@@ -1375,7 +1375,7 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
   char* json = NULL;
   num_printed = tor_asprintf(&json, "[%s]", json_buffer);
 
-  free(json_buffer);
+  tor_free(json_buffer);
 
   if(num_printed <= 0) {
     log_warn(LD_BUG, "Problem truncating viterbi path json buffer: "
@@ -1386,7 +1386,7 @@ static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
       log_warn(LD_GENERAL, "Encoded viterbi path json size is %ld, but the"
           "maximum supported size is %ld. Dropping result so we don't "
           "crash PrivCount.", (long)num_printed, (long)TMODEL_MAX_JSON_RESULT_LEN);
-      free(json);
+      tor_free(json);
       return NULL;
     } else {
       log_info(LD_GENERAL,
@@ -1438,16 +1438,16 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   /* initialize the auxiliary tables:
    *   table1 stores max probs
    *   table2 stores state index of max probs  */
-  double** table1 = calloc(n_states, sizeof(double*));
-  uint** table2 = calloc(n_states, sizeof(uint*));
+  double** table1 = tor_calloc(n_states, sizeof(double*));
+  uint** table2 = tor_calloc(n_states, sizeof(uint*));
   for(uint i = 0; i < n_states; i++) {
-    table1[i] = calloc(n_obs, sizeof(double));
-    table2[i] = calloc(n_obs, sizeof(uint));
+    table1[i] = tor_calloc(n_obs, sizeof(double));
+    table2[i] = tor_calloc(n_obs, sizeof(uint));
   }
 
   /* list of most probable states for each observation.
    * we store indices into our state space string array. */
-  uint* optimal_states = calloc(n_obs, sizeof(uint));
+  uint* optimal_states = tor_calloc(n_obs, sizeof(uint));
   memset(optimal_states, UINT_MAX, sizeof(uint) * n_obs);
 
   log_info(LD_GENERAL, "State setup done, running viterbi algorithm now");
@@ -1640,12 +1640,12 @@ cleanup:
   for(uint i = 0; i < n_states; i++) {
     tor_assert(table1[i]);
     tor_assert(table2[i]);
-    free(table1[i]);
-    free(table2[i]);
+    tor_free(table1[i]);
+    tor_free(table2[i]);
   }
-  free(table1);
-  free(table2);
-  free(optimal_states);
+  tor_free(table1);
+  tor_free(table2);
+  tor_free(optimal_states);
 
   return viterbi_json;
 }
@@ -1758,7 +1758,7 @@ tmodel_packets_t* tmodel_packets_new(void) {
     return NULL;
   }
 
-  tmodel_packets_t* tpackets = tor_malloc_zero_(sizeof(struct tmodel_packets_s));
+  tmodel_packets_t* tpackets = tor_malloc_zero(sizeof(struct tmodel_packets_s));
   tpackets->magic = TRAFFIC_MAGIC_PACKETS;
   num_outstanding_packets++;
 
@@ -1779,16 +1779,16 @@ static void _tmodel_handle_viterbi_result(char* viterbi_json,
     } else if(tstreams) {
       control_event_privcount_viterbi_streams(viterbi_json);
     }
-    free(viterbi_json);
+    tor_free(viterbi_json);
   } else {
     /* send a json empty list to signal an error */
-    char* empty_list = strndup("[]", 2);
+    char* empty_list = tor_strndup("[]", 2);
     if(tpackets) {
       control_event_privcount_viterbi_packets(empty_list);
     } else if(tstreams) {
       control_event_privcount_viterbi_streams(empty_list);
     }
-    free(empty_list);
+    tor_free(empty_list);
   }
 }
 
@@ -1800,7 +1800,7 @@ static void _tmodel_packets_free_helper(tmodel_packets_t* tpackets) {
   smartlist_free(tpackets->packets);
 
   tpackets->magic = 0;
-  tor_free_(tpackets);
+  tor_free(tpackets);
 
   if(num_outstanding_packets > 0) {
     num_outstanding_packets--;
@@ -1815,7 +1815,7 @@ static void _tmodel_streams_free_helper(tmodel_streams_t* tstreams) {
   smartlist_free(tstreams->streams);
 
   tstreams->magic = 0;
-  tor_free_(tstreams);
+  tor_free(tstreams);
 
   if(num_outstanding_streams > 0) {
     num_outstanding_streams--;
@@ -1953,7 +1953,7 @@ tmodel_streams_t* tmodel_streams_new(void) {
     return NULL;
   }
 
-  tmodel_streams_t* tstreams = tor_malloc_zero_(sizeof(struct tmodel_streams_s));
+  tmodel_streams_t* tstreams = tor_malloc_zero(sizeof(struct tmodel_streams_s));
   tstreams->magic = TRAFFIC_MAGIC_STREAMS;
   num_outstanding_streams++;
 
@@ -1985,7 +1985,7 @@ typedef struct viterbi_worker_job_s {
 
 static viterbi_worker_job_t* _viterbi_job_new(
     tmodel_packets_t* tpackets, tmodel_streams_t* tstreams) {
-  viterbi_worker_job_t* job = calloc(1, sizeof(viterbi_worker_job_t));
+  viterbi_worker_job_t* job = tor_calloc(1, sizeof(viterbi_worker_job_t));
   job->tpackets = tpackets;
   job->tstreams = tstreams;
   num_outstanding_jobs++;
@@ -2001,9 +2001,9 @@ static void _viterbi_job_free(viterbi_worker_job_t* job) {
       _tmodel_streams_free_helper(job->tstreams);
     }
     if(job->viterbi_result) {
-      free(job->viterbi_result);
+      tor_free(job->viterbi_result);
     }
-    free(job);
+    tor_free(job);
     if(num_outstanding_jobs > 0) {
       num_outstanding_jobs--;
     }
