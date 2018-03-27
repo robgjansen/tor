@@ -101,6 +101,7 @@
 #include "routerset.h"
 #include "scheduler.h"
 #include "statefile.h"
+#include "tmodel.h"
 #include "transports.h"
 #include "ext_orport.h"
 #ifdef _WIN32
@@ -493,6 +494,7 @@ static config_var_t option_vars_[] = {
   V(PrivCountMaxCellEventsPerCircuit, INT, "-1"),
   V(PrivCountNumViterbiWorkers,  INT,      "0"),
   V(PrivCountTrafficModel,       FILENAME, NULL),
+  V(TrafficModel,                LINELIST, NULL),
   V(ReachableAddresses,          LINELIST, NULL),
   V(ReachableDirAddresses,       LINELIST, NULL),
   V(ReachableORAddresses,        LINELIST, NULL),
@@ -2293,6 +2295,7 @@ options_act(const or_options_t *old_options)
     options->enable_privcount_timestamp.tv_usec = 999999;
   }
 
+<<<<<<< HEAD
   if(options->PrivCountTrafficModel != NULL) {
     log_info(LD_GENERAL, "Attempting to add traffic model at path '%s'",
         options->PrivCountTrafficModel);
@@ -2320,6 +2323,30 @@ options_act(const or_options_t *old_options)
     } else {
       log_warn(LD_GENERAL, "Failed to add traffic model at path '%s'",
           options->PrivCountTrafficModel);
+=======
+  /* clear all of the models */
+  log_info(LD_GENERAL, "Clearing all traffic models if they exist");
+  tmodel_set_traffic_model(7, "FALSE\r\n");
+
+  if(options->TrafficModel != NULL) {
+    config_line_t* model_filepath = options->TrafficModel;
+    for (; model_filepath; model_filepath = model_filepath->next) {
+      log_info(LD_GENERAL, "Attempting to add traffic model at %s", model_filepath->value);
+      char* contents = read_file_to_str(model_filepath->value, 0, NULL);
+      if(contents) {
+        char* model_command = NULL;
+        int num = tor_asprintf(&model_command, "TRUE %s\r\n", contents);
+        if(num > 0) {
+          int retcode = tmodel_set_traffic_model(strlen(model_command), model_command);
+          if(retcode == 0) {
+            log_info(LD_GENERAL, "Success adding traffic model at %s", model_filepath->value);
+          } else {
+            log_warn(LD_GENERAL, "Failed to add traffic model at %s", model_filepath->value);
+          }
+          tor_free(contents);
+        }
+      }
+>>>>>>> Add some code for a best fit test across many models
     }
   }
 

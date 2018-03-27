@@ -4693,6 +4693,9 @@ typedef struct {
   int PrivCountNumViterbiWorkers;
   /* The model to use during a PrivCount traffic model measurement. */
   char* PrivCountTrafficModel;
+  /* Traffic model files that we will run packets/streams through for
+   * testing model best-fitness. */
+  config_line_t *TrafficModel;
 
   int IPv6Exit; /**< Do we support exiting to IPv6 addresses? */
 

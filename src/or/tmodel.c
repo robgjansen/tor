@@ -169,7 +169,7 @@ struct tmodel_s {
 };
 
 /* global pointer to traffic model state */
-static tmodel_t* global_traffic_model = NULL;
+static smartlist_t* global_bestfit_traffic_model_list = NULL;
 tor_mutex_t* global_traffic_model_lock;
 
 uint64_t num_outstanding_models = 0;
@@ -188,8 +188,8 @@ static void _viterbi_worker_assign(tmodel_packets_t* tpackets,
 /* returns true if we want to know about cells on exit streams,
  * false otherwise. */
 int tmodel_is_active(void) {
-  if (get_options()->EnablePrivCount && global_traffic_model != NULL
-      && global_traffic_model->magic == TRAFFIC_MAGIC) {
+  if (get_options()->TrafficModel != NULL &&
+      global_bestfit_traffic_model_list != NULL) {
     return 1;
   }
   return 0;
@@ -1235,21 +1235,26 @@ int tmodel_set_traffic_model(uint32_t len, const char *body) {
     tor_mutex_init(global_traffic_model_lock);
   }
 
-  /* we always free the previous model if the length is too
-   * short or we have a 'FALSE' command, or we are creating
-   * a new model object. */
+  /* Protect changes to the global model list. */
   tor_mutex_acquire(global_traffic_model_lock);
 
-  if (global_traffic_model != NULL) {
-    _tmodel_free(global_traffic_model);
-    global_traffic_model = NULL;
-
-    log_notice(LD_GENERAL,
-        "Successfully freed a previously loaded traffic model");
-  }
-
   if (traffic_model != NULL) {
-    global_traffic_model = traffic_model;
+    /* we were given a new model */
+    if(global_bestfit_traffic_model_list == NULL) {
+      global_bestfit_traffic_model_list = smartlist_new();
+    }
+    smartlist_add(global_bestfit_traffic_model_list, traffic_model);
+  } else {
+    /* we had a problem or were given a FALSE model, clear and free */
+    if(global_bestfit_traffic_model_list != NULL) {
+      SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
+      {
+        _tmodel_free(tmodel);
+      });
+      smartlist_clear(global_bestfit_traffic_model_list);
+      smartlist_free(global_bestfit_traffic_model_list);
+    }
+    global_bestfit_traffic_model_list = NULL;
   }
 
   tor_mutex_release(global_traffic_model_lock);
@@ -1293,109 +1298,155 @@ int tmodel_set_traffic_model(uint32_t len, const char *body) {
  ** Traffic model stream processing **
  *************************************/
 
-static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
-    uint* viterbi_path, uint path_len) {
-  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
-
-  if(!observations || !viterbi_path ||
-      path_len != (uint)smartlist_len(observations)) {
-    log_warn(LD_BUG, "Problem verifying input params before "
-        "encoding viterbi path as json");
-    return NULL;
+static void _tmodel_handle_result(smartlist_t* probs,
+    tmodel_packets_t* tpackets, tmodel_streams_t* tstreams) {
+  if(!probs) {
+    return;
   }
 
-  uint obs_index, state_index;
-
-  /* our json object will be something like:
-   *   [["m10s1";"+";35432];["m2s4";"+";0];["m4s2";"-";100];["m4sEnd";"F";0]]
-   * each observation (i.e., packet) will require:
-   *   9 chars for ["";"";];
-   *   n chars for state, where n is at most tmodel->max_state_str_length
-   *   1 char for either + or - or F
-   *   20 chars, the most that an int64_t value will consume
-   *       (INT64 range is -9223372036854775808 to 9223372036854775807)
-   *   --------
-   *   max total per packet is = 30 + n
-   *
-   * so for p packets, we need at most:
-   *   p * (30 + n) characters
-   *
-   * if n is 7, that's 37 bytes per observation
-   * we may go up to 100,000 or more packets on a really heavy stream
-   *   which would be 3700000 bytes or about 3.7 MB in a pessimistic case
-   *   this will get freed as soon as it is send to PrivCount
-   * instead, we use the large buffer to build the string, and then
-   *   truncate it before sending to the main thread (and then to PrivCount).
-   */
-  size_t n = hmm->max_state_str_length;
-  size_t json_buffer_len = (size_t)(path_len * (30 + n));
-
-  char* json_buffer = tor_calloc(json_buffer_len, 1);
-  size_t write_index = 0;
-  size_t rem_space = json_buffer_len-1;
-
+  char* result = NULL;
   int num_printed = 0;
 
-  for(uint i = 0; i < path_len; i++) {
-    void* element = smartlist_get(observations, i);
-    tmodel_delay_t d;
-    memmove(&d, &element, sizeof(void*));
+  for(int i = 0; i < smartlist_len(probs); i++) {
+    for(int j = i; j < smartlist_len(probs); j++) {
+      char symbol;
+      if(smartlist_get(probs, i) > smartlist_get(probs, j)) {
+        symbol = '>';
+      } else if(smartlist_get(probs, i) < smartlist_get(probs, j)) {
+        symbol = '<';
+      } else {
+        symbol = '=';
+      }
 
-    obs_index = _tmodel_hmm_obstype_to_index(hmm, d.otype);
-    state_index = viterbi_path[i];
+      char* temp = NULL;
+      if(result == NULL) {
+        num_printed = tor_asprintf(&temp, "%i%c%i", i, symbol, j);
+      } else {
+        num_printed = tor_asprintf(&temp, "%s,%i%c%i", result, i, symbol, j);
+        tor_free(result);
+        result = NULL;
+      }
 
-    /* sanity check */
-    if(obs_index >= hmm->num_obs || state_index >= hmm->num_states) {
-      /* these would overflow the respective arrays */
-      log_warn(LD_BUG, "Can't print viterbi path json for packet %u/%u "
-          "because obs_index (%u) or state_index (%u) is out of range",
-          i, path_len-1, obs_index, state_index);
-      tor_free(json_buffer);
-      return NULL;
-    }
+      if(num_printed <= 0) {
+        log_warn(LD_BUG, "Problem encoding viterbi result: "
+            "tor_asprintf returned %d", num_printed);
+        return;
+      }
 
-    num_printed = tor_snprintf(&json_buffer[write_index], rem_space,
-        "[\"%s\";\"%s\";%lu]%s",
-        hmm->state_space[state_index],
-        hmm->obs_space[obs_index],
-        (long unsigned int)d.delay,
-        (i == path_len-1) ? "" : ";");
-
-    if(num_printed <= 0) {
-      tor_free(json_buffer);
-      log_warn(LD_BUG, "Problem printing viterbi path json for "
-          "packet %u/%u: tor_snprintf returned %d", i, path_len-1, num_printed);
-      return NULL;
-    } else {
-      rem_space -= (size_t)num_printed;
-      write_index += (size_t)num_printed;
+      result = temp;
     }
   }
 
-  /* get the final string and truncate the buffer */
-  char* json = NULL;
-  num_printed = tor_asprintf(&json, "[%s]", json_buffer);
-
-  tor_free(json_buffer);
-
-  if(num_printed <= 0) {
-    log_warn(LD_BUG, "Problem truncating viterbi path json buffer: "
-        "tor_asprintf returned %d", num_printed);
-    return NULL;
-  } else {
-    if(json && num_printed > TMODEL_MAX_JSON_RESULT_LEN) {
-      log_warn(LD_GENERAL, "Encoded viterbi path json size is %ld, but the"
-          "maximum supported size is %ld. Dropping result so we don't "
-          "crash PrivCount.", (long)num_printed, (long)TMODEL_MAX_JSON_RESULT_LEN);
-      tor_free(json);
-      return NULL;
-    } else {
-      log_info(LD_GENERAL,
-          "Encoded viterbi path as json string of size %ld", (long)num_printed);
-      return json;
-    }
+  if(result != NULL) {
+    log_notice(LD_GENERAL, "Viterbi best fit %s model: %s",
+        tpackets ? "packet" : tstreams ? "stream" : "unknown", result);
+    tor_free(result);
   }
 }
+
+//static char* _encode_viterbi_path(tmodel_hmm_t* hmm, smartlist_t* observations,
+//    uint* viterbi_path, uint path_len) {
+//  tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
+//
+//  if(!observations || !viterbi_path ||
+//      path_len != (uint)smartlist_len(observations)) {
+//    log_warn(LD_BUG, "Problem verifying input params before "
+//        "encoding viterbi path as json");
+//    return NULL;
+//  }
+//
+//  uint obs_index, state_index;
+//
+//  /* our json object will be something like:
+//   *   [["m10s1";"+";35432];["m2s4";"+";0];["m4s2";"-";100];["m4sEnd";"F";0]]
+//   * each observation (i.e., packet) will require:
+//   *   9 chars for ["";"";];
+//   *   n chars for state, where n is at most tmodel->max_state_str_length
+//   *   1 char for either + or - or F
+//   *   20 chars, the most that an int64_t value will consume
+//   *       (INT64 range is -9223372036854775808 to 9223372036854775807)
+//   *   --------
+//   *   max total per packet is = 30 + n
+//   *
+//   * so for p packets, we need at most:
+//   *   p * (30 + n) characters
+//   *
+//   * if n is 7, that's 37 bytes per observation
+//   * we may go up to 100,000 or more packets on a really heavy stream
+//   *   which would be 3700000 bytes or about 3.7 MB in a pessimistic case
+//   *   this will get freed as soon as it is send to PrivCount
+//   * instead, we use the large buffer to build the string, and then
+//   *   truncate it before sending to the main thread (and then to PrivCount).
+//   */
+//  size_t n = hmm->max_state_str_length;
+//  size_t json_buffer_len = (size_t)(path_len * (30 + n));
+//
+//  char* json_buffer = tor_calloc(json_buffer_len, 1);
+//  size_t write_index = 0;
+//  size_t rem_space = json_buffer_len-1;
+//
+//  int num_printed = 0;
+//
+//  for(uint i = 0; i < path_len; i++) {
+//    void* element = smartlist_get(observations, i);
+//    tmodel_delay_t d;
+//    memmove(&d, &element, sizeof(void*));
+//
+//    obs_index = _tmodel_hmm_obstype_to_index(hmm, d.otype);
+//    state_index = viterbi_path[i];
+//
+//    /* sanity check */
+//    if(obs_index >= hmm->num_obs || state_index >= hmm->num_states) {
+//      /* these would overflow the respective arrays */
+//      log_warn(LD_BUG, "Can't print viterbi path json for packet %u/%u "
+//          "because obs_index (%u) or state_index (%u) is out of range",
+//          i, path_len-1, obs_index, state_index);
+//      tor_free(json_buffer);
+//      return NULL;
+//    }
+//
+//    num_printed = tor_snprintf(&json_buffer[write_index], rem_space,
+//        "[\"%s\";\"%s\";%lu]%s",
+//        hmm->state_space[state_index],
+//        hmm->obs_space[obs_index],
+//        (long unsigned int)d.delay,
+//        (i == path_len-1) ? "" : ";");
+//
+//    if(num_printed <= 0) {
+//      tor_free(json_buffer);
+//      log_warn(LD_BUG, "Problem printing viterbi path json for "
+//          "packet %u/%u: tor_snprintf returned %d", i, path_len-1, num_printed);
+//      return NULL;
+//    } else {
+//      rem_space -= (size_t)num_printed;
+//      write_index += (size_t)num_printed;
+//    }
+//  }
+//
+//  /* get the final string and truncate the buffer */
+//  char* json = NULL;
+//  num_printed = tor_asprintf(&json, "[%s]", json_buffer);
+//
+//  tor_free(json_buffer);
+//
+//  if(num_printed <= 0) {
+//    log_warn(LD_BUG, "Problem truncating viterbi path json buffer: "
+//        "tor_asprintf returned %d", num_printed);
+//    return NULL;
+//  } else {
+//    if(json && num_printed > TMODEL_MAX_JSON_RESULT_LEN) {
+//      log_warn(LD_GENERAL, "Encoded viterbi path json size is %ld, but the"
+//          "maximum supported size is %ld. Dropping result so we don't "
+//          "crash PrivCount.", (long)num_printed, (long)TMODEL_MAX_JSON_RESULT_LEN);
+//      tor_free(json);
+//      return NULL;
+//    } else {
+//      log_info(LD_GENERAL,
+//          "Encoded viterbi path as json string of size %ld", (long)num_printed);
+//      return json;
+//    }
+//  }
+//}
 
 static double _compute_delay_dx(long unsigned int delay) {
   if(delay <= 2) {
@@ -1420,11 +1471,12 @@ static double _compute_delay_log(double dx, double mu, double sigma) {
   return log_prob;
 }
 
-static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
+static double _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   tor_assert(hmm && hmm->magic == TRAFFIC_MAGIC_HMM);
 
-  /* our goal is to find the viterbi path and encode it as a json string */
-  char* viterbi_json = NULL;
+//  /* our goal is to find the viterbi path and encode it as a json string */
+//  char* viterbi_json = NULL;
+  double optimal_prob = -INFINITY;
 
   const uint n_states = hmm->num_states;
   const uint n_obs = (uint)smartlist_len(observations);
@@ -1433,7 +1485,8 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
    * we must have at least one of ('+','-') or ('$') and also an ('F') event */
   if(n_obs <= 1) {
     log_info(LD_GENERAL, "Not running viterbi algorithm with no observations.");
-    return viterbi_json;
+//    return viterbi_json;
+    return -INFINITY;
   }
 
   /* initialize the auxiliary tables:
@@ -1589,7 +1642,6 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   }
 
   /* get most probable final state */
-  double optimal_prob = -INFINITY;
   for(uint i = 0; i < n_states; i++) {
     if(table1[i][n_obs-1] > optimal_prob) {
       optimal_prob = table1[i][n_obs-1];
@@ -1625,13 +1677,7 @@ static char* _tmodel_run_viterbi(tmodel_hmm_t* hmm, smartlist_t* observations) {
   }
 
   log_info(LD_GENERAL, "Finished running viterbi. Found optimal path with %u "
-      "observations and %f prob. Encoding json result path now.", n_obs, optimal_prob);
-
-  /* convert to json */
-  viterbi_json = _encode_viterbi_path(hmm, observations, &optimal_states[0], n_obs);
-
-  log_debug(LD_GENERAL, "Final encoded viterbi path is: %s",
-      viterbi_json ? viterbi_json : "NULL");
+      "observations and %f prob.", n_obs, optimal_prob);
 
 cleanup:
   tor_assert(table1);
@@ -1648,7 +1694,7 @@ cleanup:
   tor_free(table2);
   tor_free(optimal_states);
 
-  return viterbi_json;
+  return optimal_prob;
 }
 
 static void _tmodel_packets_commit_packets(tmodel_packets_t* tpackets,
@@ -1746,6 +1792,30 @@ void tmodel_packets_observation(tmodel_packets_t* tpackets,
   }
 }
 
+static int _tmodel_wants_packets(void) {
+  if(global_bestfit_traffic_model_list != NULL) {
+    SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
+    {
+      if(tmodel->hmm_packets != NULL) {
+        return 1;
+      }
+    });
+  }
+  return 0;
+}
+
+static int _tmodel_wants_streams(void) {
+  if(global_bestfit_traffic_model_list != NULL) {
+    SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
+    {
+      if(tmodel->hmm_streams != NULL) {
+        return 1;
+      }
+    });
+  }
+  return 0;
+}
+
 /* allocate storage for a new tmodel stream object that will be used
  * to track cell transmit times while a stream is active. */
 tmodel_packets_t* tmodel_packets_new(void) {
@@ -1755,7 +1825,7 @@ tmodel_packets_t* tmodel_packets_new(void) {
   }
 
   /* if we don't want to count a packet model, we don't need to track */
-  if(global_traffic_model == NULL || global_traffic_model->hmm_packets == NULL) {
+  if(!_tmodel_wants_packets()) {
     return NULL;
   }
 
@@ -1769,28 +1839,6 @@ tmodel_packets_t* tmodel_packets_new(void) {
   tpackets->packets = smartlist_new();
 
   return tpackets;
-}
-
-static void _tmodel_handle_viterbi_result(char* viterbi_json,
-    tmodel_packets_t* tpackets, tmodel_streams_t* tstreams) {
-  if(viterbi_json != NULL) {
-    /* send the viterbi json result */
-    if(tpackets) {
-      control_event_privcount_viterbi_packets(viterbi_json);
-    } else if(tstreams) {
-      control_event_privcount_viterbi_streams(viterbi_json);
-    }
-    tor_free(viterbi_json);
-  } else {
-    /* send a json empty list to signal an error */
-    char* empty_list = tor_strndup("[]", 2);
-    if(tpackets) {
-      control_event_privcount_viterbi_packets(empty_list);
-    } else if(tstreams) {
-      control_event_privcount_viterbi_streams(empty_list);
-    }
-    tor_free(empty_list);
-  }
 }
 
 static void _tmodel_packets_free_helper(tmodel_packets_t* tpackets) {
@@ -1853,28 +1901,54 @@ static void _tmodel_process_models(tmodel_packets_t* tpackets,
   } else {
     /* just run the task now in the main thread using the main
      * thread instance of the traffic model. */
-    if(tpackets && global_traffic_model->hmm_packets) {
-      char* viterbi_json = _tmodel_run_viterbi(
-          global_traffic_model->hmm_packets, tpackets->packets);
+    if(global_bestfit_traffic_model_list &&
+        tpackets && _tmodel_wants_packets()) {
+      smartlist_t* optimal_probs = smartlist_new();
 
-      /* send the appropriate event to PrivCount.
-       * after calling this function, viterbi_json is invalid. */
-      _tmodel_handle_viterbi_result(viterbi_json, tpackets, NULL);
+      SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
+      {
+        if(tmodel && tmodel->hmm_packets) {
+          double* model_prob = tor_malloc_zero(sizeof(double));
+          *model_prob = _tmodel_run_viterbi(
+              tmodel->hmm_packets, tpackets->packets);
+          smartlist_add(optimal_probs, model_prob);
+        }
+      });
+
+      _tmodel_handle_result(optimal_probs, tpackets, NULL);
 
       /* free the data */
+      SMARTLIST_FOREACH(optimal_probs, double *, prob,
+      {
+         tor_free(prob);
+      });
+      smartlist_free(optimal_probs);
       _tmodel_packets_free_helper(tpackets);
     }
 
-    if(tstreams && global_traffic_model->hmm_streams) {
-      char* viterbi_json = _tmodel_run_viterbi(
-          global_traffic_model->hmm_streams, tstreams->streams);
+    if(global_bestfit_traffic_model_list &&
+        tstreams && _tmodel_wants_streams()) {
+      smartlist_t* optimal_probs = smartlist_new();
 
-      /* send the appropriate event to PrivCount.
-       * after calling this function, viterbi_json is invalid. */
-      _tmodel_handle_viterbi_result(viterbi_json, NULL, tstreams);
+      SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
+      {
+        if(tmodel && tmodel->hmm_streams) {
+          double* model_prob = tor_malloc_zero(sizeof(double));
+          *model_prob = _tmodel_run_viterbi(
+              tmodel->hmm_streams, tstreams->streams);
+          smartlist_add(optimal_probs, model_prob);
+        }
+      });
+
+      _tmodel_handle_result(optimal_probs, NULL, tstreams);
 
       /* free the data */
-      _tmodel_streams_free_helper(tstreams);
+      SMARTLIST_FOREACH(optimal_probs, double *, prob,
+      {
+         tor_free(prob);
+      });
+      smartlist_free(optimal_probs);
+      _tmodel_packets_free_helper(tpackets);
     }
   }
 }
@@ -1973,7 +2047,7 @@ tmodel_streams_t* tmodel_streams_new(void) {
   }
 
   /* if we don't want to count a stream model, we don't need to track */
-  if(global_traffic_model == NULL || global_traffic_model->hmm_streams == NULL) {
+  if(!_tmodel_wants_streams()) {
     return NULL;
   }
 
@@ -1999,13 +2073,13 @@ static threadpool_t* viterbi_thread_pool = NULL;
 static struct event* viterbi_reply_event = NULL;
 
 typedef struct viterbi_worker_state_s {
-  tmodel_t* thread_traffic_model;
+  smartlist_t* traffic_model_list;
 } viterbi_worker_state_t;
 
 typedef struct viterbi_worker_job_s {
   tmodel_packets_t* tpackets;
   tmodel_streams_t* tstreams;
-  char* viterbi_result;
+  smartlist_t* optimal_probs;
 } viterbi_worker_job_t;
 
 static viterbi_worker_job_t* _viterbi_job_new(
@@ -2024,9 +2098,6 @@ static void _viterbi_job_free(viterbi_worker_job_t* job) {
     }
     if(job->tstreams) {
       _tmodel_streams_free_helper(job->tstreams);
-    }
-    if(job->viterbi_result) {
-      tor_free(job->viterbi_result);
     }
     tor_free(job);
     if(num_outstanding_jobs > 0) {
@@ -2058,18 +2129,26 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
 
   /* its OK if the traffic model is NULL, it means we synced with
    * a NULL model while we still had jobs to finish */
-  if(state && state->thread_traffic_model && job &&
+  if(state && state->traffic_model_list && job &&
       (job->tpackets || job->tstreams)) {
     /* if we make it here, we can run the viterbi algorithm.
      * The result will be stored in the job object, and handled
      * by the main thread in the handle_reply function. */
-    if(job->tpackets && state->thread_traffic_model->hmm_packets) {
-      job->viterbi_result = _tmodel_run_viterbi(
-          state->thread_traffic_model->hmm_packets, job->tpackets->packets);
-    } else if(job->tstreams && state->thread_traffic_model->hmm_streams) {
-      job->viterbi_result = _tmodel_run_viterbi(
-          state->thread_traffic_model->hmm_streams, job->tstreams->streams);
-    }
+
+    SMARTLIST_FOREACH(state->traffic_model_list, tmodel_t *, tmodel,
+    {
+      if(job->tpackets && tmodel && tmodel->hmm_packets) {
+        double* model_prob = tor_malloc_zero(sizeof(double));
+        *model_prob = _tmodel_run_viterbi(
+            tmodel->hmm_packets, job->tpackets->packets);
+        smartlist_add(job->optimal_probs, model_prob);
+      } else if(job->tstreams && tmodel && tmodel->hmm_streams) {
+        double* model_prob = tor_malloc_zero(sizeof(double));
+        *model_prob = _tmodel_run_viterbi(
+            tmodel->hmm_streams, job->tstreams->streams);
+        smartlist_add(job->optimal_probs, model_prob);
+      }
+    });
   }
 
   return WQ_RPL_REPLY;
@@ -2080,10 +2159,16 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
 static void _viterbi_worker_handle_reply(void* job_arg) {
   viterbi_worker_job_t* job = job_arg;
   if(job) {
-    /* count the result, and free the string. */
-    _tmodel_handle_viterbi_result(job->viterbi_result, job->tpackets, job->tstreams);
-    /* the above frees the string, so don't double free */
-    job->viterbi_result = NULL;
+    if(job->optimal_probs) {
+      /* count the result, and free the string. */
+      _tmodel_handle_result(job->optimal_probs, job->tpackets, job->tstreams);
+      SMARTLIST_FOREACH(job->optimal_probs, double* *, prob,
+      {
+          tor_free(prob);
+      });
+      smartlist_free(job->optimal_probs);
+      job->optimal_probs = NULL;
+    }
     /* free the job */
     _viterbi_job_free(job);
   } else {
@@ -2100,8 +2185,8 @@ static void _viterbi_worker_assign_job(viterbi_worker_job_t* job) {
 
   if(!queue_entry) {
     log_warn(LD_BUG, "Unable to queue work on viterbi thread pool.");
-    /* count this as a failure */
-    _tmodel_handle_viterbi_result(NULL, job->tpackets, job->tstreams);
+//    /* count this as a failure */
+//    _tmodel_handle_viterbi_result(NULL, job->tpackets, job->tstreams);
     /* free the job */
     _viterbi_job_free(job);
   }
@@ -2137,20 +2222,29 @@ static void * _viterbi_worker_state_new(void *arg) {
   /* we need to reference the global traffic model here
    * to make sure we have the latest version. */
   tor_mutex_acquire(global_traffic_model_lock);
-  if(global_traffic_model) {
-    state->thread_traffic_model = _tmodel_deepcopy(global_traffic_model);
+  if(global_bestfit_traffic_model_list) {
+    state->traffic_model_list = smartlist_new();
+
+    SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
+    {
+      tmodel_t* tmodel_copy = _tmodel_deepcopy(tmodel);
+      smartlist_add(state->traffic_model_list, tmodel_copy);
+    });
   }
   tor_mutex_release(global_traffic_model_lock);
 
-  if(state->thread_traffic_model){
-    if(state->thread_traffic_model->hmm_packets) {
-      _viterbi_worker_log_model(state->thread_traffic_model->hmm_packets, "packet");
-    }
-    if(state->thread_traffic_model->hmm_streams) {
-      _viterbi_worker_log_model(state->thread_traffic_model->hmm_streams, "stream");
-    }
+  if(state->traffic_model_list) {
+    SMARTLIST_FOREACH(state->traffic_model_list, tmodel_t *, tmodel_copy,
+    {
+        if(tmodel_copy && tmodel_copy->hmm_packets) {
+          _viterbi_worker_log_model(tmodel_copy->hmm_packets, "packet");
+        }
+        if(tmodel_copy && tmodel_copy->hmm_streams) {
+          _viterbi_worker_log_model(tmodel_copy->hmm_streams, "stream");
+        }
+    });
   } else {
-    log_notice(LD_GENERAL, "Setting traffic model for a thread to NULL");
+    log_notice(LD_GENERAL, "Setting traffic models for a thread to NULL");
   }
 
   return state;
@@ -2161,10 +2255,18 @@ static void _viterbi_worker_state_free(void *arg) {
   viterbi_worker_state_t* state = arg;
 
   if(state) {
-    if(state->thread_traffic_model) {
-      _tmodel_free(state->thread_traffic_model);
+    if(state->traffic_model_list) {
+      SMARTLIST_FOREACH(state->traffic_model_list, tmodel_t *, tmodel_copy,
+      {
+        if(tmodel_copy) {
+          _tmodel_free(tmodel_copy);
+        }
+      });
+      smartlist_clear(state->traffic_model_list);
+      smartlist_free(state->traffic_model_list);
     }
 
+    state->traffic_model_list = NULL;
     tor_free(state);
   }
 }
@@ -2174,14 +2276,22 @@ static workqueue_reply_t _viterbi_worker_update_threadfn(void* cur, void* upd) {
   viterbi_worker_state_t* current_state = cur;
   viterbi_worker_state_t* update_state = upd;
 
-  if(current_state->thread_traffic_model) {
-    _tmodel_free(current_state->thread_traffic_model);
-    current_state->thread_traffic_model = NULL;
+  if(current_state->traffic_model_list) {
+    SMARTLIST_FOREACH(current_state->traffic_model_list, tmodel_t *, tmodel_copy,
+    {
+      if(tmodel_copy) {
+        _tmodel_free(tmodel_copy);
+      }
+    });
+    smartlist_clear(current_state->traffic_model_list);
+    smartlist_free(current_state->traffic_model_list);
   }
 
-  if (update_state->thread_traffic_model) {
-    current_state->thread_traffic_model = update_state->thread_traffic_model;
-    update_state->thread_traffic_model = NULL;
+  current_state->traffic_model_list = NULL;
+
+  if (update_state->traffic_model_list) {
+    current_state->traffic_model_list = update_state->traffic_model_list;
+    update_state->traffic_model_list = NULL;
   }
 
   _viterbi_worker_state_free(update_state);
