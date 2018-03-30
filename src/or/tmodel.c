@@ -1338,7 +1338,7 @@ static void _tmodel_handle_result(smartlist_t* probs,
   }
 
   if(result != NULL) {
-    log_notice(LD_GENERAL, "Viterbi best fit %s model: %s",
+    log_info(LD_GENERAL, "Viterbi best fit %s model: %s",
         tpackets ? "packet" : tstreams ? "stream" : "unknown", result);
     tor_free(result);
   }
@@ -2141,11 +2141,17 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
         double* model_prob = tor_malloc_zero(sizeof(double));
         *model_prob = _tmodel_run_viterbi(
             tmodel->hmm_packets, job->tpackets->packets);
+        if(!job->optimal_probs) {
+          job->optimal_probs = smartlist_new();
+        }
         smartlist_add(job->optimal_probs, model_prob);
       } else if(job->tstreams && tmodel && tmodel->hmm_streams) {
         double* model_prob = tor_malloc_zero(sizeof(double));
         *model_prob = _tmodel_run_viterbi(
             tmodel->hmm_streams, job->tstreams->streams);
+        if(!job->optimal_probs) {
+          job->optimal_probs = smartlist_new();
+        }
         smartlist_add(job->optimal_probs, model_prob);
       }
     });
