@@ -4683,6 +4683,8 @@ typedef struct {
    * measurement. The workers run the expensive Viterbi computation and
    * prepare the reply event string that will be sent to PrivCount. */
   int PrivCountNumViterbiWorkers;
+  /* The model to use during a PrivCount traffic model measurement. */
+  char* PrivCountTrafficModel;
 
   int IPv6Exit; /**< Do we support exiting to IPv6 addresses? */
 

@@ -492,6 +492,7 @@ static config_var_t option_vars_[] = {
   V(PrivCountCircuitSampleRate,  DOUBLE,   "1.0"),
   V(PrivCountMaxCellEventsPerCircuit, INT, "-1"),
   V(PrivCountNumViterbiWorkers,  INT,      "0"),
+  V(PrivCountTrafficModel,       FILENAME, NULL),
   V(ReachableAddresses,          LINELIST, NULL),
   V(ReachableDirAddresses,       LINELIST, NULL),
   V(ReachableORAddresses,        LINELIST, NULL),
@@ -2290,6 +2291,36 @@ options_act(const or_options_t *old_options)
      * 2038. */
     options->enable_privcount_timestamp.tv_sec = LONG_MAX;
     options->enable_privcount_timestamp.tv_usec = 999999;
+  }
+
+  if(options->PrivCountTrafficModel != NULL) {
+    log_info(LD_GENERAL, "Attempting to add traffic model at path '%s'",
+        options->PrivCountTrafficModel);
+    int was_success = 0;
+
+    char* contents = read_file_to_str(options->PrivCountTrafficModel, 0, NULL);
+
+    if(contents) {
+      char* model_command = NULL;
+      int num = tor_asprintf(&model_command, "TRUE %s\r\n", contents);
+
+      if(num > 0) {
+        int rc = tmodel_set_traffic_model(strlen(model_command), model_command);
+        if(rc == 0) {
+          was_success = 1;
+        }
+      }
+
+      tor_free(contents);
+    }
+
+    if(was_success) {
+      log_info(LD_GENERAL, "Success adding traffic model at path '%s'",
+          options->PrivCountTrafficModel);
+    } else {
+      log_warn(LD_GENERAL, "Failed to add traffic model at path '%s'",
+          options->PrivCountTrafficModel);
+    }
   }
 
   return 0;
