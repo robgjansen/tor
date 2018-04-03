@@ -1308,11 +1308,21 @@ static void _tmodel_handle_result(smartlist_t* probs,
   int num_printed = 0;
 
   for(int i = 0; i < smartlist_len(probs); i++) {
+    double* i_prob_ptr = smartlist_get(probs, i);
+    if(!i_prob_ptr){
+      continue;
+    }
+
     for(int j = i; j < smartlist_len(probs); j++) {
+      double* j_prob_ptr = smartlist_get(probs, j);
+      if(!j_prob_ptr) {
+        continue;
+      }
+
       char symbol;
-      if(smartlist_get(probs, i) > smartlist_get(probs, j)) {
+      if(*i_prob_ptr > *j_prob_ptr) {
         symbol = '>';
-      } else if(smartlist_get(probs, i) < smartlist_get(probs, j)) {
+      } else if(*i_prob_ptr < *j_prob_ptr) {
         symbol = '<';
       } else {
         symbol = '=';
@@ -1338,7 +1348,7 @@ static void _tmodel_handle_result(smartlist_t* probs,
   }
 
   if(result != NULL) {
-    log_info(LD_GENERAL, "Viterbi best fit %s model: %s",
+    log_notice(LD_GENERAL, "Viterbi best fit %s model: %s",
         tpackets ? "packet" : tstreams ? "stream" : "unknown", result);
     tor_free(result);
   }
@@ -1902,7 +1912,8 @@ static void _tmodel_process_models(tmodel_packets_t* tpackets,
     /* just run the task now in the main thread using the main
      * thread instance of the traffic model. */
     if(global_bestfit_traffic_model_list &&
-        tpackets && _tmodel_wants_packets()) {
+        tpackets && _tmodel_wants_packets() &&
+        tpackets->packets && smartlist_len(tpackets->packets) > 0) {
       smartlist_t* optimal_probs = smartlist_new();
 
       SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
@@ -1927,7 +1938,8 @@ static void _tmodel_process_models(tmodel_packets_t* tpackets,
     }
 
     if(global_bestfit_traffic_model_list &&
-        tstreams && _tmodel_wants_streams()) {
+        tstreams && _tmodel_wants_streams() &&
+        tstreams->streams && smartlist_len(tstreams->streams) > 0) {
       smartlist_t* optimal_probs = smartlist_new();
 
       SMARTLIST_FOREACH(global_bestfit_traffic_model_list, tmodel_t *, tmodel,
@@ -2130,14 +2142,19 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
   /* its OK if the traffic model is NULL, it means we synced with
    * a NULL model while we still had jobs to finish */
   if(state && state->traffic_model_list && job &&
-      (job->tpackets || job->tstreams)) {
+      ((job->tpackets && job->tpackets->packets &&
+          smartlist_len(job->tpackets->packets) > 0) ||
+          (job->tstreams && job->tstreams->streams &&
+              smartlist_len(job->tstreams->streams) > 0))) {
     /* if we make it here, we can run the viterbi algorithm.
      * The result will be stored in the job object, and handled
      * by the main thread in the handle_reply function. */
 
     SMARTLIST_FOREACH(state->traffic_model_list, tmodel_t *, tmodel,
     {
-      if(job->tpackets && tmodel && tmodel->hmm_packets) {
+      if(job->tpackets && job->tpackets->packets &&
+          smartlist_len(job->tpackets->packets) > 0 &&
+          tmodel && tmodel->hmm_packets) {
         double* model_prob = tor_malloc_zero(sizeof(double));
         *model_prob = _tmodel_run_viterbi(
             tmodel->hmm_packets, job->tpackets->packets);
@@ -2145,7 +2162,9 @@ static workqueue_reply_t _viterbi_worker_work_threadfn(void* state_arg, void* jo
           job->optimal_probs = smartlist_new();
         }
         smartlist_add(job->optimal_probs, model_prob);
-      } else if(job->tstreams && tmodel && tmodel->hmm_streams) {
+      } else if(job->tstreams && job->tstreams->streams &&
+          smartlist_len(job->tstreams->streams) > 0 &&
+          tmodel && tmodel->hmm_streams) {
         double* model_prob = tor_malloc_zero(sizeof(double));
         *model_prob = _tmodel_run_viterbi(
             tmodel->hmm_streams, job->tstreams->streams);
