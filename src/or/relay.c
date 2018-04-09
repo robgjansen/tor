@@ -941,8 +941,8 @@ connection_edge_send_command(edge_connection_t *fromconn,
    * The state object will be NULL if PrivCount is off or
    * it does not want to model cell emissions. */
   if (relay_command == RELAY_COMMAND_DATA &&
-      fromconn && fromconn->privcount_traffic_model_state) {
-    tmodel_packets_observation(fromconn->privcount_traffic_model_state,
+      fromconn && fromconn->privcount_tmodel_packets) {
+    tmodel_packets_observation(fromconn->privcount_tmodel_packets,
         TMODEL_OBSTYPE_PACKET_SENT_TO_ORIGIN, payload_len);
   }
 
@@ -1806,8 +1806,8 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
       /* Update PrivCount traffic model state, if we need to.
        * The state object will be NULL if PrivCount is off or
        * it does not want to model cell emissions. */
-      if(conn && conn->privcount_traffic_model_state) {
-        tmodel_packets_observation(conn->privcount_traffic_model_state,
+      if(conn && conn->privcount_tmodel_packets) {
+        tmodel_packets_observation(conn->privcount_tmodel_packets,
             TMODEL_OBSTYPE_PACKET_RECV_FROM_ORIGIN, (size_t)rh.length);
       }
 

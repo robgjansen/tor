@@ -616,15 +616,15 @@ connection_free_(connection_t *conn)
     rend_data_free(TO_EDGE_CONN(conn)->rend_data);
     hs_ident_edge_conn_free(TO_EDGE_CONN(conn)->hs_ident);
     /* if we have a tmodel on this stream, process and free the results */
-    if (TO_EDGE_CONN(conn)->privcount_traffic_model_state) {
+    if (TO_EDGE_CONN(conn)->privcount_tmodel_packets) {
       /* send the finished event for completeness */
       tmodel_packets_observation(
-          TO_EDGE_CONN(conn)->privcount_traffic_model_state,
+          TO_EDGE_CONN(conn)->privcount_tmodel_packets,
           TMODEL_OBSTYPE_PACKETS_FINISHED, 0);
       /* free the model state */
       tmodel_packets_free(
-          TO_EDGE_CONN(conn)->privcount_traffic_model_state);
-      TO_EDGE_CONN(conn)->privcount_traffic_model_state = NULL;
+          TO_EDGE_CONN(conn)->privcount_tmodel_packets);
+      TO_EDGE_CONN(conn)->privcount_tmodel_packets = NULL;
     }
   }
   if (conn->type == CONN_TYPE_CONTROL) {

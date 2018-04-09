@@ -3547,13 +3547,13 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
      * rejected due to the PrivCountCircuitSampleRate config.
      * Also, don't count BEGINDIR streams.  */
     if(!bcell.is_begindir && (!circ || !circ->privcount_event_sample_reject)) {
-      n_stream->privcount_traffic_model_state = tmodel_packets_new();
+      n_stream->privcount_tmodel_packets = tmodel_packets_new();
       if(circ) {
-        if(!circ->privcount_traffic_model_state) {
-          circ->privcount_traffic_model_state = tmodel_streams_new();
+        if(!circ->privcount_tmodel_streams) {
+          circ->privcount_tmodel_streams = tmodel_streams_new();
         }
-        if(circ->privcount_traffic_model_state) {
-          tmodel_streams_observation(circ->privcount_traffic_model_state,
+        if(circ->privcount_tmodel_streams) {
+          tmodel_streams_observation(circ->privcount_tmodel_streams,
               TMODEL_OBSTYPE_STREAM_NEW);
         }
       }

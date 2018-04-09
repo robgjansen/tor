@@ -960,14 +960,14 @@ circuit_free(circuit_t *circ)
    * hs identifier is freed. */
   hs_circ_cleanup(circ);
 
-  if(circ->privcount_traffic_model_state) {
+  if(circ->privcount_tmodel_streams) {
     /* send finished event for completeness */
     tmodel_streams_observation(
-        circ->privcount_traffic_model_state,
+        circ->privcount_tmodel_streams,
         TMODEL_OBSTYPE_STREAMS_FINISHED);
     /* free the traffic model state */
-    tmodel_streams_free(circ->privcount_traffic_model_state);
-    circ->privcount_traffic_model_state = NULL;
+    tmodel_streams_free(circ->privcount_tmodel_streams);
+    circ->privcount_tmodel_streams = NULL;
   }
 
   if (CIRCUIT_IS_ORIGIN(circ)) {
