@@ -27,9 +27,9 @@ const char* stream_model_str =
 const char* viterbi_packets_str =
     "[[\"s1\";\"+\";1000];[\"s0\";\"+\";1000];[\"s0\";\"-\";1000];[\"s1\";\"-\";1000];[\"End\";\"F\";0]]";
 const char* viterbi_streams_str =
-    "[[\"s0Active\";\"$\";1000];[\"s0Active\";\"$\";1000];[\"s0Active\";\"$\";1000];[\"s2End\";\"F\";0]]";
+    "[[\"s0Active\";\"$\";0];[\"s0Active\";\"$\";1000];[\"s0Active\";\"$\";1000];[\"s2End\";\"F\";1000]]";
 const char* viterbi_streams_dwell_str =
-    "[[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s2End\";\"F\";0]]";
+    "[[\"s0Active\";\"$\";0];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s1Dwell\";\"$\";2957929];[\"s2End\";\"F\";2957929]]";
 
 
 static void
@@ -295,22 +295,27 @@ test_traffic_model_viterbi_streams_helper(const char* model_str, int num_threads
   tmodel_streams_t* test_circuit = tmodel_streams_new();
   tt_assert(test_circuit);
 
-  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM_NEW);
+  monotime_t now;
+  monotime_get(&now);
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM, now);
 
   now_ns += 1000 * 1000;
   monotime_set_mock_time_nsec(now_ns);
 
-  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM_NEW);
+  monotime_get(&now);
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM, now);
 
   now_ns += 1000 * 1000;
   monotime_set_mock_time_nsec(now_ns);
 
-  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM_NEW);
+  monotime_get(&now);
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM, now);
 
   now_ns += 1000 * 1000;
   monotime_set_mock_time_nsec(now_ns);
 
-  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED);
+  monotime_get(&now);
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED, now);
 
   tmodel_streams_free(test_circuit);
 
@@ -361,8 +366,10 @@ test_traffic_model_viterbi_heavy_threads(void *arg) {
   tmodel_streams_t* test_circuit = tmodel_streams_new();
   tt_assert(test_circuit);
 
+  monotime_t now;
   for(int i = 0; i < 1000; i++) {
-    tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM_NEW);
+    monotime_get(&now);
+    tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM, now);
 
     tmodel_packets_t* test_stream = tmodel_packets_new();
     tt_assert(test_stream);
@@ -383,7 +390,8 @@ test_traffic_model_viterbi_heavy_threads(void *arg) {
     tt_assert(result >= 0);
   }
 
-  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED);
+  monotime_get(&now);
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED, now);
   tmodel_streams_free(test_circuit);
 
   result = tmodel_set_traffic_model((uint32_t) 5, "FALSE");
@@ -410,14 +418,17 @@ test_traffic_model_viterbi_streams_dwell(void *arg) {
   tt_assert(test_circuit);
 
 
+  monotime_t now;
   for(int i = 0; i < 5; i++) {
-    tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM_NEW);
+    monotime_get(&now);
+    tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAM, now);
 
     now_ns += ((uint64_t)1000) * ((uint64_t)2957929); // should cause dwell state
     monotime_set_mock_time_nsec(now_ns);
   }
 
-  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED);
+  monotime_get(&now);
+  tmodel_streams_observation(test_circuit, TMODEL_OBSTYPE_STREAMS_FINISHED, now);
   tmodel_streams_free(test_circuit);
 
   result = tmodel_set_traffic_model((uint32_t) 5, "FALSE");

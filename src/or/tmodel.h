@@ -10,13 +10,15 @@
 
 #include <stdint.h>
 
+#include "compat_time.h"
+
 typedef enum tmodel_obs_type_e tmodel_obs_type_t;
 enum tmodel_obs_type_e {
   TMODEL_OBSTYPE_NONE,
   TMODEL_OBSTYPE_PACKET_SENT_TO_ORIGIN,
   TMODEL_OBSTYPE_PACKET_RECV_FROM_ORIGIN,
   TMODEL_OBSTYPE_PACKETS_FINISHED,
-  TMODEL_OBSTYPE_STREAM_NEW,
+  TMODEL_OBSTYPE_STREAM,
   TMODEL_OBSTYPE_STREAMS_FINISHED,
   /* if we add another element, we need to increase the amount used
   to store this type in the obs bitfield in tmodel_delay_t */
@@ -44,7 +46,7 @@ tmodel_streams_t* tmodel_streams_new(void);
 void tmodel_streams_free(tmodel_streams_t* tstreams);
 /* notify the stream model of a stream model observation. */
 void tmodel_streams_observation(tmodel_streams_t* tstreams,
-    tmodel_obs_type_t otype);
+    tmodel_obs_type_t otype, monotime_t stream_obs_time);
 
 int tmodel_set_traffic_model(uint32_t len, const char *body);
 int tmodel_is_active(void);

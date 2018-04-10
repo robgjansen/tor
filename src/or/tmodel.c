@@ -10,7 +10,6 @@
 #include <strings.h>
 #include <math.h>
 
-#include "tmodel.h"
 #include "or.h"
 #include "config.h"
 #include "compat.h"
@@ -21,6 +20,7 @@
 #include "util.h"
 #include "util_bug.h"
 #include "workqueue.h"
+#include "tmodel.h"
 
 /* magic for memory checking */
 #define TRAFFIC_MAGIC 0xAABBCCDD
@@ -86,8 +86,9 @@ struct tmodel_streams_s {
   /* Time the circuit was created */
   monotime_t creation_time;
 
-  monotime_t buf_time;
-  tmodel_obs_type_t buf_obstype;
+  /* sorted list of creation times. times are added on stream
+   * end, but we want to sort by stream start time. */
+  smartlist_t* stream_obs_times;
 
   /* committed observations */
   smartlist_t* streams;
@@ -206,7 +207,7 @@ static const char* _tmodel_obstype_to_code(tmodel_obs_type_t obstype) {
       /* '-' means a packet was sent toward the client side.
        * uses a lognorm distribution. */
       return TMODEL_OBS_CODE_PACKET_TO_ORIGIN;
-    case TMODEL_OBSTYPE_STREAM_NEW:
+    case TMODEL_OBSTYPE_STREAM:
       /* '$' means a stream was observed */
       return TMODEL_OBS_CODE_STREAM;
     case TMODEL_OBSTYPE_PACKETS_FINISHED:
@@ -1812,7 +1813,15 @@ static void _tmodel_streams_free_helper(tmodel_streams_t* tstreams) {
 
   /* the stream data is stored in the packet element pointers,
    * which will be freed by the smartlist. */
-  smartlist_free(tstreams->streams);
+  if(tstreams->streams) {
+    smartlist_free(tstreams->streams);
+  }
+
+  if(tstreams->stream_obs_times) {
+    SMARTLIST_FOREACH(tstreams->stream_obs_times, monotime_t *, t, tor_free(t));
+    smartlist_free(tstreams->stream_obs_times);
+    tstreams->stream_obs_times = NULL;
+  }
 
   tstreams->magic = 0;
   tor_free(tstreams);
@@ -1900,8 +1909,16 @@ void tmodel_streams_free(tmodel_streams_t* tstreams) {
   }
 }
 
+static int _tmodel_sort_streams(const void **a, const void **b) {
+  const monotime_t* ta = *a;
+  const monotime_t* tb = *b;
+  int64_t diff = monotime_diff_nsec(ta, tb);
+  /* if the diff is positive, b comes after a */
+  return (diff > 0) ? -1 : (diff < 0) ? 1 : 0;
+}
+
 void tmodel_streams_observation(tmodel_streams_t* tstreams,
-    tmodel_obs_type_t otype) {
+    tmodel_obs_type_t otype, monotime_t stream_obs_time) {
   tor_assert(tstreams && tstreams->magic == TRAFFIC_MAGIC_STREAMS);
 
   /* just in case, don't do unnecessary work */
@@ -1910,35 +1927,42 @@ void tmodel_streams_observation(tmodel_streams_t* tstreams,
   }
 
   /* should be a stream-related observation */
-  if(otype != TMODEL_OBSTYPE_STREAM_NEW &&
+  if(otype != TMODEL_OBSTYPE_STREAM &&
       otype != TMODEL_OBSTYPE_STREAMS_FINISHED) {
     return;
   }
 
-  monotime_t now;
-  monotime_get(&now);
+  monotime_t* t = tor_malloc_zero(sizeof(monotime_t));
+  *t = stream_obs_time;
+  smartlist_add(tstreams->stream_obs_times, t);
 
-  if(tstreams->buf_obstype != 0) {
-    /* commit the previous stream info */
-    int64_t elapsed = monotime_diff_usec(&tstreams->buf_time, &now);
+  /* after we get a finished event, we dont process any more events */
+  if(otype == TMODEL_OBSTYPE_STREAMS_FINISHED &&
+      smartlist_len(tstreams->streams) == 0) {
+    /* now that the circuit is done, we expect no more observations */
+    smartlist_sort(tstreams->stream_obs_times, _tmodel_sort_streams);
+
+    int num_streams = smartlist_len(tstreams->stream_obs_times);
+    monotime_t* prev_time = smartlist_get(tstreams->stream_obs_times, 0);
     tmodel_delay_t d;
-    d.delay = (elapsed <= 0) ? 0 : (long unsigned int)elapsed;
-    d.otype = tstreams->buf_obstype;
-    void* element;
-    memmove(&element, &d, sizeof(void*));
-    smartlist_add(tstreams->streams, element);
-  }
 
-  tstreams->buf_obstype = otype;
-  tstreams->buf_time = now;
+    /* compute all delay times and obs types */
+    for(int i = 0; i < num_streams; i++) {
+      monotime_t* this_time = smartlist_get(tstreams->stream_obs_times, i);
+      int64_t elapsed = monotime_diff_usec(prev_time, this_time);
+      prev_time = this_time;
 
-  if(otype == TMODEL_OBSTYPE_STREAMS_FINISHED) {
-    tmodel_delay_t d;
-    d.delay = 0;
-    d.otype = TMODEL_OBSTYPE_STREAMS_FINISHED;
-    void* element;
-    memmove(&element, &d, sizeof(void*));
-    smartlist_add(tstreams->streams, element);
+      d.delay = (elapsed <= 0) ? 0 : (long unsigned int)elapsed;
+      if(i < num_streams - 1) {
+        d.otype = TMODEL_OBSTYPE_STREAM;
+      } else {
+        d.otype = TMODEL_OBSTYPE_STREAMS_FINISHED;
+      }
+
+      void* element;
+      memmove(&element, &d, sizeof(void*));
+      smartlist_add(tstreams->streams, element);
+    }
   }
 }
 
@@ -1961,6 +1985,7 @@ tmodel_streams_t* tmodel_streams_new(void) {
 
   /* store stream delay times in the element pointers */
   tstreams->streams = smartlist_new();
+  tstreams->stream_obs_times = smartlist_new();
 
   return tstreams;
 }

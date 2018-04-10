@@ -3553,8 +3553,7 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
           circ->privcount_tmodel_streams = tmodel_streams_new();
         }
         if(circ->privcount_tmodel_streams) {
-          tmodel_streams_observation(circ->privcount_tmodel_streams,
-              TMODEL_OBSTYPE_STREAM_NEW);
+          monotime_get(&n_stream->privcount_create_time);
         }
       }
     }

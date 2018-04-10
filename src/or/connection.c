@@ -613,18 +613,31 @@ connection_free_(connection_t *conn)
     }
   }
   if (CONN_IS_EDGE(conn)) {
-    rend_data_free(TO_EDGE_CONN(conn)->rend_data);
-    hs_ident_edge_conn_free(TO_EDGE_CONN(conn)->hs_ident);
-    /* if we have a tmodel on this stream, process and free the results */
-    if (TO_EDGE_CONN(conn)->privcount_tmodel_packets) {
+    edge_connection_t* edge = TO_EDGE_CONN(conn);
+    rend_data_free(edge->rend_data);
+    hs_ident_edge_conn_free(edge->hs_ident);
+
+    /* if we collect a packet model, send the "no more packets" end
+     * event so that we process the packets on this stream. */
+    if (edge->privcount_tmodel_packets) {
       /* send the finished event for completeness */
       tmodel_packets_observation(
-          TO_EDGE_CONN(conn)->privcount_tmodel_packets,
+          edge->privcount_tmodel_packets,
           TMODEL_OBSTYPE_PACKETS_FINISHED, 0);
       /* free the model state */
-      tmodel_packets_free(
-          TO_EDGE_CONN(conn)->privcount_tmodel_packets);
-      TO_EDGE_CONN(conn)->privcount_tmodel_packets = NULL;
+      tmodel_packets_free(edge->privcount_tmodel_packets);
+      edge->privcount_tmodel_packets = NULL;
+    }
+
+    /* if we collect a stream model, mark the stream observation,
+     * but only if the stream was active (transferred a packet).
+     * the active check is done so we stay consistent with the packet
+     * model, which doesn't count streams with no packets. */
+    if (edge->privcount_stream_active && edge->on_circuit &&
+        edge->on_circuit->privcount_tmodel_streams) {
+      tmodel_streams_observation(
+          edge->on_circuit->privcount_tmodel_streams,
+          TMODEL_OBSTYPE_STREAM, edge->privcount_create_time);
     }
   }
   if (conn->type == CONN_TYPE_CONTROL) {
