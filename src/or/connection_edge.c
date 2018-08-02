@@ -370,6 +370,38 @@ warn_if_hs_unreachable(const edge_connection_t *conn, uint8_t reason)
   }
 }
 
+void connection_edge_privcount_tmodel_stream_end(edge_connection_t *conn, circuit_t *circ) {
+  /* make sure we don't count the stream twice. */
+  if(!conn || conn->privcount_stream_counted) {
+    return;
+  }
+
+  /* if we collect a packet model, send the "no more packets" end
+   * event so that we process the packets on this stream. */
+  if (conn->privcount_tmodel_packets) {
+    /* send the finished event for completeness */
+    tmodel_packets_observation(
+        conn->privcount_tmodel_packets,
+        TMODEL_OBSTYPE_PACKETS_FINISHED, 0);
+    /* free the model state */
+    tmodel_packets_free(conn->privcount_tmodel_packets);
+    conn->privcount_tmodel_packets = NULL;
+  }
+
+  /* if we collect a stream model, mark the stream observation,
+   * but only if the stream was active (transferred a packet).
+   * the active check is done so we stay consistent with the packet
+   * model, which doesn't count streams with no packets. */
+  if (circ && conn->privcount_stream_active &&
+      circ->privcount_tmodel_streams) {
+    tmodel_streams_observation(
+        circ->privcount_tmodel_streams,
+        TMODEL_OBSTYPE_STREAM, conn->privcount_create_time);
+  }
+
+  conn->privcount_stream_counted = 1;
+}
+
 /** Send a relay end cell from stream <b>conn</b> down conn's circuit, and
  * remember that we've done so.  If this is not a client connection, set the
  * relay end cell's reason for closing as <b>reason</b>.
@@ -440,29 +472,7 @@ connection_edge_end(edge_connection_t *conn, uint8_t reason)
   conn->end_reason = control_reason;
 
   control_event_privcount_stream_ended(conn);
-
-  /* if we collect a packet model, send the "no more packets" end
-   * event so that we process the packets on this stream. */
-  if (conn->privcount_tmodel_packets) {
-    /* send the finished event for completeness */
-    tmodel_packets_observation(
-        conn->privcount_tmodel_packets,
-        TMODEL_OBSTYPE_PACKETS_FINISHED, 0);
-    /* free the model state */
-    tmodel_packets_free(conn->privcount_tmodel_packets);
-    conn->privcount_tmodel_packets = NULL;
-  }
-
-  /* if we collect a stream model, mark the stream observation,
-   * but only if the stream was active (transferred a packet).
-   * the active check is done so we stay consistent with the packet
-   * model, which doesn't count streams with no packets. */
-  if (circ && conn->privcount_stream_active &&
-      circ->privcount_tmodel_streams) {
-    tmodel_streams_observation(
-        circ->privcount_tmodel_streams,
-        TMODEL_OBSTYPE_STREAM, conn->privcount_create_time);
-  }
+  connection_edge_privcount_tmodel_stream_end(conn, circ);
 
   return 0;
 }
