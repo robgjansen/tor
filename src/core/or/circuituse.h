@@ -68,6 +68,8 @@ int circuit_should_use_vanguards(uint8_t);
 void circuit_sent_valid_data(origin_circuit_t *circ, uint16_t relay_body_len);
 void circuit_read_valid_data(origin_circuit_t *circ, uint16_t relay_body_len);
 
+void circuit_try_to_send_speedtest_cells(origin_circuit_t* origin_circ);
+
 #ifdef TOR_UNIT_TESTS
 /* Used only by circuituse.c and test_circuituse.c */
 

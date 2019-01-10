@@ -241,6 +241,23 @@ circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
   if (circ->marked_for_close)
     return 0;
 
+  /* if origin is getting back a speedtest cell, don't try to decrypt it
+   * unless the circuit isn't open yet */
+  if(circ->is_speedtest && CIRCUIT_IS_ORIGIN(circ)) {
+    origin_circuit_t* origin_circ = TO_ORIGIN_CIRCUIT(circ);
+    if(!origin_circ->has_opened) {
+      log_info(LD_OR, "Got a relay cell while building speedtest circuit %d!",
+          origin_circ-> global_identifier);
+    }
+    if(origin_circ->has_opened && TO_CIRCUIT(origin_circ)->is_speedtest > 0) {
+      origin_circ->speedtest_n_cells_recv++;
+      origin_circ->speedtest_n_cells_recv_tot++;
+      /* now that we got a speedtest cell back, we might want to send more */
+      circuit_try_to_send_speedtest_cells(origin_circ);
+      return 0;
+    }
+  }
+
   if (relay_decrypt_cell(circ, cell, cell_direction, &layer_hint, &recognized)
       < 0) {
     log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
@@ -249,6 +266,16 @@ circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
   }
 
   circuit_update_channel_usage(circ, cell);
+
+  /* if we got a speedtest cell, just forward it back to the measurer. */
+  if(circ->is_speedtest && CIRCUIT_IS_ORCIRC(circ)) {
+    or_circuit_t* or_circ = TO_OR_CIRCUIT(circ);
+    cell->circ_id = or_circ->p_circ_id;
+    chan = or_circ->p_chan;
+    append_cell_to_circuit_queue(circ, chan, cell, CELL_DIRECTION_IN, 0);
+    circ->n_speedtest_cells_relayed++;
+    return 0;
+  }
 
   if (recognized) {
     edge_connection_t *conn = NULL;
@@ -593,7 +620,9 @@ relay_send_command_from_edge_,(streamid_t stream_id, circuit_t *circ,
 
   if (cell_direction == CELL_DIRECTION_OUT) {
     origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(circ);
-    if (origin_circ->remaining_relay_early_cells > 0 &&
+    if(circ->is_speedtest && relay_command == RELAY_COMMAND_SPEEDTEST) {
+      // do not use RELAY_EARLY
+    } else if (origin_circ->remaining_relay_early_cells > 0 &&
         (relay_command == RELAY_COMMAND_EXTEND ||
          relay_command == RELAY_COMMAND_EXTEND2 ||
          cpath_layer != origin_circ->cpath)) {
@@ -1931,6 +1960,12 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
       log_info(domain,
                "'resolved' received, no conn attached anymore. Ignoring.");
       return 0;
+    case RELAY_COMMAND_SPEEDTEST:
+      circ->is_speedtest = 1;
+      log_info(domain,
+               "'SPEEDTEST' cell received on circid %u, marked as speedtest circuit.",
+               (unsigned int)TO_OR_CIRCUIT(circ)->p_circ_id);
+      return 0;
     case RELAY_COMMAND_ESTABLISH_INTRO:
     case RELAY_COMMAND_ESTABLISH_RENDEZVOUS:
     case RELAY_COMMAND_INTRODUCE1:
@@ -2759,6 +2794,17 @@ set_streams_blocked_on_circ(circuit_t *circ, channel_t *chan,
       /* Is this right? */
       if (!connection_is_reading(conn))
         connection_start_reading(conn);
+    }
+  }
+
+  if(circ->is_speedtest && CIRCUIT_IS_ORIGIN(circ)) {
+    origin_circuit_t* origin_circ = TO_ORIGIN_CIRCUIT(circ);
+
+//    log_debug(LD_OR, "Streams on speedtest circuit %"PRIu32" were %s",
+//        origin_circ->global_identifier, block ? "blocked" : "unblocked");
+
+    if(!block) {
+      circuit_try_to_send_speedtest_cells(origin_circ);
     }
   }
 

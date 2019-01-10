@@ -289,6 +289,15 @@ struct origin_circuit_t {
    * to 2*CircuitsAvailableTimoeut. */
   int circuit_idle_timeout;
 
+  /* if nonzero, this circuit will be used as a speedtest circuit,
+   * the client will run the test for this many seconds. */
+  uint32_t speedtest_client_n_secs;
+  time_t speedtest_client_start_time;
+  time_t speedtest_client_stop_time;
+  size_t speedtest_n_cells_sent;
+  size_t speedtest_n_cells_sent_tot;
+  size_t speedtest_n_cells_recv;
+  size_t speedtest_n_cells_recv_tot;
 };
 
 #endif

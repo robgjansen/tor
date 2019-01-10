@@ -193,8 +193,18 @@ relay_encrypt_cell_outbound(cell_t *cell,
   /* moving from farthest to nearest hop */
   do {
     tor_assert(thishop);
-    log_debug(LD_OR,"encrypting a layer of the relay cell.");
-    relay_crypt_one_payload(thishop->crypto.f_crypto, cell->payload);
+
+    if(TO_CIRCUIT(circ)->is_speedtest && circ->speedtest_client_n_secs > 0 &&
+        circ->speedtest_n_cells_sent_tot > 1 && thishop == circ->cpath->prev) {
+      /* Encrypt the first cell so relay can mark circ as speedtest circ.
+       * all other cells will be unrecognized after the relay decrypts and
+       * will be forwarded back without cell parsing or digest checks.
+       * This only applies to the last relay in a speedtest circuit. */
+      // skip the crypto
+    } else {
+      log_debug(LD_OR,"encrypting a layer of the relay cell.");
+      relay_crypt_one_payload(thishop->crypto.f_crypto, cell->payload);
+    }
 
     thishop = thishop->prev;
   } while (thishop != circ->cpath->prev);

@@ -177,6 +177,10 @@ struct curve25519_public_key_t;
  * a given stream? */
 #define MIN_CIRCUITS_HANDLING_STREAM 2
 
+/* we wont send more than this many cells more than we received back */
+#define SPEEDTEST_LOWWATER 40000
+#define SPEEDTEST_HIGHWATER 45000
+
 /* These RELAY_COMMAND constants define values for relay cell commands, and
 * must match those defined in tor-spec.txt. */
 #define RELAY_COMMAND_BEGIN 1
@@ -194,6 +198,7 @@ struct curve25519_public_key_t;
 #define RELAY_COMMAND_BEGIN_DIR 13
 #define RELAY_COMMAND_EXTEND2 14
 #define RELAY_COMMAND_EXTENDED2 15
+#define RELAY_COMMAND_SPEEDTEST 16
 
 #define RELAY_COMMAND_ESTABLISH_INTRO 32
 #define RELAY_COMMAND_ESTABLISH_RENDEZVOUS 33

@@ -436,6 +436,10 @@ command_process_created_cell(cell_t *cell, channel_t *chan)
 
   if (CIRCUIT_IS_ORIGIN(circ)) { /* we're the OP. Handshake this. */
     origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(circ);
+    if(TO_CIRCUIT(origin_circ)->is_speedtest > 0) {
+      log_info(LD_OR, "Got created cell on speedtest circuit %d",
+          origin_circ->global_identifier);
+    }
     int err_reason = 0;
     log_debug(LD_OR,"at OP. Finishing handshake.");
     if ((err_reason = circuit_finish_handshake(origin_circ,
@@ -641,6 +645,11 @@ command_process_destroy_cell(cell_t *cell, channel_t *chan)
 
   reason = (uint8_t)cell->payload[0];
   circ->received_destroy = 1;
+
+  if(circ->is_speedtest && !CIRCUIT_IS_ORIGIN(circ)) {
+    log_notice(LD_OR, "Closed speedtest circuit %u after relaying %lu cells.",
+        (unsigned)cell->circ_id, (unsigned long)circ->n_speedtest_cells_relayed);
+  }
 
   if (!CIRCUIT_IS_ORIGIN(circ) &&
       chan == TO_OR_CIRCUIT(circ)->p_chan &&

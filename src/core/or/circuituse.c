@@ -36,6 +36,7 @@
 #include "core/or/circuitstats.h"
 #include "core/or/circuituse.h"
 #include "core/or/connection_edge.h"
+#include "core/or/relay.h"
 #include "core/or/policies.h"
 #include "feature/client/addressmap.h"
 #include "feature/client/bridges.h"
@@ -1472,7 +1473,11 @@ circuit_expire_old_circuits_clientside(void)
       continue;
 
     cutoff = now;
-    cutoff.tv_sec -= TO_ORIGIN_CIRCUIT(circ)->circuit_idle_timeout;
+    if(circ->is_speedtest) {
+      cutoff.tv_sec -= 600;
+    } else {
+      cutoff.tv_sec -= TO_ORIGIN_CIRCUIT(circ)->circuit_idle_timeout;
+    }
 
     /* If the circuit has been dirty for too long, and there are no streams
      * on it, mark it for close.
@@ -1655,6 +1660,60 @@ circuit_testing_failed(origin_circuit_t *circ, int at_last_hop)
   (void)at_last_hop;
 }
 
+/* for testing relay speed. keep this function minimal and fast. */
+static void circuit_send_speedtest_cells(origin_circuit_t *origin_circ) {
+  tor_assert(origin_circ);
+
+  /* dont overflow other relays' cell queue size */
+  while(!TO_CIRCUIT(origin_circ)->streams_blocked_on_n_chan &&
+      origin_circ->speedtest_n_cells_sent_tot <=
+      (origin_circ->speedtest_n_cells_recv_tot + SPEEDTEST_HIGHWATER)) {
+    /* send to the last hop of the speedtest circuit */
+    int result = relay_send_command_from_edge(0, TO_CIRCUIT(origin_circ),
+          RELAY_COMMAND_SPEEDTEST, NULL, 0, origin_circ->cpath->prev);
+
+    if (result < 0) {
+      log_warn(LD_CIRC,
+               "relay_send_command_from_edge failed for speedtest circ. Circuit's closed.");
+      break;
+    } else {
+      origin_circ->speedtest_n_cells_sent++;
+      origin_circ->speedtest_n_cells_sent_tot++;
+    }
+  }
+}
+
+void circuit_try_to_send_speedtest_cells(origin_circuit_t* origin_circ) {
+  if(!origin_circ || !TO_CIRCUIT(origin_circ)->is_speedtest) {
+    return;
+  }
+
+  if(origin_circ->speedtest_client_n_secs == 0) {
+    return;
+  }
+
+  /* an origin speedtest circuit was unblocked (either streams are unblocked
+   * or we got back a speedtest cell so our self limit might allow us to send
+   * more). The client speedtest circ is configured to be running the test. */
+  if(approx_time() >= origin_circ->speedtest_client_stop_time) {
+    /* we ran for the requested amount of time, stop now */
+    time_t start_time = origin_circ->speedtest_client_start_time;
+
+    origin_circ->speedtest_client_n_secs = 0;
+    origin_circ->speedtest_client_start_time = 0;
+    origin_circ->speedtest_client_stop_time = 0;
+
+    /* send the control event */
+    control_event_speedtest_stopped(origin_circ, start_time);
+  } else {
+    /* keep running speedtest if we are below lowwater */
+    if(origin_circ->speedtest_n_cells_sent_tot <=
+          (origin_circ->speedtest_n_cells_recv_tot + SPEEDTEST_LOWWATER)) {
+      circuit_send_speedtest_cells(origin_circ);
+    }
+  }
+}
+
 /** The circuit <b>circ</b> has just become open. Take the next
  * step: for rendezvous circuits, we pass circ to the appropriate
  * function in rendclient or rendservice. For general circuits, we
@@ -1670,6 +1729,11 @@ circuit_has_opened(origin_circuit_t *circ)
    * it building again later (e.g. by extending it), we will know not
    * to consider its build time. */
   circ->has_opened = 1;
+
+  if(TO_CIRCUIT(circ)->is_speedtest > 0) {
+    control_event_speedtest_opened(circ);
+    return;
+  }
 
   switch (TO_CIRCUIT(circ)->purpose) {
     case CIRCUIT_PURPOSE_C_ESTABLISH_REND:

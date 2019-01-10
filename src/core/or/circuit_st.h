@@ -177,6 +177,10 @@ struct circuit_t {
   /** Hashtable node: used to look up the circuit by its HS token using the HS
       circuitmap. */
   HT_ENTRY(circuit_t) hs_circuitmap_node;
+
+  /* Flags if we are using this for speedtest, on both client and relay */
+  int is_speedtest;
+  size_t n_speedtest_cells_relayed;
 };
 
 #endif

@@ -1012,7 +1012,8 @@ circuit_build_no_more_hops(origin_circuit_t *circ)
   if (! circ->guard_state) {
     if (circuit_get_cpath_len(circ) != 1 &&
         ! circuit_purpose_may_omit_guard(circ->base_.purpose) &&
-        get_options()->UseEntryGuards) {
+        get_options()->UseEntryGuards &&
+        !TO_CIRCUIT(circ)->is_speedtest) {
       log_warn(LD_BUG, "%d-hop circuit %p with purpose %d has no "
                "guard state",
                circuit_get_cpath_len(circ), circ, circ->base_.purpose);
@@ -1044,6 +1045,10 @@ circuit_build_no_more_hops(origin_circuit_t *circ)
 
   if (circ->build_state->onehop_tunnel || circ->has_opened) {
     control_event_bootstrap(BOOTSTRAP_STATUS_REQUESTING_STATUS, 0);
+  }
+
+  if(TO_CIRCUIT(circ)->is_speedtest > 0) {
+    log_info(LD_OR, "speedtest circuit %d is built!", circ->global_identifier);
   }
 
   pathbias_count_build_success(circ);

@@ -247,6 +247,12 @@ void control_event_hs_descriptor_content(const char *onion_address,
                                          const char *desc_id,
                                          const char *hsdir_fp,
                                          const char *content);
+
+int control_event_speedtest_opened(origin_circuit_t *origin_circ);
+int control_event_speedtest_started(origin_circuit_t *origin_circ);
+int control_event_speedtest_stopped(origin_circuit_t *origin_circ, time_t start_time);
+int control_event_speedtest_closed(origin_circuit_t *origin_circ);
+
 void control_free_all(void);
 
 #ifdef CONTROL_PRIVATE
@@ -293,7 +299,8 @@ void control_free_all(void);
 #define EVENT_HS_DESC                 0x0021
 #define EVENT_HS_DESC_CONTENT         0x0022
 #define EVENT_NETWORK_LIVENESS        0x0023
-#define EVENT_MAX_                    0x0023
+#define EVENT_SPEEDTEST               0x0024
+#define EVENT_MAX_                    0x0024
 
 /* sizeof(control_connection_t.event_mask) in bits, currently a uint64_t */
 #define EVENT_CAPACITY_               0x0040

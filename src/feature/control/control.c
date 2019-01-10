@@ -72,6 +72,7 @@
 #include "feature/hs/hs_control.h"
 #include "feature/hs_common/shared_random_client.h"
 #include "feature/nodelist/authcert.h"
+#include "feature/nodelist/describe.h"
 #include "feature/nodelist/dirlist.h"
 #include "feature/nodelist/microdesc.h"
 #include "feature/nodelist/networkstatus.h"
@@ -1350,6 +1351,7 @@ static const struct control_event_t control_event_table[] = {
   { EVENT_HS_DESC, "HS_DESC" },
   { EVENT_HS_DESC_CONTENT, "HS_DESC_CONTENT" },
   { EVENT_NETWORK_LIVENESS, "NETWORK_LIVENESS" },
+  { EVENT_SPEEDTEST, "SPEEDTEST" },
   { 0, NULL },
 };
 
@@ -5250,6 +5252,312 @@ handle_control_del_onion(control_connection_t *conn,
   return 0;
 }
 
+int control_event_speedtest_opened(origin_circuit_t *origin_circ) {
+  if(!origin_circ) {
+    return 0;
+  }
+
+  char *vpath = circuit_list_path_for_controller(origin_circ);
+
+  send_control_event(EVENT_SPEEDTEST,
+                     "650 SPEEDTEST OPENED %"PRIu32" %s\r\n",
+                     (origin_circ->global_identifier),
+                     vpath ? vpath : "<null>");
+
+  if(vpath) {
+    tor_free(vpath);
+  }
+  return 0;
+}
+
+int control_event_speedtest_started(origin_circuit_t *origin_circ) {
+  if(!origin_circ) {
+    return 0;
+  }
+
+  unsigned long start = (unsigned long)origin_circ->speedtest_client_start_time;
+  unsigned long stop = (unsigned long)origin_circ->speedtest_client_stop_time;
+  unsigned long n_secs = (unsigned long)origin_circ->speedtest_client_n_secs;
+
+  char *vpath = circuit_list_path_for_controller(origin_circ);
+
+  send_control_event(EVENT_SPEEDTEST,
+                     "650 SPEEDTEST STARTED %"PRIu32" %lu %lu %lu %s\r\n",
+                     (origin_circ->global_identifier),
+                     start, n_secs, stop, vpath ? vpath : "<null>");
+
+  if(vpath) {
+    tor_free(vpath);
+  }
+  return 0;
+}
+
+int control_event_speedtest_stopped(origin_circuit_t *origin_circ, time_t start_time) {
+  if(!origin_circ) {
+    return 0;
+  }
+
+  time_t stop_time = time(NULL);
+
+  unsigned long recvd = (unsigned long)origin_circ->speedtest_n_cells_recv;
+  unsigned long sent = (unsigned long)origin_circ->speedtest_n_cells_sent;
+  unsigned long n_secs = (unsigned long)(stop_time - start_time);
+
+  char *vpath = circuit_list_path_for_controller(origin_circ);
+
+  log_notice(LD_OR, "Completed a speedtest on circ %"PRIu32" "
+      "received %lu cells and sent %lu in %lu seconds with path %s\r\n",
+       origin_circ->global_identifier,
+       recvd, sent, n_secs, vpath ? vpath : "<null>");
+
+  unsigned long start = (unsigned long) start_time;
+  unsigned long stop = (unsigned long) stop_time;
+
+  send_control_event(EVENT_SPEEDTEST,
+                     "650 SPEEDTEST STOPPED %"PRIu32" %lu %lu %lu %lu %lu %s\r\n",
+                     (origin_circ->global_identifier),
+                     start, n_secs, stop, recvd, sent, vpath ? vpath : "<null>");
+
+  if(vpath) {
+    tor_free(vpath);
+  }
+
+  return 0;
+}
+
+int control_event_speedtest_closed(origin_circuit_t *origin_circ) {
+  if(!origin_circ) {
+    return 0;
+  }
+
+  unsigned long recv_tot = (unsigned long)origin_circ->speedtest_n_cells_recv_tot;
+  unsigned long sent_tot = (unsigned long)origin_circ->speedtest_n_cells_sent_tot;
+
+  char *vpath = circuit_list_path_for_controller(origin_circ);
+
+  send_control_event(EVENT_SPEEDTEST,
+                     "650 SPEEDTEST CLOSED %"PRIu32" %lu %lu %s\r\n",
+                     (origin_circ->global_identifier),
+                     recv_tot, sent_tot, vpath ? vpath : "<null>");
+
+  if(vpath) {
+    tor_free(vpath);
+  }
+  return 0;
+}
+
+static void
+handle_control_speedtest_open(control_connection_t *conn, smartlist_t *args) {
+  const char *nickname_csv = smartlist_get(args, 1);
+
+  /* parse the input string to get the relay names */
+  smartlist_t *nicknames = smartlist_new();
+  smartlist_split_string(nicknames, nickname_csv, ",", 0, 0);
+
+  /* lookup node info for each relay name */
+  smartlist_t *nodes = smartlist_new();
+  SMARTLIST_FOREACH_BEGIN(nicknames, const char *, nickname) {
+    const node_t *node = node_get_by_nickname(nickname, 0);
+    if (!node) {
+      connection_printf_to_buf(conn, "552 No such router \"%s\"\r\n", nickname);
+      goto done;
+    }
+    if (!node_has_preferred_descriptor(node, 1)) {
+      connection_printf_to_buf(conn, "552 No descriptor for \"%s\"\r\n", nickname);
+      goto done;
+    }
+    smartlist_add(nodes, (void*)node);
+  } SMARTLIST_FOREACH_END(nickname);
+
+
+  log_info(LD_CONTROL, "Parsed SPEEDTEST OPEN arguments path=%s.", nickname_csv);
+
+  // maybe use CIRCUIT_PURPOSE_TESTING?
+  /* start a new circuit */
+  origin_circuit_t* circ = origin_circuit_init(CIRCUIT_PURPOSE_C_GENERAL, 0);
+
+  /* connection to first relay will be direct */
+  int direct_connect = 1;
+  SMARTLIST_FOREACH(nodes, const node_t *, node, {
+    /* now circ refers to something that is ready to be extended */
+    extend_info_t *info = extend_info_from_node(node, direct_connect);
+    if (!info) {
+      tor_assert_nonfatal(1);
+      log_warn(LD_CONTROL,
+               "controller tried to connect to a node that lacks a suitable "
+               "descriptor, or which doesn't have any "
+               "addresses that are allowed by the firewall configuration; "
+               "circuit marked for closing.");
+      circuit_mark_for_close(TO_CIRCUIT(circ), -END_CIRC_REASON_CONNECTFAILED);
+      connection_write_str_to_buf("551 Couldn't start circuit\r\n", conn);
+      goto done;
+    }
+
+    /* add the relay to the path */
+    circuit_append_new_exit(circ, info);
+    extend_info_free(info);
+    circ->build_state->onehop_tunnel = 0;
+    /* the next relay will not be a direct connection */
+    direct_connect = 0;
+  });
+
+  /* now that we've populated the cpath, start extending */
+  int err_reason = 0;
+  if ((err_reason = circuit_handle_first_hop(circ)) < 0) {
+    circuit_mark_for_close(TO_CIRCUIT(circ), -err_reason);
+    connection_write_str_to_buf("551 Couldn't start circuit\r\n", conn);
+    goto done;
+  }
+
+  log_info(LD_CONTROL, "Started a circuit build for SPEEDTEST on circ %u",
+      circ->global_identifier);
+
+  /* flag the circuit for a speedtest, run time will get set on start cmd */
+  TO_CIRCUIT(circ)->is_speedtest = 1;
+
+  /* send events for completeness */
+  control_event_circuit_status(circ, CIRC_EVENT_LAUNCHED, 0);
+  connection_printf_to_buf(conn, "250 OPENING %lu\r\n",
+                          (unsigned long)circ->global_identifier);
+
+done:
+  if(nicknames) {
+    SMARTLIST_FOREACH(nicknames, char *, cp, tor_free(cp));
+    smartlist_free(nicknames);
+  }
+  if(nodes) {
+    smartlist_free(nodes);
+  }
+}
+
+static void
+handle_control_speedtest_start(control_connection_t *conn, smartlist_t *args) {
+  /* get the args */
+  const char *circ_id_str = smartlist_get(args, 1);
+  const char *n_sec_str = smartlist_get(args, 2);
+
+  /* parse the circid */
+  origin_circuit_t *origin_circ = get_circ(circ_id_str);
+  if(!origin_circ) {
+    connection_printf_to_buf(conn, "552 Unknown circuit \"%s\"\r\n", circ_id_str);
+    return;
+  }
+
+  /* parse the num seconds */
+  int ok = 0;
+  uint32_t n_secs = (uint32_t) tor_parse_ulong(n_sec_str, 10, 0, UINT32_MAX, &ok, NULL);
+  if (!ok) {
+    connection_printf_to_buf(conn, "512 Malformed n_secs\r\n");
+    return;
+  }
+
+  log_info(LD_CONTROL, "Parsed SPEEDTEST START arguments circid=%"PRIu32" n_secs=%"PRIu32,
+      origin_circ->global_identifier, n_secs);
+
+  time_t start_ts = time(NULL);
+
+  origin_circ->speedtest_client_n_secs = n_secs;
+  origin_circ->speedtest_client_start_time = start_ts;
+  origin_circ->speedtest_client_stop_time = start_ts + ((time_t)n_secs);
+
+  log_notice(LD_CIRC, "Client speedtest starting now at %lu, will run for %lu seconds until %lu",
+      (unsigned long)origin_circ->speedtest_client_start_time,
+      (unsigned long)origin_circ->speedtest_client_n_secs,
+      (unsigned long)origin_circ->speedtest_client_stop_time);
+
+  /* reset cell counters for this current test */
+  origin_circ->speedtest_n_cells_recv = 0;
+  origin_circ->speedtest_n_cells_sent = 0;
+
+  /* start sending speedtest cells */
+  circuit_try_to_send_speedtest_cells(origin_circ);
+
+  /* response to this command */
+  send_control_done(conn);
+
+  /* emit the async event */
+  control_event_speedtest_started(origin_circ);
+}
+
+static void
+handle_control_speedtest_stop(control_connection_t *conn, smartlist_t *args) {
+  /* get the args */
+  const char *circ_id_str = smartlist_get(args, 1);
+
+  /* parse the circid */
+  origin_circuit_t *origin_circ = get_circ(circ_id_str);
+  if(!origin_circ) {
+    connection_printf_to_buf(conn, "552 Unknown circuit \"%s\"\r\n", circ_id_str);
+    return;
+  }
+
+  time_t start_time = origin_circ->speedtest_client_start_time;
+
+  /* requested to stop speedtest now */
+  origin_circ->speedtest_client_n_secs = 0;
+  origin_circ->speedtest_client_start_time = 0;
+  origin_circ->speedtest_client_stop_time = 0;
+
+  /* response to this command */
+  send_control_done(conn);
+
+  /* emit the async event */
+  control_event_speedtest_stopped(origin_circ, start_time);
+}
+
+static void
+handle_control_speedtest_close(control_connection_t *conn, smartlist_t *args) {
+  /* get the args */
+  const char *circ_id_str = smartlist_get(args, 1);
+
+  /* parse the circid */
+  origin_circuit_t *origin_circ = get_circ(circ_id_str);
+  if(!origin_circ) {
+    connection_printf_to_buf(conn, "552 Unknown circuit \"%s\"\r\n", circ_id_str);
+    return;
+  }
+
+  /* response to this command */
+  send_control_done(conn);
+
+  /* async event will get sent when circuit closes */
+//  control_event_speedtest_closed(origin_circ);
+  circuit_mark_for_close(TO_CIRCUIT(origin_circ), END_CIRC_REASON_REQUESTED);
+//  circuit_mark_for_close(TO_CIRCUIT(origin_circ), END_CIRC_REASON_FINISHED);
+}
+
+static int
+handle_control_speedtest(control_connection_t *conn, uint32_t len,
+                       const char *body) {
+  smartlist_t *args = NULL;
+  (void) len; /* body is nul-terminated; it's safe to ignore the length */
+  args = getargs_helper("SPEEDTEST", conn, body, 2, 3);
+  if (!args)
+    return 0;
+
+  log_info(LD_CONTROL, "Received SPEEDTEST command body %s.", body ? body : "NULL");
+
+  const char *command = smartlist_get(args, 0);
+
+  if (!strcasecmp(command, "OPEN")) {
+    handle_control_speedtest_open(conn, args);
+  } else if(!strcasecmp(command, "START")) {
+    handle_control_speedtest_start(conn, args);
+  } else if(!strcasecmp(command, "STOP")) {
+    handle_control_speedtest_stop(conn, args);
+  } else if(!strcasecmp(command, "CLOSE")) {
+    handle_control_speedtest_close(conn, args);
+  } else {
+    connection_printf_to_buf(conn, "510 Unrecognized command \"%s\"\r\n", command);
+  }
+
+  if(args) {
+    SMARTLIST_FOREACH(args, char *, cp, tor_free(cp));
+    smartlist_free(args);
+  }
+  return 0;
+}
+
 /** Called when <b>conn</b> has no more bytes left on its outbuf. */
 int
 connection_control_finished_flushing(control_connection_t *conn)
@@ -5607,6 +5915,9 @@ connection_control_process_inbuf(control_connection_t *conn)
     int ret = handle_control_del_onion(conn, cmd_data_len, args);
     memwipe(args, 0, cmd_data_len); /* Scrub the service id/pk. */
     if (ret)
+      return -1;
+  } else if (!strcasecmp(conn->incoming_cmd, "SPEEDTEST")) {
+    if (handle_control_speedtest(conn, cmd_data_len, args))
       return -1;
   } else {
     connection_printf_to_buf(conn, "510 Unrecognized command \"%s\"\r\n",

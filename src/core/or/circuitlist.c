@@ -2270,6 +2270,14 @@ circuit_about_to_free(circuit_t *circ)
     smartlist_remove(circuits_pending_other_guards, circ);
   }
   if (CIRCUIT_IS_ORIGIN(circ)) {
+    origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(circ);
+    if(circ->is_speedtest) {
+      if(origin_circ->speedtest_client_n_secs > 0) {
+        time_t start = origin_circ->speedtest_client_start_time;
+        control_event_speedtest_stopped(origin_circ, start);
+      }
+      control_event_speedtest_closed(origin_circ);
+    }
     control_event_circuit_status(TO_ORIGIN_CIRCUIT(circ),
      (circ->state == CIRCUIT_STATE_OPEN ||
       circ->state == CIRCUIT_STATE_GUARD_WAIT) ?
