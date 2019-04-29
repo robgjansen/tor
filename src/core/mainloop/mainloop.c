@@ -894,6 +894,21 @@ conn_read_callback(evutil_socket_t fd, short event, void *_conn)
   }
   assert_connection_ok(conn, time(NULL));
 
+  if (conn->marked_for_close) {
+      /* Libevent says we can read, but we are marked so we will never try
+       * to read again. We will try to close the connection below inside of
+       * close_closeable_connections(), but let's make sure not to cause
+       * Libevent to spin on conn_read_callback() while we wait for the
+       * socket to let us flush to it.*/
+      connection_stop_reading(conn);
+
+      /* Now, if we still have data to flush, then make sure Libevent tells
+       * us when the conn is ready to accept the bytes we want to write. */
+      if (connection_wants_to_flush(conn)) {
+          connection_start_writing(conn);
+      }
+  }
+
   if (smartlist_len(closeable_connection_lst))
     close_closeable_connections();
 }
